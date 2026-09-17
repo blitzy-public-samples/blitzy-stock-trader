@@ -1,0 +1,57 @@
+<!--
+       Copyright 2017-2021 IBM Corp All Rights Reserved
+       Copyright 2022-2024 Kyndryl, All Rights Reserved
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+       http://www.apache.org/licenses/LICENSE-2.0
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-->
+
+<server description="Trader UI server">
+    <!-- Enable features -->
+    <featureManager>
+        <feature>microProfile-7.1</feature>
+        <feature>mpTelemetry-2.1</feature>
+        <feature>pages-3.1</feature>
+    </featureManager>
+
+    <variable name="AUTH_TYPE"  defaultValue="basic"/>
+    <variable name="TRACE_SPEC" defaultValue="*=info"/>
+
+    <logging traceSpecification="${TRACE_SPEC}" consoleLogLevel="INFO" />
+
+    <httpEndpoint httpPort="9080" httpsPort="9443" host="*" id="defaultHttpEndpoint"/>
+
+    <keyStore id="defaultKeyStore" password="St0ckTr@der" type="pkcs12"
+         location="${server.config.dir}/resources/security/key.p12" />
+
+    <keyStore id="defaultTrustStore" password="St0ckTr@der" type="pkcs12"
+         location="${server.config.dir}/resources/security/trust.p12" />
+
+    <ssl id="defaultSSLConfig" keyStoreRef="defaultKeyStore" trustStoreRef="defaultTrustStore" trustDefaultCerts="true" />
+
+    <include optional="false" location="${server.config.dir}/includes/${AUTH_TYPE}.xml"/>
+
+    <mpMetrics authentication="false"/>
+
+    <ltpa expiration="1h"/>
+
+    <webAppSecurity allowFailOverToBasicAuth="true" displayAuthenticationRealm="true" logoutOnHttpSessionExpire="false"
+        webAlwaysLogin="true" preserveFullyQualifiedReferrerUrl="true" trackLoggedOutSSOCookies="false" ssoCookieName="StockTraderSSO"
+        useOnlyCustomCookieName="true" ssoUseDomainFromURL="true"/>
+
+    <webApplication id="TraderUI" name="TraderUI" location="TraderUI.war" contextRoot="/trader">
+        <classloader apiTypeVisibility="+third-party"/>
+        <application-bnd>
+            <security-role id="StockTrader" name="StockTrader">
+                <special-subject type="ALL_AUTHENTICATED_USERS" id="IBMid"/>
+            </security-role>
+        </application-bnd>
+    </webApplication>
+</server>

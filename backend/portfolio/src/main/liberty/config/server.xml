@@ -1,0 +1,70 @@
+<!--
+       Copyright 2017-2021 IBM Corp All Rights Reserved
+       Copyright 2022-2024 Kyndryl, All Rights Reserved
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-->
+
+<server description="Portfolio server">
+    <featureManager>
+        <feature>restfulWS-3.1</feature>
+        <feature>microProfile-6.1</feature>
+        <feature>persistence-3.1</feature>
+        <feature>jdbc-4.3</feature>
+        <feature>jndi-1.0</feature>
+        <feature>appSecurity-5.0</feature>
+<!--    <feature>restConnector-2.0</feature>
+        <feature>logstashCollector-1.0</feature> -->
+    </featureManager>
+
+    <variable name="AUTH_TYPE"    defaultValue="basic"/>
+    <variable name="JWT_AUDIENCE" defaultValue="stock-trader"/>
+    <variable name="JWT_ISSUER"   defaultValue="http://stock-trader.ibm.com"/>
+    <variable name="TRACE_SPEC"   defaultValue="*=info"/>
+    <variable name="JDBC_KIND"    defaultValue="db2"/>
+
+    <logging traceSpecification="${TRACE_SPEC}" consoleLogLevel="INFO" />
+
+    <httpEndpoint httpPort="9080" httpsPort="9443" host="*" id="defaultHttpEndpoint"/>
+
+    <keyStore id="defaultKeyStore" password="St0ckTr@der" type="pkcs12"
+         location="${server.config.dir}/resources/security/key.p12" />
+
+    <keyStore id="defaultTrustStore" password="St0ckTr@der" type="pkcs12"
+         location="${server.config.dir}/resources/security/trust.p12" />
+
+    <ssl id="defaultSSLConfig" keyStoreRef="defaultKeyStore" trustStoreRef="defaultTrustStore" trustDefaultCerts="true" />
+
+    <include optional="false" location="${server.config.dir}/includes/${AUTH_TYPE}.xml"/>
+
+    <mpMetrics authentication="false"/>
+
+<!--
+    <logstashCollector source="message,trace,ffdc,accessLog" hostName="logstash" port="5044"/>
+-->
+
+    <connectionManager id="dbConnections" minPoolSize="5" maxPoolSize="50" purgePolicy="ValidateAllConnections" agedTimeout="10m"/>
+
+    <include optional="false" location="${server.config.dir}/includes/${JDBC_KIND}.xml"/>
+
+    <ltpa expiration="1h"/>
+
+    <webApplication id="Portfolio" name="Portfolio" location="Portfolio.war" contextRoot="/portfolio">
+        <classloader apiTypeVisibility="+third-party"/>
+        <application-bnd>
+            <security-role id="StockTrader" name="StockTrader">
+                <special-subject type="ALL_AUTHENTICATED_USERS" id="IBMid"/>
+            </security-role>
+        </application-bnd>
+    </webApplication>
+</server>

@@ -1,0 +1,85 @@
+#       Copyright 2017 IBM Corp All Rights Reserved
+
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+
+#       http://www.apache.org/licenses/LICENSE-2.0
+
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+
+
+###########################################################################################
+## Configuration for deploying Messaging microservice using WebSphere Liberty helm chart
+###########################################################################################
+
+image:
+  repository: ibmstocktrader/messaging  # Docker Hub
+  #repository: mycluster.icp:8500/stock-trader/messaging        # IBM Cloud Private
+  #repository: registry.ng.bluemix.net/stock_trader/messaging   # IBM Container Service
+  tag: latest
+  pullPolicy: Always
+  extraEnvs:
+    - name: MQ_ID
+      valueFrom:
+        secretKeyRef:
+          name: mq
+          key: id
+    - name: MQ_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: mq   
+          key: pwd
+    - name: MQ_URL
+      valueFrom:
+        secretKeyRef:
+          name: mq
+          key: url
+    - name: MQ_HOST
+      valueFrom:
+        secretKeyRef:
+          name: mq
+          key: host
+    - name: MQ_PORT
+      valueFrom:
+        secretKeyRef:
+          name: mq
+          key: port
+    - name: MQ_CHANNEL
+      valueFrom:
+        secretKeyRef:
+          name: mq   
+          key: channel
+    - name: MQ_QUEUE_MANAGER
+      valueFrom:
+        secretKeyRef:
+          name: mq   
+          key: queue-manager
+    - name: MQ_QUEUE
+      valueFrom:
+        secretKeyRef:
+          name: mq   
+          key: queue
+    - name: JWT_AUDIENCE
+      valueFrom:
+        secretKeyRef:
+          name: jwt 
+          key: audience
+    - name: JWT_ISSUER
+      valueFrom:
+        secretKeyRef:
+          name: jwt
+          key: issuer
+
+resourceNameOverride: stock-trader
+
+pod:
+  labels:
+    solution: stock-trader
+
+monitoring:
+  enabled: true

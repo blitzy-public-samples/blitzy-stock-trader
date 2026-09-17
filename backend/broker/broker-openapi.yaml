@@ -1,0 +1,178 @@
+---
+openapi: 3.0.3
+info:
+  title: Generated API
+  version: "1.0"
+servers:
+- url: http://74.179.199.13:9080/broker
+- url: https://74.179.199.13:9443/broker
+paths:
+  /:
+    get:
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Broker'
+  /{owner}:
+    get:
+      parameters:
+      - name: owner
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Broker'
+    put:
+      parameters:
+      - name: owner
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: shares
+        in: query
+        schema:
+          format: int32
+          type: integer
+      - name: symbol
+        in: query
+        schema:
+          type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Broker'
+    post:
+      parameters:
+      - name: owner
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: balance
+        in: query
+        schema:
+          format: double
+          type: number
+      - name: currency
+        in: query
+        schema:
+          type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Broker'
+    delete:
+      parameters:
+      - name: owner
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Broker'
+  /{owner}/feedback:
+    post:
+      parameters:
+      - name: owner
+        in: path
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WatsonInput'
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Feedback'
+  /{owner}/returns:
+    get:
+      parameters:
+      - name: owner
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            text/plain:
+              schema:
+                type: string
+components:
+  schemas:
+    Broker:
+      type: object
+      properties:
+        owner:
+          type: string
+        total:
+          format: double
+          type: number
+        loyalty:
+          type: string
+        balance:
+          format: double
+          type: number
+        commissions:
+          format: double
+          type: number
+        free:
+          format: int32
+          type: integer
+        sentiment:
+          type: string
+        nextCommission:
+          format: double
+          type: number
+        cashAccountBalance:
+          format: double
+          type: number
+        cashAccountCurrency:
+          type: string
+        stocks:
+          type: object
+    Feedback:
+      type: object
+      properties:
+        message:
+          type: string
+        free:
+          format: int32
+          type: integer
+        sentiment:
+          type: string
+    WatsonInput:
+      type: object
+      properties:
+        text:
+          type: string

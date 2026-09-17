@@ -1,0 +1,248 @@
+---
+openapi: 3.1.0
+components:
+  schemas:
+    Account:
+      type: object
+      properties:
+        id:
+          type: string
+        owner:
+          type: string
+        loyalty:
+          type: string
+        balance:
+          type: number
+          format: double
+        commissions:
+          type: number
+          format: double
+        free:
+          type: integer
+          format: int32
+        sentiment:
+          type: string
+        nextCommission:
+          type: number
+          format: double
+        operation:
+          type: string
+    Feedback:
+      type: object
+      properties:
+        message:
+          type: string
+        free:
+          type: integer
+          format: int32
+        sentiment:
+          type: string
+    WatsonInput:
+      type: object
+      properties:
+        text:
+          type: string
+  securitySchemes:
+    SecurityScheme:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Authentication
+paths:
+  /account:
+    get:
+      parameters:
+      - description: List of owner names to retrieve account details for
+        required: false
+        name: owners
+        in: query
+        schema:
+          type: array
+          items:
+            type: string
+      - description: Which page to retrieve
+        required: false
+        name: page
+        in: query
+        schema:
+          type: integer
+          format: int32
+          default: 1
+      - description: How many accounts per page
+        required: false
+        name: pageSize
+        in: query
+        schema:
+          type: integer
+          format: int32
+          default: 10
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Account"
+        "401":
+          description: Not Authorized
+        "403":
+          description: Not Allowed
+      summary: Get Accounts
+      tags:
+      - Account Service
+      security:
+      - SecurityScheme:
+        - StockTrader
+        - StockViewer
+  /account/{id}:
+    put:
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: total
+        in: query
+        schema:
+          type: number
+          format: double
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Account"
+        "401":
+          description: Not Authorized
+        "403":
+          description: Not Allowed
+      summary: Update Account
+      tags:
+      - Account Service
+      security:
+      - SecurityScheme:
+        - StockTrader
+    get:
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: total
+        in: query
+        schema:
+          type: number
+          format: double
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Account"
+        "401":
+          description: Not Authorized
+        "403":
+          description: Not Allowed
+      summary: Get Account
+      tags:
+      - Account Service
+      security:
+      - SecurityScheme:
+        - StockTrader
+        - StockViewer
+    delete:
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Account"
+        "401":
+          description: Not Authorized
+        "403":
+          description: Not Allowed
+      summary: Delete Account
+      tags:
+      - Account Service
+      security:
+      - SecurityScheme:
+        - StockTrader
+  /account/{id}/feedback:
+    post:
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WatsonInput"
+        required: true
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Feedback"
+        "401":
+          description: Not Authorized
+        "403":
+          description: Not Allowed
+        "400":
+          description: Bad Request
+      summary: Submit Feedback
+      tags:
+      - Account Service
+      security:
+      - SecurityScheme:
+        - StockTrader
+  /account/{owner}:
+    post:
+      parameters:
+      - name: owner
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Account"
+        "401":
+          description: Not Authorized
+        "403":
+          description: Not Allowed
+      summary: Create Account
+      tags:
+      - Account Service
+      security:
+      - SecurityScheme:
+        - StockTrader
+info:
+  title: account API
+  version: 1.0-SNAPSHOT
+servers:
+- url: http://localhost:9080
+  description: Auto generated value
+- url: http://0.0.0.0:9080
+  description: Auto generated value

@@ -1,0 +1,4 @@
+-Dcom.ibm.hybrid.cloud.sample.stocktrader.broker.client.PortfolioClient/mp-rest/url=http://portfolio-service:9080/stock-quote
+-Dcom.ibm.hybrid.cloud.sample.stocktrader.broker.client.AccountClient/mp-rest/url=http://account-service:9080/account
+-Dcom.ibm.hybrid.cloud.sample.stocktrader.broker.client.CashAccountClient/mp-rest/url=http://cash-account-service:8080/account
+-Dcom.ibm.hybrid.cloud.sample.stocktrader.broker.client.TradeHistoryClient/mp-rest/url=http://tradehistory-service:9080/trade-history

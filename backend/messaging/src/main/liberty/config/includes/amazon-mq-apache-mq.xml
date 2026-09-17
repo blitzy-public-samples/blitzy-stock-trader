@@ -1,0 +1,25 @@
+<server>
+    <authData id="MQ-Credentials" user="${env.MQ_ID}" password="${env.MQ_PASSWORD}"></authData>
+
+    <resourceAdapter id="activemq" location="/config/activemq.rar">
+        <properties.activemq ServerUrl="${env.MQ_URL}" />
+        <classloader apiTypeVisibility="+third-party"/>
+    </resourceAdapter>
+
+    <jmsActivationSpec id="Messaging/MessagingEJB/MessagingMDB" authDataRef="MQ-Credentials" maxEndpoints="1">
+        <properties.activemq
+                destination="${env.MQ_QUEUE}"
+                destinationRef="jms/Portfolio/NotificationQueue"
+                destinationType="javax.jms.Queue" />
+        <!-- Using .activemq as that is the ID for the resource adapter          -->
+        <!-- ******************************************************************* -->
+        <!-- Note, that this is the OpenWire endpoint (ssl://)                   -->
+        <!-- I could not get the amqp+ssl endpoint to work (Connection timeouts) -->
+        <!-- ******************************************************************* -->
+    </jmsActivationSpec>
+
+    <jmsQueue id="jms/Portfolio/NotificationQueue" jndiName="jms/Portfolio/NotificationQueue">
+        <properties.activemq PhysicalName="${env.MQ_QUEUE}"/>
+    </jmsQueue>
+
+</server>

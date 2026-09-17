@@ -1,0 +1,60 @@
+apiVersion: networking.istio.io/v1beta1
+kind: Gateway
+metadata:
+  name: stock-trader-gateway
+  namespace: ${stock_trader_namespace}
+spec:
+  selector:
+    istio: ${istio_ingress_external_service_name}
+  servers:
+  - port:
+      number: 80
+      name: http
+      protocol: HTTP
+    hosts:
+    - "*"
+  - port:
+      number: 443
+      name: https
+      protocol: HTTPS
+    tls:
+      mode: SIMPLE
+      credentialName: stock-trader-tls
+    hosts:
+    - "*"
+---
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: stock-trader-vs
+  namespace: ${stock_trader_namespace}
+spec:
+  hosts:
+  - "*"
+  gateways:
+  - stock-trader-gateway
+  http:
+  - match:
+    - uri:
+        prefix: "/trader"
+    route:
+    - destination:
+        host: gitops-stocktrader-trader-service.${stock_trader_namespace}.svc.cluster.local
+        port:
+          number: 9080
+  - match:
+    - uri:
+        prefix: "/portfolio"
+    route:
+    - destination:
+        host: gitops-stocktrader-portfolio-service.${stock_trader_namespace}.svc.cluster.local
+        port:
+          number: 9080
+  - match:
+    - uri:
+        prefix: "/account"
+    route:
+    - destination:
+        host: gitops-stocktrader-cash-account-service.${stock_trader_namespace}.svc.cluster.local
+        port:
+          number: 8080

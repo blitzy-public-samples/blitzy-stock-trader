@@ -1,0 +1,19 @@
+<server>
+    <variable name="JDBC_SSL" defaultValue="false"/>
+    <dataSource id="PortfolioDB" jndiName="jdbc/Portfolio/PortfolioDB" connectionManagerRef="dbConnections" isolationLevel="TRANSACTION_REPEATABLE_READ">
+        <jdbcDriver>
+            <library name="DB2" description="DB2 JDBC driver jar">
+                <file id="db2jcc4" name="/config/prereqs/jcc-12.1.0.0.jar"/>
+<!-- These jars aren't needed any more on DB2 LUW, but seem to still be needed with DB2 for z/OS (but aren't available via Maven Central)
+                <file id="db2jcc4-license1" name="/config/prereqs/db2jcc_license_cu.jar"/>
+                <file id="db2jcc4-license2" name="/config/prereqs/db2jcc_license_cisuz.jar"/>
+-->
+            </library>
+        </jdbcDriver>
+        <!-- Note that as of the DB2 JDBC jar in 11.5.9.0, credentials are sent encrypted now by default.  Since our mainframe doesn't have the necessary
+             crypto modules installed, we need to disable that for now, via the securityMechanism="3" below -->
+        <properties.db2.jcc serverName="${env.JDBC_HOST}" portNumber="${env.JDBC_PORT}" databaseName="${env.JDBC_DB}" sslConnection="${JDBC_SSL}"
+            securityMechanism="3"
+            user="${env.JDBC_ID}" password="${env.JDBC_PASSWORD}"/> <!-- It won't use a containerAuthDataRef for some reason, so defining credentials here instead -->
+    </dataSource>
+</server>

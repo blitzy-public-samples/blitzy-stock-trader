@@ -1,0 +1,130 @@
+#       Copyright 2017 IBM Corp All Rights Reserved
+
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+
+#       http://www.apache.org/licenses/LICENSE-2.0
+
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+
+#Deploy the pod
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: messaging
+  labels:
+    solution: stock-trader
+  annotations: { 
+    prism.subkind: Liberty
+  }
+# namespace: stock-trader
+spec:
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: messaging
+        solution: stock-trader
+    spec:
+      containers:
+      - name: messaging
+#       Note: this manifests/deploy.yaml will be used when we want to deploy this directly using kubectl or a helm chart. 
+#             Microclimate uses the Charts folder so we can actually have both options
+#        image: ibmstocktrader/messaging:latest # Docker Hub
+        image: bigloon.icp:8500/stock-trader/messaging:demo # IBM Cloud Private
+#       image: registry.ng.bluemix.net/stock_trader/messaging:latest # IBM Container Service
+        env:
+          - name: MQ_ID
+            valueFrom:
+              secretKeyRef:
+                name: mq
+                key: id
+          - name: MQ_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: mq   
+                key: pwd
+          - name: MQ_URL
+            valueFrom:
+              secretKeyRef:
+                name: mq
+                key: url
+          - name: MQ_HOST
+            valueFrom:
+              secretKeyRef:
+                name: mq
+                key: host
+          - name: MQ_PORT
+            valueFrom:
+              secretKeyRef:
+                name: mq
+                key: port
+          - name: MQ_CHANNEL
+            valueFrom:
+              secretKeyRef:
+                name: mq   
+                key: channel
+          - name: MQ_QUEUE_MANAGER
+            valueFrom:
+              secretKeyRef:
+                name: mq   
+                key: queue-manager
+          - name: MQ_QUEUE
+            valueFrom:
+              secretKeyRef:
+                name: mq   
+                key: queue
+          - name: JWT_AUDIENCE
+            valueFrom:
+              secretKeyRef:
+                name: jwt 
+                key: audience
+          - name: JWT_ISSUER
+            valueFrom:
+              secretKeyRef:
+                name: jwt
+                key: issuer
+        ports:
+          - containerPort: 9080
+          - containerPort: 9443
+        imagePullPolicy: Always
+#        readinessProbe:
+#          httpGet:
+#            path: /health
+#           port: 9080
+#          initialDelaySeconds: 30
+#          periodSeconds: 5
+#        livenessProbe:
+#          httpGet:
+#            path: /health
+#            port: 9080
+#          initialDelaySeconds: 60
+#          periodSeconds: 5
+        resources:
+          limits:
+            cpu: 500m
+            memory: 500Mi
+          requests:
+            cpu: 100m
+            memory: 128Mi
+---
+#Deploy the autoscaler
+apiVersion: autoscaling/v1
+kind: HorizontalPodAutoscaler
+metadata:
+  name: messaging
+  labels:
+    solution: stock-trader
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: messaging
+  maxReplicas: 10
+  minReplicas: 2
+  targetCPUUtilizationPercentage: 50

@@ -1,0 +1,129 @@
+#       Copyright 2017-2020 IBM Corp All Rights Reserved
+
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+
+#       http://www.apache.org/licenses/LICENSE-2.0
+
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+
+#Deploy the pod
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trader
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trader
+  template:
+    metadata:
+      labels:
+        app: trader
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9080"
+    spec:
+      containers:
+      - name: trader
+        image: quay-quay-quay.mycluster-us-sout-363772-a01ee4194ed985a1e32b1d96fd4ae346-0000.us-south.containers.appdomain.cloud/cicd/trader:latest # OCP
+        envFrom:
+          - configMapRef:
+              name: s3-configmap
+        env:
+          - name: WLP_LOGGING_CONSOLE_FORMAT
+            value: json
+          - name: WLP_LOGGING_CONSOLE_SOURCE
+            value: message,ffdc
+          - name: JWT_AUDIENCE
+            value: trader
+          - name: JWT_ISSUER
+            value: trader            
+          - name: OIDC_CLIENTID
+            valueFrom:
+              secretKeyRef:
+                name: keycloak-oidc
+                key: OIDC_CLIENTID
+                optional: true
+          - name: OIDC_CLIENTSECRET
+            valueFrom:
+              secretKeyRef:
+                name: keycloak-oidc
+                key: OIDC_CLIENTSECRET
+                optional: true
+          - name: OIDC_DISCOVERY_URL
+            valueFrom:
+              secretKeyRef:
+                name: keycloak-oidc
+                key: OIDC_DISCOVERY_URL
+                optional: true
+          - name: PORTFOLIO_URL
+            value: http://portfolio-service:9080/portfolio
+          - name: AUTH_TYPE
+            value: keycloak
+        ports:
+          - containerPort: 9080
+          - containerPort: 9443
+        imagePullPolicy: Always
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 9080
+          initialDelaySeconds: 30
+          periodSeconds: 15
+          successThreshold: 1
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: 9080
+          initialDelaySeconds: 60
+          periodSeconds: 15
+          successThreshold: 1
+          failureThreshold: 5 # Allow a little time to exec into the pod to grab FFDCs before it's killed
+        resources:
+          limits:
+            cpu: 500m
+            memory: 500Mi
+          requests:
+            cpu: 100m
+            memory: 128Mi
+---
+#Deploy the service
+apiVersion: v1
+kind: Service
+metadata:
+  name: trader-service
+spec:
+  ports:
+    - name: http
+      protocol: TCP
+      port: 9080
+      targetPort: 9080
+    - name: https
+      protocol: TCP
+      port: 9443
+      targetPort: 9443
+  selector:
+    app: trader
+---
+# Openshift Route
+kind: Route
+apiVersion: route.openshift.io/v1
+metadata:
+  name: trader
+spec:
+  to:
+    kind: Service
+    name: trader-service
+    weight: 100
+  port:
+    targetPort: http
+  tls:
+    termination: edge

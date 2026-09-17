@@ -1,0 +1,283 @@
+# =============================================================================
+# TERRAFORM VARIABLES EXAMPLE FILE
+# =============================================================================
+# 
+# This file contains example values for all Terraform variables used in the
+# Stock Trader infrastructure deployment. Copy this file to `terraform.tfvars`
+# and replace the example values with your actual configuration.
+#
+# IMPORTANT: Before running Terraform, ensure:
+# 1. You have Azure CLI installed and are logged in
+# 2. The resource group exists in your Azure subscription
+# 3. All resource names are unique within your subscription
+# 4. You have sufficient permissions to create resources
+#
+# For detailed architecture information, see: ARCHITECTURE.md
+# For variable descriptions and validation rules, see: variables.tf
+# =============================================================================
+
+# =============================================================================
+# CORE INFRASTRUCTURE VARIABLES
+# =============================================================================
+# These variables define the foundational infrastructure settings including
+# Azure subscription, resource group, and location configuration.
+# =============================================================================
+
+# Azure Subscription ID where all resources will be deployed
+# Format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+subscription_id = ""
+
+# Azure region (location) where all resources will be deployed
+# Examples: eastus, westus2, westeurope, southeastasia
+# See: https://azure.microsoft.com/en-us/global-infrastructure/geographies/
+location = ""
+
+# Name of the existing Azure Resource Group where all resources will be created
+# NOTE: This resource group MUST exist before running Terraform
+# Format: rg-<project>-<environment>-<region>
+resource_group_name = ""
+
+# Identifier for tracking who created the resources (for tagging)
+# Used in resource tags for ownership and cost tracking
+created_by = ""
+
+# =============================================================================
+# KUBERNETES & SERVICE MESH VARIABLES
+# =============================================================================
+# These variables configure the Azure Kubernetes Service (AKS) cluster and
+# Istio service mesh for container orchestration and traffic management.
+# =============================================================================
+
+# Enable/disable Istio service mesh deployment
+# Set to false to deploy without Istio service mesh
+# Set to true to deploy with Istio service mesh (default)
+enable_istio = true
+
+# Name of the Azure Kubernetes Service (AKS) cluster
+# Must be unique within your Azure subscription
+# Format: aks-<project>-<environment>-<region>
+aks_cluster_name = ""
+
+# VM size for AKS node pools
+# Recommended: Standard_D4ds_v5 or larger for production workloads
+# See: https://docs.microsoft.com/en-us/azure/virtual-machines/sizes-general
+aks_node_vm_size = "Standard_D4ds_v5"
+
+# Istio service mesh revision for AKS
+# This revision must match the namespace label for sidecar injection
+# Current stable version: asm-1-24
+aks_service_mesh_revisions = ["asm-1-26"]
+
+# Istio revision label applied to namespaces for sidecar injection
+# Must match the revision in aks_service_mesh_revisions
+istio_revision = "asm-1-26"
+
+# Kubernetes namespace for the Stock Trader application
+# This namespace will be created and labeled for Istio sidecar injection
+stock_trader_namespace = "stock-trader"
+
+# =============================================================================
+# DATA SERVICES VARIABLES
+# =============================================================================
+# These variables configure the database and caching services that support
+# the Stock Trader application.
+# =============================================================================
+
+# Azure Cache for Redis configuration
+# ===================================
+
+# Name of the Azure Cache for Redis instance
+# Must be globally unique across all Azure subscriptions
+# IMPORTANT: Keep it short and simple (max 63 characters)
+# Format: redis-<project>-<env>
+redis_cache_name = "redis-stocktrader-dev"
+
+# Redis cache SKU (pricing tier)
+# Options: Basic, Standard, Premium
+# See: https://docs.microsoft.com/en-us/azure/azure-cache-for-redis/cache-overview#service-tiers
+redis_cache_sku = "Standard"
+
+# Name of the Redis private endpoint
+# Used for secure private connectivity from VNet
+redis_private_endpoint_name = "pe-redis-stocktrader-dev"
+
+# Azure Database for PostgreSQL configuration
+# ===========================================
+
+# Name of the PostgreSQL Flexible Server instance
+# Must be globally unique across all Azure subscriptions
+# IMPORTANT: Keep it short and simple (max 63 characters)
+# Format: postgres-<project>-<env>
+postgres_server_name = "postgres-stocktrader-dev"
+
+# PostgreSQL administrator username
+# Used for database administration and initial setup
+administrator_login = "postgresadmin"
+
+# PostgreSQL administrator password
+# IMPORTANT: Use a strong, unique password
+# Minimum 8 characters, must contain uppercase, lowercase, and numbers
+administrator_login_password = ""
+
+# Name of the PostgreSQL private endpoint
+# Used for secure private connectivity from VNet
+postgres_private_endpoint_name = "pe-postgres-stocktrader-dev"
+
+# CouchDB NoSQL Database configuration
+# ====================================
+
+# Kubernetes namespace for CouchDB deployment
+couchdb_namespace = "couchdb"
+
+# Name of the CouchDB Persistent Volume Claim
+couchdb_pvc_name = "couchdb-pvc"
+
+# Storage size for CouchDB data persistence
+# Format: <number>Gi (e.g., 10Gi, 50Gi)
+couchdb_storage_size = "10Gi"
+
+# Name of the CouchDB deployment in Kubernetes
+couchdb_deployment_name = "couchdb"
+
+# Docker image for CouchDB container
+# Format: couchdb:<version>
+couchdb_image = "couchdb:3.3.2"
+
+# CouchDB administrator username
+couchdb_user = "admin"
+
+# CouchDB administrator password
+# IMPORTANT: Use a strong, unique password
+couchdb_password = ""
+
+# Name of the CouchDB Kubernetes service
+couchdb_service_name = "couchdb-service"
+
+# Name of the CouchDB database for the application
+couchdb_database_name = "account"
+
+# Kubernetes namespace for OLM (Operator Lifecycle Manager)
+olm_namespace = "olm"
+
+# =============================================================================
+# SECURITY & SECRETS VARIABLES
+# =============================================================================
+# These variables configure security services and authentication for the
+# Stock Trader application.
+# =============================================================================
+
+# Azure Key Vault configuration
+# =============================
+
+# Name of the Azure Key Vault for storing application secrets
+# Must be globally unique across all Azure subscriptions
+# IMPORTANT: Must be 3-24 characters, alphanumeric and dashes only
+# Format: kv-<project>-<env>-<region> (keep it short!)
+key_vault_name = "kv-stocktrader-dev"
+
+# OpenID Connect (OIDC) Configuration
+# ===================================
+
+# OIDC client identifier for the Stock Trader application
+# Used for authentication and authorization
+# VALIDATION: 3-63 characters, alphanumeric and hyphens only
+oidc_client_id = "stock-trader"
+
+# OIDC client secret for secure authentication
+# IMPORTANT: Generate a secure random secret using one of these methods:
+#   OpenSSL: openssl rand -base64 32
+#   Python: python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+#   Node.js: node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+#   PowerShell: [System.Web.Security.Membership]::GeneratePassword(32, 8)
+oidc_client_secret = ""
+
+# =============================================================================
+# MONITORING & ALERTING VARIABLES
+# =============================================================================
+# These variables configure monitoring, alerting, and observability for the
+# infrastructure and application.
+# =============================================================================
+
+# Email address for receiving monitoring alerts and notifications
+# Used for Azure Monitor action groups and alert rules
+email_receiver_name = ""
+
+# =============================================================================
+# EXTERNAL SECRETS VARIABLES (OPTIONAL)
+# =============================================================================
+# These variables configure External Secrets Operator for secure secret
+# management. Default values are suitable for most deployments.
+# =============================================================================
+
+# Namespace to install External Secrets Operator
+# Default: external-secrets
+external_secrets_namespace = "external-secrets"
+
+# ServiceAccount name used by ESO for Azure Workload Identity
+# Default: eso-wi
+external_secrets_service_account = "eso-wi"
+
+# ClusterSecretStore name for Key Vault
+# Default: azure-kv
+cluster_secret_store_name = "azure-kv"
+
+# Kubernetes secret name for app credentials
+# Default: stock-trader-secret-credentials
+credentials_secret_name = "stock-trader-secret-credentials"
+
+# Azure Function App
+# Must be globally unique across Azure
+function_app_name = ""
+
+# =============================================================================
+# NETWORKING VARIABLES (OPTIONAL)
+# =============================================================================
+# These variables configure advanced networking settings. The default values
+# are suitable for most deployments and should only be changed if you have
+# specific networking requirements.
+# =============================================================================
+
+# Kubernetes service CIDR range
+# Default: 10.200.0.0/16
+# Only change if you have specific network requirements
+aks_service_cidr = "10.200.0.0/16"
+
+# Kubernetes pod CIDR range
+# Default: 10.201.0.0/16
+# Only change if you have specific network requirements
+aks_pod_cidr = "10.201.0.0/16"
+
+# Kubernetes DNS service IP
+# Default: 10.200.0.10
+# Must be within the service_cidr range
+aks_dns_service_ip = "10.200.0.10"
+
+# =============================================================================
+# DEPLOYMENT NOTES
+# =============================================================================
+#
+# After copying this file to terraform.tfvars and filling in your values:
+#
+# 1. Run precheck to validate prerequisites:
+#    make precheck
+#
+# 2. Initialize Terraform:
+#    make init
+#
+# 3. Review the deployment plan:
+#    make plan
+#
+# 4. Deploy the infrastructure:
+#    make apply
+#
+# 5. Verify the deployment:
+#    make postcheck
+#
+# 6. Access the application:
+#    make app-url
+#
+# For troubleshooting and additional information:
+# - Architecture details: ARCHITECTURE.md
+# - Variable documentation: variables.tf
+# - Module documentation: modules/*/README.md
+# =============================================================================

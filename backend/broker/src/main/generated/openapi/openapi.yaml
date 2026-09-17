@@ -1,0 +1,180 @@
+---
+openapi: 3.1.0
+components:
+  schemas:
+    Broker:
+      type: object
+      properties:
+        owner:
+          type: string
+        total:
+          type: number
+          format: double
+        loyalty:
+          type: string
+        balance:
+          type: number
+          format: double
+        commissions:
+          type: number
+          format: double
+        free:
+          type: integer
+          format: int32
+        sentiment:
+          type: string
+        nextCommission:
+          type: number
+          format: double
+        cashAccountBalance:
+          type: number
+          format: double
+        cashAccountCurrency:
+          type: string
+        stocks:
+          type: object
+        currencyFormatter:
+          type: object
+        stocksJSON:
+          type: string
+    Feedback:
+      type: object
+      properties:
+        message:
+          type: string
+        free:
+          type: integer
+          format: int32
+        sentiment:
+          type: string
+    WatsonInput:
+      type: object
+      properties:
+        text:
+          type: string
+paths:
+  /:
+    get:
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Broker"
+  /{owner}:
+    put:
+      parameters:
+      - name: owner
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: shares
+        in: query
+        schema:
+          type: integer
+          format: int32
+      - name: symbol
+        in: query
+        schema:
+          type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Broker"
+    get:
+      parameters:
+      - name: owner
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Broker"
+    delete:
+      parameters:
+      - name: owner
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Broker"
+    post:
+      parameters:
+      - name: owner
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: balance
+        in: query
+        schema:
+          type: number
+          format: double
+      - name: currency
+        in: query
+        schema:
+          type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Broker"
+  /{owner}/feedback:
+    post:
+      parameters:
+      - name: owner
+        in: path
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WatsonInput"
+        required: true
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Feedback"
+  /{owner}/returns:
+    get:
+      parameters:
+      - name: owner
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            text/plain:
+              schema:
+                type: string
+info:
+  title: Generated API
+  version: "1.0"

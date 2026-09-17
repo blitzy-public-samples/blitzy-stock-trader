@@ -1,0 +1,83 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stock-sentiment-analysis"
+version = "1.0.0"
+description = "Professional stock sentiment analysis dashboard with Azure OpenAI, Redis caching, and RAG"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "Anand Mohan Singh"}
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+
+dependencies = [
+    "streamlit>=1.28.0",
+    "pandas>=2.0.0",
+    "plotly>=5.17.0",
+    "yfinance>=0.2.0",
+    "openai>=1.0.0",
+    "python-dotenv>=1.0.0",
+    "redis>=5.0.0",
+    "numpy>=1.24.0",
+    "textblob>=0.17.1",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-mock>=3.11.0",
+    "pytest-env>=1.1.0",
+    "pytest-timeout>=2.1.0",
+    "fakeredis>=2.18.0",
+    "responses>=0.23.0",
+    "black>=23.0.0",
+    "flake8>=6.0.0",
+    "mypy>=1.5.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/IBMStockTrader/stock-sentiment-analysis"
+Documentation = "https://github.com/IBMStockTrader/stock-sentiment-analysis#readme"
+Repository = "https://github.com/IBMStockTrader/stock-sentiment-analysis"
+Issues = "https://github.com/IBMStockTrader/stock-sentiment-analysis/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 100
+target-version = ['py38', 'py39', 'py310', 'py311']
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+markers = [
+    "unit: Unit tests (always use mocks)",
+    "integration: Integration tests (mocks by default)",
+    "integration_real: Integration tests with real APIs",
+    "api: API endpoint tests",
+    "real_api: Tests that require real APIs",
+    "slow: Tests that take longer (real API tests)",
+]
+asyncio_mode = "auto"
+timeout = 300
+

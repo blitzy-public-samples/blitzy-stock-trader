@@ -1,0 +1,248 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!--
+       Copyright 2017-2021 IBM Corp All Rights Reserved
+       Copyright 2022-2025 Kyndryl, All Rights Reserved
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+       http://www.apache.org/licenses/LICENSE-2.0
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-->
+
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.stocktrader</groupId>
+    <artifactId>trader</artifactId>
+    <version>1.0-SNAPSHOT</version>
+    <packaging>war</packaging>
+
+    <name>StockTrader - trader</name>
+
+    <!-- Parent needed for MicroClimate to build properly -->
+<!--    <parent>
+        <groupId>io.openliberty.tools</groupId>
+        <artifactId>liberty-maven-app-parent</artifactId>
+        <version>3.11.5</version>
+    </parent>
+-->
+    <properties>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+        <maven.compiler.release>21</maven.compiler.release>
+
+        <app.name>trader</app.name>
+        <warContext>${app.name}</warContext>
+
+        <!-- Liberty configuration -->
+        <liberty.var.default.http.port>9080</liberty.var.default.http.port>
+        <liberty.var.default.https.port>9443</liberty.var.default.https.port>
+        <liberty.var.project.name>${project.artifactId}</liberty.var.project.name>
+        <liberty.var.app.context.root>${project.artifactId}</liberty.var.app.context.root>
+        <liberty.env.TEST_MODE>true</liberty.env.TEST_MODE>
+        <liberty.env.AUTH_TYPE>none</liberty.env.AUTH_TYPE>
+        <liberty.env.JWT_AUDIENCE>stock</liberty.env.JWT_AUDIENCE>
+        <liberty.env.JWT_ISSUER>trader</liberty.env.JWT_ISSUER>
+        <sonar.organization>ibmstocktrader</sonar.organization>
+        <sonar.host.url>https://sonarcloud.io</sonar.host.url>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.eclipse.microprofile</groupId>
+            <artifactId>microprofile</artifactId>
+            <version>6.1</version>
+            <type>pom</type>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <!-- this ships as part of MP 6.1 on OpenLiberty -->
+            <groupId>org.eclipse.microprofile.telemetry</groupId>
+            <artifactId>microprofile-telemetry-api</artifactId>
+            <type>pom</type>
+            <version>2.0</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>jakarta.platform</groupId>
+            <artifactId>jakarta.jakartaee-web-api</artifactId>
+            <version>10.0.0</version>
+            <scope>provided</scope>
+        </dependency>
+        <!-- Used for health checking math -->
+        <dependency>
+            <groupId>org.apache.commons</groupId>
+            <artifactId>commons-math3</artifactId>
+            <version>3.6.1</version>
+        </dependency>
+        <!-- disable jaeger to pass security scan -->
+        <dependency>
+            <groupId>io.jaegertracing</groupId>
+            <artifactId>jaeger-client</artifactId>
+            <version>1.8.1</version>
+        </dependency>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-jdk14</artifactId>
+            <version>2.0.17</version>
+        </dependency>
+        <dependency>
+            <groupId>com.ibm.cos</groupId>
+            <artifactId>ibm-cos-java-sdk-s3</artifactId>
+            <version>2.14.1</version>
+        </dependency>
+        <!-- Dependencies only used in tests -->
+        <dependency>
+            <groupId>junit</groupId>
+            <artifactId>junit</artifactId>
+            <version>4.13.2</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.cxf</groupId>
+            <artifactId>cxf-rt-rs-client</artifactId>
+            <version>4.1.1</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>jakarta.xml.bind</groupId>
+            <artifactId>jakarta.xml.bind-api</artifactId>
+            <version>4.0.2</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <finalName>TraderUI</finalName>
+        <plugins>
+            <!-- generate OpenAPI documentation -->
+            <plugin>
+                <artifactId>smallrye-open-api-maven-plugin</artifactId>
+                <groupId>io.smallrye</groupId>
+                <configuration>
+                    <outputDirectory>${project.basedir}/src/main/generated/openapi</outputDirectory>
+                </configuration>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>generate-schema</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-war-plugin</artifactId>
+                <version>3.4.0</version>
+                <configuration>
+                    <failOnMissingWebXml>false</failOnMissingWebXml>
+                    <packagingExcludes>pom.xml</packagingExcludes>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.14.0</version>
+                <configuration>
+                    <source>21</source>
+                    <target>21</target>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-resources-plugin</artifactId>
+                <version>3.3.1</version>
+            </plugin>
+            <!-- Enable liberty-maven plugin -->
+            <plugin>
+                <groupId>io.openliberty.tools</groupId>
+                <artifactId>liberty-maven-plugin</artifactId>
+                <version>3.11.5</version>
+                <executions>
+                    <execution>
+                        <id>start-server</id>
+                        <phase>pre-integration-test</phase>
+                        <goals> 
+                            <goal>test-start</goal>
+                            <goal>deploy</goal>
+                        </goals>
+                        <configuration>
+                            <looseApplication>false</looseApplication>
+                        </configuration>                    
+                    </execution>
+                    <execution>
+                        <id>install-feature</id>
+                        <phase>prepare-package</phase>
+                        <goals>
+                            <goal>create</goal>                        
+                            <goal>install-feature</goal>
+                        </goals>
+                    <configuration>
+                        <features>
+                            <feature>microprofile-7.1</feature>
+                            <feature>mpTelemetry-2.1</feature>
+                            <feature>pages-3.1</feature>
+                        </features>
+                    </configuration>
+                    </execution>                  
+                    <execution>
+                        <id>stop-server</id>
+                        <phase>post-integration-test</phase>
+                        <goals> 
+                            <goal>test-stop</goal> 
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                     <assemblyArtifact>
+                            <groupId>com.ibm.websphere.appserver.runtime</groupId>
+                            <artifactId>wlp-webProfile10</artifactId>
+                            <version>25.0.0.9</version>
+                            <type>zip</type>
+                     </assemblyArtifact>
+                     <configDirectory>${basedir}/src/main/liberty/config</configDirectory>
+                     <include>${packaging.type}</include>
+                     <bootstrapProperties>
+                            <app.location>${project.artifactId}-${project.version}.war</app.location>
+                            <default.http.port>${testServerHttpPort}</default.http.port>
+                            <default.https.port>${testServerHttpsPort}</default.https.port>
+                     </bootstrapProperties>
+                     <features>
+                            <acceptLicense>true</acceptLicense>
+                     </features>
+                     <looseApplication>false</looseApplication>
+                     <stripVersion>true</stripVersion>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-failsafe-plugin</artifactId>
+                <version>3.5.4</version>
+                <executions>
+                  <execution>
+                    <goals>
+                      <goal>integration-test</goal>
+                      <goal>verify</goal>
+                    </goals>
+                  </execution>
+                </executions>
+                <configuration>
+                    <systemPropertyVariables>
+                        <http.port>${liberty.var.default.http.port}</http.port>
+                        <https.port>${liberty.var.default.https.port}</https.port>
+                        <war.name>${liberty.var.app.context.root}</war.name>
+                        <JWT_AUDIENCE>stock</JWT_AUDIENCE>
+                        <JWT_ISSUER>trader</JWT_ISSUER>
+                        <AUTH_TYPE>none</AUTH_TYPE>
+                        <TEST_MODE>true</TEST_MODE>
+                    </systemPropertyVariables>
+                </configuration>
+            </plugin>            
+        </plugins>
+    </build>
+</project>
