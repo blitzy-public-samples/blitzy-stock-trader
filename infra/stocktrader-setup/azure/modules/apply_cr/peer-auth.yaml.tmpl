@@ -1,8 +1,0 @@
-apiVersion: security.istio.io/v1beta1
-kind: PeerAuthentication
-metadata:
-  name: stock-trader-mtls
-  namespace: ${namespace}
-spec:
-  mtls:
-    mode: STRICT

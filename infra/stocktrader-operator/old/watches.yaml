@@ -1,5 +1,0 @@
----
-- version: v1
-  group: operators.ibm.com
-  kind: StockTrader
-  chart: helm-charts/stocktrader

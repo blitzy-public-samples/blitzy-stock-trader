@@ -1,5 +1,0 @@
-resources:
-- bases/stocktrader-operator.clusterserviceversion.yaml
-- ../default
-- ../samples
-- ../scorecard
