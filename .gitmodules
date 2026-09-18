@@ -1,64 +1,64 @@
 [submodule "frontend/trader"]
 	path = frontend/trader
-	url = https://github.com/aidan-blitzy/trader.git
+	url = https://github.com/blitzy-public-samples/trader.git
 	branch = master
 [submodule "backend/broker"]
 	path = backend/broker
-	url = https://github.com/aidan-blitzy/broker.git
+	url = https://github.com/blitzy-public-samples/broker.git
         branch = master
 [submodule "backend/portfolio"]
 	path = backend/portfolio
-	url = https://github.com/aidan-blitzy/portfolio.git
+	url = https://github.com/blitzy-public-samples/portfolio.git
         branch = master
 [submodule "backend/account"]
 	path = backend/account
-	url = https://github.com/aidan-blitzy/account.git
+	url = https://github.com/blitzy-public-samples/account.git
         branch = master
 [submodule "backend/cash-account-cobol"]
 	path = backend/cash-account-cobol
-	url = https://github.com/aidan-blitzy/cash-account-cobol.git
+	url = https://github.com/blitzy-public-samples/cash-account-cobol.git
         branch = main
 [submodule "backend/stock-quote"]
 	path = backend/stock-quote
-	url = https://github.com/aidan-blitzy/stock-quote.git
+	url = https://github.com/blitzy-public-samples/stock-quote.git
         branch = master
 [submodule "backend/trade-history"]
 	path = backend/trade-history
-	url = https://github.com/aidan-blitzy/trade-history.git
+	url = https://github.com/blitzy-public-samples/trade-history.git
         branch = master
 [submodule "backend/messaging"]
 	path = backend/messaging
-	url = https://github.com/aidan-blitzy/messaging.git
+	url = https://github.com/blitzy-public-samples/messaging.git
         branch = master
 [submodule "backend/notification-twitter"]
 	path = backend/notification-twitter
-	url = https://github.com/aidan-blitzy/notification-twitter.git
+	url = https://github.com/blitzy-public-samples/notification-twitter.git
         branch = master
 [submodule "backend/stock-sentiment-analysis"]
 	path = backend/stock-sentiment-analysis
-	url = https://github.com/aidan-blitzy/stock-sentiment-analysis.git
+	url = https://github.com/blitzy-public-samples/stock-sentiment-analysis.git
         branch = main
 [submodule "backend/portfolio-assistant"]
 	path = backend/portfolio-assistant
-	url = https://github.com/aidan-blitzy/portfolio-assistant.git
+	url = https://github.com/blitzy-public-samples/portfolio-assistant.git
         branch = main
 [submodule "infra/stocktrader-operator"]
 	path = infra/stocktrader-operator
-	url = https://github.com/aidan-blitzy/stocktrader-operator.git
+	url = https://github.com/blitzy-public-samples/stocktrader-operator.git
         branch = master
 [submodule "infra/stocktrader-gitops"]
 	path = infra/stocktrader-gitops
-	url = https://github.com/aidan-blitzy/stocktrader-gitops.git
+	url = https://github.com/blitzy-public-samples/stocktrader-gitops.git
         branch = main
 [submodule "infra/stocktrader-setup"]
 	path = infra/stocktrader-setup
-	url = https://github.com/aidan-blitzy/stocktrader-setup.git
+	url = https://github.com/blitzy-public-samples/stocktrader-setup.git
         branch = main
 [submodule "tools/test-tools"]
 	path = tools/test-tools
-	url = https://github.com/aidan-blitzy/test-tools.git
+	url = https://github.com/blitzy-public-samples/test-tools.git
 	branch = main
 [submodule "tools/looper"]
 	path = tools/looper
-	url = https://github.com/aidan-blitzy/looper.git
+	url = https://github.com/blitzy-public-samples/looper.git
 	branch = master
