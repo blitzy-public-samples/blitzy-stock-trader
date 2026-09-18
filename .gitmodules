@@ -1,64 +1,64 @@
 [submodule "frontend/trader"]
 	path = frontend/trader
 	url = https://github.com/blitzy-public-samples/trader.git
-	branch = master
+	branch = blitzy
 [submodule "backend/broker"]
 	path = backend/broker
 	url = https://github.com/blitzy-public-samples/broker.git
-	branch = master
+	branch = blitzy
 [submodule "backend/portfolio"]
 	path = backend/portfolio
 	url = https://github.com/blitzy-public-samples/portfolio.git
-	branch = master
+	branch = blitzy
 [submodule "backend/account"]
 	path = backend/account
 	url = https://github.com/blitzy-public-samples/account.git
-	branch = master
+	branch = blitzy
 [submodule "backend/cash-account-cobol"]
 	path = backend/cash-account-cobol
 	url = https://github.com/blitzy-public-samples/cash-account-cobol.git
-	branch = main
+	branch = blitzy
 [submodule "backend/stock-quote"]
 	path = backend/stock-quote
 	url = https://github.com/blitzy-public-samples/stock-quote.git
-	branch = master
+	branch = blitzy
 [submodule "backend/trade-history"]
 	path = backend/trade-history
 	url = https://github.com/blitzy-public-samples/trade-history.git
-	branch = master
+	branch = blitzy
 [submodule "backend/messaging"]
 	path = backend/messaging
 	url = https://github.com/blitzy-public-samples/messaging.git
-	branch = master
+	branch = blitzy
 [submodule "backend/notification-twitter"]
 	path = backend/notification-twitter
 	url = https://github.com/blitzy-public-samples/notification-twitter.git
-	branch = master
+	branch = blitzy
 [submodule "backend/stock-sentiment-analysis"]
 	path = backend/stock-sentiment-analysis
 	url = https://github.com/blitzy-public-samples/stock-sentiment-analysis.git
-	branch = main
+	branch = blitzy
 [submodule "backend/portfolio-assistant"]
 	path = backend/portfolio-assistant
 	url = https://github.com/blitzy-public-samples/portfolio-assistant.git
-	branch = main
+	branch = blitzy
 [submodule "infra/stocktrader-operator"]
 	path = infra/stocktrader-operator
 	url = https://github.com/blitzy-public-samples/stocktrader-operator.git
-	branch = master
+	branch = blitzy
 [submodule "infra/stocktrader-gitops"]
 	path = infra/stocktrader-gitops
 	url = https://github.com/blitzy-public-samples/stocktrader-gitops.git
-	branch = main
+	branch = blitzy
 [submodule "infra/stocktrader-setup"]
 	path = infra/stocktrader-setup
 	url = https://github.com/blitzy-public-samples/stocktrader-setup.git
-	branch = main
+	branch = blitzy
 [submodule "tools/test-tools"]
 	path = tools/test-tools
 	url = https://github.com/blitzy-public-samples/test-tools.git
-	branch = main
+	branch = blitzy
 [submodule "tools/looper"]
 	path = tools/looper
 	url = https://github.com/blitzy-public-samples/looper.git
-	branch = master
+	branch = blitzy
