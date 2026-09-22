@@ -17,7 +17,6 @@
 
 package com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.it;
 
-//Jakarta REST client 3.1
 import jakarta.ws.rs.client.Client;
 import jakarta.ws.rs.client.ClientBuilder;
 import jakarta.ws.rs.client.Entity;
@@ -25,7 +24,6 @@ import jakarta.ws.rs.client.Invocation;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 
-//JSON-P 2.1, for building request bodies and reading response bodies
 import jakarta.json.Json;
 import jakarta.json.JsonArray;
 import jakarta.json.JsonObject;
@@ -38,7 +36,6 @@ import java.time.Instant;
 import java.util.Base64;
 import java.util.UUID;
 
-//JUnit 5 Jupiter
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -124,8 +121,7 @@ class SettlementExceptionIT {
 
     /* The arrow is written as an escape so this source file stays ASCII whatever encoding an editor
        saves it in, while the assertion still pins the U+2192 character LifecycleTransitions emits
-       and StateConflictExceptionMapper relays verbatim. Should this ever fail, the fault is a
-       charset in the pipeline rather than the message, and the fix belongs there. */
+       and StateConflictExceptionMapper relays verbatim. */
     private static final String DUPLICATE_RESOLVE_CONFLICT =
         "RESOLVED \u2192 RESOLVED is not a legal transition";
 

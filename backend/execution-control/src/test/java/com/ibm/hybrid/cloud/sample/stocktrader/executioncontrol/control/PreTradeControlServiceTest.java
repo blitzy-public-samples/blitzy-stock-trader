@@ -22,19 +22,15 @@ import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.Order;
 import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.Position;
 import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.RecordSource;
 
-//Arbitrary-precision arithmetic
 import java.math.BigDecimal;
 
-//Time (java.time)
 import java.time.Instant;
 
-//Collections
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 
-//JUnit 5 Jupiter
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -64,11 +60,14 @@ class PreTradeControlServiceTest {
     private static final List<String> DEFAULT_RESTRICTED_SYMBOLS = Arrays.asList("RSTRA", "RSTRB");
     private static final int DEFAULT_EXCEPTION_SLA_HOURS = 24;
 
-    //The rendering the restricted-symbol result reports as its configured limit.
     private static final String RESTRICTED_LIST = "RSTRA,RSTRB";
 
     //evaluate reads no clock, so this instant only fills the Order constructor and is never asserted.
     private static final Instant SUBMITTED_AT = Instant.parse("2025-01-02T03:04:05Z");
+
+    //Comfortably above the longest refusal this service composes and far below the megabyte a
+    //rendered out-of-range amount would run to, so the assertion tells the two apart.
+    private static final int MAX_REFUSAL_MESSAGE_LENGTH = 300;
 
 
     @Test
@@ -232,7 +231,6 @@ class PreTradeControlServiceTest {
 
         ControlResult reducedPosition = control(sellDown, MAX_POSITION_NOTIONAL);
         assertTrue(reducedPosition.isPassed(), MAX_POSITION_NOTIONAL + " must pass at 4000000.00");
-        //40000, not 50000: a sell subtracts its quantity from the holding it settles against.
         assertEquals("4000000.00", reducedPosition.getObservedValue(),
                 MAX_POSITION_NOTIONAL + " observed resulting position notional");
         assertPassedWithinLimit(sellDown, MAX_ORDER_NOTIONAL);
@@ -347,11 +345,11 @@ class PreTradeControlServiceTest {
 
     @Test
     void testResultingQuantityBeyondLongRangeIsMeasuredRatherThanWrapped() {
-        /* Long.MAX_VALUE + 1 is the arithmetic that used to wrap to Long.MIN_VALUE, whose Math.abs
-           is still negative: the control observed a negative notional, found it under a positive
-           ceiling and passed the largest position the service could be asked to take. The true
-           magnitude is 9223372036854775808 shares, so at 0.01 the exposure is 92233720368547758.08
-           and the only correct verdict is a breach. */
+        /* The resulting share count here is one past Long.MAX_VALUE. In long arithmetic it wraps to
+           Long.MIN_VALUE, whose Math.abs is still negative, and a control observing a negative
+           notional finds it under a positive ceiling and passes the largest position the service
+           could be asked to take. The true magnitude is 9223372036854775808 shares, an exposure of
+           92233720368547758.08 at 0.01, so a breach is the only correct verdict. */
         List<ControlResult> overflowingBuy = defaultService().evaluate(
                 order("INST-001", "BUY", "SYNA", 1, "0.01"),
                 position("INST-001", "SYNA", Long.MAX_VALUE, "0.01"));
@@ -383,10 +381,10 @@ class PreTradeControlServiceTest {
     @Test
     void testUnexpectedSideFailsFastRatherThanBeingMeasuredAsABuy() {
         /* OrderLifecycleService.submit refuses anything but BUY or SELL, so this order cannot arise
-           from a request; what it proves is that the fallback which used to treat every non-SELL
-           side as a buy is gone. Against the short below that fallback moved the resulting quantity
-           towards zero and reported 4000000.00 - less exposure than the trade carries - so guessing
-           the side is the one thing this control must not do. */
+           from a request. The control matches the side exactly against BUY and then SELL and
+           refuses anything else: measuring an unknown side as a buy moves the resulting quantity
+           towards zero against the short below and reports 4000000.00 - less exposure than the
+           trade carries - and guessing the side is the one thing this control must not do. */
         IllegalArgumentException refused = assertThrows(IllegalArgumentException.class,
                 () -> defaultService().evaluate(order("INST-002", "SHORT", "SYND", 5000, "100.00"),
                         position("INST-002", "SYND", -45000, "100.00")),
@@ -394,7 +392,6 @@ class PreTradeControlServiceTest {
         assertTrue(refused.getMessage().contains("SHORT"),
                 "the message must name the rejected side: " + refused.getMessage());
 
-        //Both validated sides remain measurable, so failing fast costs the legal path nothing.
         assertNotNull(defaultService().evaluate(order("INST-002", "BUY", "SYND", 1, "100.00"), null),
                 "BUY must still be measured");
         assertNotNull(defaultService().evaluate(order("INST-002", "SELL", "SYND", 1, "100.00"), null),
@@ -416,7 +413,6 @@ class PreTradeControlServiceTest {
         assertTrue(restricted.isPassed(),
                 "no second canonicalization happens here, so a raw ticker matches nothing");
 
-        //The canonical spelling the submit path produces is the one the restricted list holds.
         ControlResult canonical = control(defaultService().evaluate(
                 orderWithRawSymbol("INST-001", "BUY", "RSTRA", 10, "10.00"), null),
                 RESTRICTED_SYMBOL);
@@ -425,8 +421,6 @@ class PreTradeControlServiceTest {
 
     @Test
     void testNullExistingPositionTreatsExistingQuantityAsZero() {
-        //A client's first order in a symbol has no position to add to, which must read as a holding
-        //of zero rather than fail the evaluation.
         List<ControlResult> results = defaultService().evaluate(
                 order("INST-001", "BUY", "SYNA", 100, "100.00"), null);
 
@@ -505,6 +499,58 @@ class PreTradeControlServiceTest {
                 "a key no configuration source declares must stop start-up");
         assertTrue(undeclared.getMessage().startsWith("RESTRICTED_SYMBOLS is not declared"),
                 "the undeclared key must be named");
+    }
+
+    @Test
+    void testAmountsBeyondTheSupportedRangeAreRefusedBeforeBeingRendered() {
+        /* Both reported values and the reason of each notional control are produced with setScale
+           and toPlainString, and that is where a BigDecimal's exponent stops being a few characters
+           and becomes digits. An order's own amounts are bounded when Order is constructed, so the
+           value that can still arrive unbounded is a configured ceiling: 1E+40 normalizes to
+           forty-three digits at two decimals, past the supported forty. */
+        ControlLimits beyondRange = new ControlLimits(new BigDecimal("1E+40"),
+                DEFAULT_MAX_POSITION_NOTIONAL, DEFAULT_FAT_FINGER_THRESHOLD,
+                DEFAULT_RESTRICTED_SYMBOLS, DEFAULT_EXCEPTION_SLA_HOURS);
+
+        IllegalArgumentException refusedLimit = assertThrows(IllegalArgumentException.class,
+                () -> new PreTradeControlService(beyondRange).evaluate(
+                        order("INST-001", "BUY", "SYNA", 100, "100.00"), null),
+                "a configured limit outside the supported amount range must be refused");
+        assertTrue(refusedLimit.getMessage().contains("significant digits"),
+                "the refusal must report the representation: " + refusedLimit.getMessage());
+        assertTrue(refusedLimit.getMessage().length() < MAX_REFUSAL_MESSAGE_LENGTH,
+                "the refusal must describe the amount rather than render it, but its message ran to "
+                        + refusedLimit.getMessage().length() + " characters");
+
+        //Headroom rather than a hazard: 1E+30 is thirty-three digits at two decimals and is still
+        //reported in full, so the bound refuses what cannot be rendered without clipping a ceiling
+        //an operator might genuinely configure.
+        List<ControlResult> permissive = new PreTradeControlService(new ControlLimits(
+                new BigDecimal("1E+30"), new BigDecimal("1E+30"), new BigDecimal("1E+30"),
+                DEFAULT_RESTRICTED_SYMBOLS, DEFAULT_EXCEPTION_SLA_HOURS)).evaluate(
+                        order("INST-001", "BUY", "SYNA", 100, "100.00"), null);
+
+        assertEquals("1000000000000000000000000000000.00",
+                control(permissive, MAX_ORDER_NOTIONAL).getConfiguredLimit(),
+                MAX_ORDER_NOTIONAL + " configured limit reported in full");
+        assertPassedWithinLimit(permissive, MAX_ORDER_NOTIONAL);
+
+        /* The other direction is closed one layer earlier: evaluate reads order.getNotional() and
+           order.getLimitPrice(), so an order that cannot be constructed is an order whose amounts
+           never reach the renderer. */
+        IllegalArgumentException refusedOrder = assertThrows(IllegalArgumentException.class,
+                () -> order("INST-001", "BUY", "SYNA", 100, "1E+1000000"),
+                "an order carrying a compact exponent price must be refused at construction");
+        assertTrue(refusedOrder.getMessage().contains("limitPrice"),
+                "the refusal must name limitPrice: " + refusedOrder.getMessage());
+
+        assertTrue(Order.isAmountWithinBounds(new BigDecimal("100.00")),
+                "an ordinary two-decimal amount is within bounds");
+        //A scale this large expands inside toPlainString rather than inside setScale, which is why
+        //the bound is two-sided instead of a ceiling on magnitude alone.
+        assertFalse(Order.isAmountWithinBounds(new BigDecimal("1E-1000000")),
+                "a scale large enough to expand while being rendered is out of bounds");
+        assertFalse(Order.isAmountWithinBounds(null), "a missing amount is not a bounded amount");
     }
 
 

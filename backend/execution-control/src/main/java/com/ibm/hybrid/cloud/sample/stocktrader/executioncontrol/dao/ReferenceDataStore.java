@@ -20,6 +20,10 @@ package com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.dao;
 import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.ClientAccount;
 import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.ControlResult;
 import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.Position;
+//The module's one capacity type, which is what lets one mapper answer 503 wherever a ceiling is
+//reached; the class it names is a leaf that imports nothing, so no dependency on lifecycle
+//behaviour comes with it.
+import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.lifecycle.CapacityExceededException;
 
 //Collections
 import java.util.ArrayList;
@@ -31,6 +35,7 @@ import java.util.Objects;
 
 //Concurrency
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 
 //CDI 4.0
@@ -42,6 +47,11 @@ import jakarta.enterprise.context.ApplicationScoped;
 public class ReferenceDataStore {
     private static final String KEY_SEPARATOR = "|";
 
+    //The ceiling on distinct client-and-symbol holdings. Lower than the order ceiling because a
+    //position is a key, not a record per order: only a client's first fill in a symbol adds one,
+    //and every later fill in that symbol rewrites it in place.
+    public static final int MAX_POSITIONS = 5_000;
+
     //Ordered on the way out because ConcurrentHashMap iteration order is arbitrary, and
     //GET /positions is read entry by entry by its consumers.
     private static final Comparator<Position> BY_CLIENT_THEN_SYMBOL =
@@ -50,13 +60,33 @@ public class ReferenceDataStore {
     private final ConcurrentHashMap<String, ClientAccount> clients = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Position> positions = new ConcurrentHashMap<>();
 
+    /* Claims, not stored positions: a claim is taken inside the atomic step that would create the
+       key and released if no position came of it, so this counter - never positions.size() - is
+       what makes the ceiling exact under concurrency. Comparing the map's size would let any
+       number of simultaneous first fills in distinct symbols each read the same under-ceiling
+       size and all proceed. */
+    private final AtomicInteger admittedPositions = new AtomicInteger();
+
 
     public void putClient(ClientAccount client) {
         clients.put(client.getClientId(), client);
     }
 
+    /* Written inside a compute so the claim decision and the write are one step: a plain put
+       could not tell a creation from a replacement without a preceding read, and between that
+       read and the put another thread could create the very key this call then counted twice.
+       Only a creation claims - a replacement rewrites an entry that already holds its slot. */
     public void putPosition(Position position) {
-        positions.put(positionKey(position.getClientId(), position.getSymbol()), position);
+        String clientId = position.getClientId();
+        String symbol = position.getSymbol();
+
+        positions.compute(positionKey(clientId, symbol), (key, current) -> {
+            if (current == null && !tryAdmitPosition()) {
+                throw new CapacityExceededException("the position store is at capacity, so no new "
+                        + symbol + " position can be opened for clientId " + clientId);
+            }
+            return position;
+        });
     }
 
     /* Evaluating the controls and applying the fill are deliberately one atomic step per client
@@ -72,12 +102,73 @@ public class ReferenceDataStore {
         //this client's first order in the symbol, which the controls value at quantity zero rather
         //than refuse, and which the operator may turn into a brand-new position.
         positions.compute(positionKey(clientId, symbol), (key, current) -> {
-            FillDecision decision = operator.apply(current);
-            decided[0] = decision;
-            return decision.isFilled() ? decision.getReplacement() : current;
+            /* An absent key is about to be created, so the slot is claimed before the operator is
+               given the chance to create it, and the refusal is thrown from inside this remapping
+               function: compute then leaves the map exactly as it was, so a submission refused at
+               the ceiling creates nothing at all. */
+            boolean claimed = false;
+            if (current == null) {
+                if (!tryAdmitPosition()) {
+                    throw new CapacityExceededException("the position store is at capacity, so no "
+                            + "new " + symbol + " position can be opened for clientId " + clientId);
+                }
+                claimed = true;
+            }
+
+            boolean created = false;
+            try {
+                FillDecision decision = operator.apply(current);
+                decided[0] = decision;
+                created = decision.isFilled();
+                return created ? decision.getReplacement() : current;
+            } finally {
+                //Handed back whenever no position came of the claim - the controls refused the
+                //order, or the operator itself refused it - because a slot held by a position that
+                //does not exist would retire one of the ceiling for the life of the process.
+                if (claimed && !created) {
+                    releasePositionAdmission();
+                }
+            }
         });
 
         return decided[0];
+    }
+
+    //A compare-and-set loop rather than incrementAndGet followed by a test, as in
+    //OrderStore.tryAdmitOrder: incrementing first would let concurrent claimants push the counter
+    //past the ceiling and then hand some of them a refusal, so the ceiling would be exact only
+    //after the fact. Here a claim is never recorded unless it was granted.
+    private boolean tryAdmitPosition() {
+        int admitted = admittedPositions.get();
+        while (admitted < MAX_POSITIONS) {
+            if (admittedPositions.compareAndSet(admitted, admitted + 1)) {
+                return true;
+            }
+            admitted = admittedPositions.get();
+        }
+
+        return false;
+    }
+
+    //Floored at zero so an unbalanced release cannot mint capacity that was never claimed.
+    private void releasePositionAdmission() {
+        admittedPositions.updateAndGet(admitted -> (admitted > 0) ? admitted - 1 : 0);
+    }
+
+    /* Answered per key rather than on the map's size alone: a fill into a holding this client
+       already has rewrites that entry and adds no key, so an order in an existing position must
+       stay admissible at the ceiling - otherwise a full position map would freeze trading in the
+       very symbols it already holds. Only a first fill in a new client-and-symbol pair needs
+       headroom. This is the gate, asked before the submission has moved anything so the whole
+       flow can be declined at once; the claim inside evaluateAndFill is the authority, and it is
+       what stays exact when two first fills in distinct symbols pass this gate together. */
+    public boolean hasPositionCapacityFor(String clientId, String symbol) {
+        if (clientId == null || symbol == null) {
+            return positions.size() < MAX_POSITIONS;
+        }
+
+        return positions.containsKey(positionKey(clientId, symbol))
+                || positions.size() < MAX_POSITIONS;
     }
 
     public ClientAccount findClient(String clientId) {
@@ -100,6 +191,14 @@ public class ReferenceDataStore {
         return Collections.unmodifiableList(snapshot);
     }
 
+    //Sorted before the page is cut: ConcurrentHashMap iteration order is arbitrary, so a page
+    //taken from an unsorted copy could repeat or skip a holding between consecutive reads.
+    public List<Position> listPositions(int offset, int limit) {
+        List<Position> snapshot = new ArrayList<>(positions.values());
+        snapshot.sort(BY_CLIENT_THEN_SYMBOL);
+        return page(snapshot, offset, limit);
+    }
+
     public int clientCount() {
         return clients.size();
     }
@@ -108,8 +207,23 @@ public class ReferenceDataStore {
         return positions.size();
     }
 
+    //strip rather than trim, matching the canonicalization the lifecycle applies before it gets
+    //here: trim stops at U+0020, so the two would disagree on a symbol padded with Unicode
+    //whitespace and one holding could end up reachable under two different keys.
     private static String positionKey(String clientId, String symbol) {
-        return clientId + KEY_SEPARATOR + symbol.trim().toUpperCase(Locale.ROOT);
+        return clientId + KEY_SEPARATOR + symbol.strip().toUpperCase(Locale.ROOT);
+    }
+
+    /* Both arguments are taken defensively rather than asserted: a page read is a GET, and a
+       mis-typed query parameter must answer with the nearest page that exists instead of a 500.
+       A non-positive limit means "do not cut the page" rather than "return nothing", which lets an
+       in-process caller page without restating the REST layer's maximum page size. */
+    private static List<Position> page(List<Position> ordered, int offset, int limit) {
+        int from = Math.min(Math.max(offset, 0), ordered.size());
+        int to = (limit <= 0) ? ordered.size()
+                : (int) Math.min((long) from + limit, ordered.size());
+
+        return Collections.unmodifiableList(new ArrayList<>(ordered.subList(from, to)));
     }
 
 

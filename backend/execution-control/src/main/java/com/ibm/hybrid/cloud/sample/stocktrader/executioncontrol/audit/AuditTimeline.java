@@ -19,6 +19,10 @@ package com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.audit;
 
 import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.AuditEvent;
 import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.StateMachine;
+//The module's one capacity type, which is what lets one mapper answer 503 wherever a ceiling is
+//reached; the class it names is a leaf that imports nothing, so no dependency on lifecycle
+//behaviour comes with it.
+import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.lifecycle.CapacityExceededException;
 
 //Time (java.time)
 import java.time.Clock;
@@ -42,6 +46,15 @@ import jakarta.enterprise.context.ApplicationScoped;
 @ApplicationScoped
 public class AuditTimeline {
 
+    /* The ceiling on how many events this process will hold. It sits strictly above the worst case
+       the entity ceilings imply - the README carries that arithmetic - because the record must
+       never be the thing that refuses a state change the stores would have accepted: a fully
+       worked estate has to be able to record its own last transitions, and an order that moved
+       with its transition unrecorded is exactly the outcome this timeline exists to make
+       impossible. Admission is therefore refused upstream, while headroom remains, and this
+       ceiling is reached only by a caller that got past every gate. */
+    public static final int MAX_EVENTS = 150_000;
+
     /* Appending is the only operation offered: nothing here amends or discards a recorded
        event, nothing hands out the live list, and AuditEvent is itself immutable. The
        timeline is this service's audit record, and a record that can be rewritten after
@@ -62,12 +75,38 @@ public class AuditTimeline {
     public synchronized AuditEvent append(String entityType, String entityId, StateMachine stateMachine,
                                           String fromState, String toState, String actor, String reason,
                                           Clock clock) {
+        /* The ceiling is enforced here and not only by the gates the callers ask, because this
+           method holds the monitor that fixes the size: a check taken under it cannot be passed by
+           two concurrent appends the way a read taken outside it can. It refuses before the
+           ordinal is taken, so a refused append consumes no sequence number and leaves no gap in
+           the record that a reader would have to explain. */
+        if (events.size() >= MAX_EVENTS) {
+            throw new CapacityExceededException("the audit timeline is at capacity, so no further "
+                    + "event can be recorded");
+        }
+
         long next = sequence.incrementAndGet();
         Instant timestamp = clock.instant();
         AuditEvent event = new AuditEvent(String.format(Locale.ROOT, "EVT-%06d", next), next,
                 timestamp, entityType, entityId, stateMachine, fromState, toState, actor, reason);
         events.add(event);
         return event;
+    }
+
+    /* Asked before a flow starts, with the number of edges that flow can write at most, so a
+       submission that would run out of timeline part-way through is refused before it has moved
+       anything. Read under the same monitor as append, because a size read outside it could be
+       taken mid-append. This check and count decide *which* refusal a caller gets - a whole flow
+       declined at its first statement rather than a state change abandoned mid-way - while append
+       is the authority that cannot be passed: the headroom they report is not reserved, so two
+       flows may pass them against the same headroom and only append is exact. */
+    public synchronized boolean hasCapacityFor(int eventCount) {
+        int requested = Math.max(eventCount, 0);
+        return (long) events.size() + requested <= MAX_EVENTS;
+    }
+
+    public synchronized int count() {
+        return events.size();
     }
 
     /* Both reads answer with an unmodifiable view over a copy taken under the same monitor as
@@ -91,5 +130,43 @@ public class AuditTimeline {
 
     public synchronized List<AuditEvent> all() {
         return Collections.unmodifiableList(new ArrayList<>(events));
+    }
+
+    /* The bounded read every growing audit response comes through: narrowing and paging happen in
+       this one walk, so only the page is ever copied - the timeline is the one structure here that
+       grows without an entity to bound it, and a full copy taken merely to discard all but a page
+       of it would be the allocation this method exists to avoid. A null or blank key does not
+       narrow on that key, which is what lets one method answer the both-key, single-key and
+       unfiltered queries without the caller projecting from all(). Insertion order is sequence
+       order, as in every other read here. */
+    public synchronized List<AuditEvent> page(String entityType, String entityId, int offset,
+            int limit) {
+        boolean narrowByType = (entityType != null) && !entityType.isBlank();
+        boolean narrowById = (entityId != null) && !entityId.isBlank();
+        int skip = Math.max(offset, 0);
+        //A non-positive limit means "do not cut the page", matching the stores' paged reads: the
+        //REST layer clamps a caller's limit, and an in-process caller does not restate it.
+        int pageSize = (limit <= 0) ? Integer.MAX_VALUE : limit;
+
+        List<AuditEvent> matches = new ArrayList<>();
+        int skipped = 0;
+        for (AuditEvent event : events) {
+            if (narrowByType && !entityType.equals(event.getEntityType())) {
+                continue;
+            }
+            if (narrowById && !entityId.equals(event.getEntityId())) {
+                continue;
+            }
+            if (skipped < skip) {
+                skipped++;
+                continue;
+            }
+            matches.add(event);
+            if (matches.size() >= pageSize) {
+                break;
+            }
+        }
+
+        return Collections.unmodifiableList(matches);
     }
 }

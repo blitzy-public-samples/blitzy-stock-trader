@@ -41,6 +41,7 @@ import java.time.Instant;
 
 //Collections
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 
@@ -74,6 +75,22 @@ public class PostTradeService {
     private static final String OWNER_REQUIRED = "owner is required";
     private static final String RESOLUTION_NOTE_REQUIRED = "resolutionNote is required";
 
+    /* Semantic lengths, held as code constants rather than configuration: an owner is a desk or a
+       person and a resolution note is one sentence of workflow evidence, so these are what the
+       fields mean rather than a tuning knob. Without them an analyst could store an arbitrarily
+       large string on an exception and repeat it in the audit reason of every edge. */
+    private static final int MAX_OWNER_LENGTH = 64;
+    private static final int MAX_RESOLUTION_NOTE_LENGTH = 1024;
+
+    //The most audit events one assign or one resolve can write: an assign records a single edge,
+    //while resolving a still-open exception records OPEN -> ASSIGNED and ASSIGNED -> RESOLVED.
+    private static final int EVENTS_PER_ASSIGN = 1;
+    private static final int EVENTS_PER_RESOLVE = 2;
+
+    //A settlement-ready step records two edges on two entities: the exception's
+    //RESOLVED -> SETTLEMENT_READY and its parent order's EXCEPTION -> SETTLEMENT_READY.
+    private static final int EVENTS_PER_SETTLEMENT_READY = 2;
+
     private OrderStore orderStore;
     private SettlementExceptionStore exceptionStore;
     private ReferenceDataStore referenceData;
@@ -100,9 +117,19 @@ public class PostTradeService {
     }
 
     public Order onExecuted(Order order, String actor) {
-        //One instant for the whole call: the affirmation event, the exception's openedAt, its
-        //SLA deadline and the order's own post-trade event then carry the same timestamp, which
-        //is what makes the timeline readable and lets a fixed test clock compare it exactly.
+        //Affirmation moves two entities in two independent maps - the order's post-trade state and
+        //the settlement exception it may open - so the whole flow runs under the parent order's
+        //lock. Without it a caller can reach the exception between those moves and clear it while
+        //the order still reads PENDING_AFFIRMATION, which both files a false audit origin and
+        //leaves this thread's own transition to fail on a state that has since moved.
+        return orderStore.inOrderLock(order.getOrderId(), () -> affirm(order, actor));
+    }
+
+    private Order affirm(Order order, String actor) {
+        //One instant for the whole call: the post-trade status stamped onto the order, the
+        //exception's openedAt and the SLA deadline derived from it then agree instead of drifting
+        //apart within one call. Audit timestamps are not among them - AuditTimeline stamps each
+        //event as it appends it, under the same monitor that fixes that event's sequence number.
         Instant now = clock.instant();
         String orderId = order.getOrderId();
         Execution execution = order.getExecution();
@@ -124,11 +151,13 @@ public class PostTradeService {
 
         if (mismatches.isEmpty()) {
             return requireOrder(orderId, orderStore.transition(orderId, current -> {
-                LifecycleTransitions.assertLegal(current.getPostTradeStatus(),
-                        PostTradeStatus.SETTLEMENT_READY);
+                PostTradeStatus from = current.getPostTradeStatus();
+                LifecycleTransitions.assertLegal(from, PostTradeStatus.SETTLEMENT_READY);
                 Order affirmed = current.withPostTradeStatus(PostTradeStatus.SETTLEMENT_READY, now);
-                auditTimeline.append(ENTITY_ORDER, orderId, StateMachine.POST_TRADE,
-                        PostTradeStatus.PENDING_AFFIRMATION.name(),
+                //fromState is read off the order as it stands rather than assumed: an event that
+                //names a state the entity was not in is worse than no event at all, and the state
+                //is only knowable inside the compute that replaces it.
+                auditTimeline.append(ENTITY_ORDER, orderId, StateMachine.POST_TRADE, from.name(),
                         PostTradeStatus.SETTLEMENT_READY.name(), actor, REASON_SSI_AFFIRMED, clock);
                 return affirmed;
             }));
@@ -145,23 +174,44 @@ public class PostTradeService {
         //The origin edge is asserted through the same table every later edge goes through, so
         //the one state machine has one definition of what may happen to an exception.
         LifecycleTransitions.assertLegal(null, ExceptionStatus.OPEN);
-        exceptionStore.insert(opened);
+
+        Order excepted = requireOrder(orderId, orderStore.transition(orderId, current -> {
+            PostTradeStatus from = current.getPostTradeStatus();
+            LifecycleTransitions.assertLegal(from, PostTradeStatus.EXCEPTION);
+            Order replacement = current.withPostTradeStatus(PostTradeStatus.EXCEPTION, now);
+            auditTimeline.append(ENTITY_ORDER, orderId, StateMachine.POST_TRADE, from.name(),
+                    PostTradeStatus.EXCEPTION.name(), actor,
+                    "settlement exception " + exceptionId + " opened", clock);
+            return replacement;
+        }));
+
+        //The origin event is written before the exception is stored, and storing it comes last of
+        //everything: storing is what makes an exception workable, so by the time any caller can
+        //assign or clear it, its parent order is already in EXCEPTION and its own origin edge is
+        //already on the timeline. Published first instead, it could be assigned before its origin
+        //was recorded, leaving that exception's history starting mid-chain for good.
         auditTimeline.append(ENTITY_EXCEPTION, exceptionId, StateMachine.EXCEPTION,
                 LifecycleTransitions.NONE, ExceptionStatus.OPEN.name(), actor,
                 "SSI mismatch on " + String.join(", ", mismatchedFieldNames(mismatches)), clock);
+        exceptionStore.insert(opened);
 
-        return requireOrder(orderId, orderStore.transition(orderId, current -> {
-            LifecycleTransitions.assertLegal(current.getPostTradeStatus(), PostTradeStatus.EXCEPTION);
-            Order excepted = current.withPostTradeStatus(PostTradeStatus.EXCEPTION, now);
-            auditTimeline.append(ENTITY_ORDER, orderId, StateMachine.POST_TRADE,
-                    PostTradeStatus.PENDING_AFFIRMATION.name(), PostTradeStatus.EXCEPTION.name(),
-                    actor, "settlement exception " + exceptionId + " opened", clock);
-            return excepted;
-        }));
+        return excepted;
     }
 
     public SettlementException assign(String exceptionId, String owner, String actor) {
         String assignee = requireOwner(owner);
+        requireLegalNext(exceptionId, ExceptionStatus.ASSIGNED);
+
+        /* ASSIGNED -> ASSIGNED is a legal edge, so re-assignment is the one operation in this
+           module that can be repeated without limit on an entity that already exists: it creates
+           no order, no exception and no position, and each call appends an event. This check is
+           what bounds it. It is made before the transition, so a refusal changes neither the
+           exception nor the timeline. */
+        if (!auditTimeline.hasCapacityFor(EVENTS_PER_ASSIGN)) {
+            throw new CapacityExceededException(
+                    "the audit timeline is at capacity, so this assignment cannot be recorded");
+        }
+
         Instant now = clock.instant();
 
         SettlementException assigned = exceptionStore.transition(exceptionId, current -> {
@@ -178,11 +228,28 @@ public class PostTradeService {
 
     public SettlementException resolve(String exceptionId, ResolveRequest request, String actor) {
         String note = (request == null) ? null : request.getResolutionNote();
-        if (note == null || note.trim().isEmpty()) {
+        //isBlank and strip rather than trim: trim only removes characters up to U+0020, so a note
+        //of U+2003 (EM SPACE) would close an exception with no readable evidence against it, and
+        //Unicode padding would survive into both the stored note and its audit reason.
+        if (note == null || note.isBlank()) {
             throw new ValidationException(RESOLUTION_NOTE_REQUIRED);
         }
 
-        String resolutionNote = note.trim();
+        String resolutionNote = note.strip();
+        if (resolutionNote.length() > MAX_RESOLUTION_NOTE_LENGTH) {
+            throw new ValidationException("resolutionNote must not exceed "
+                    + MAX_RESOLUTION_NOTE_LENGTH + " characters");
+        }
+
+        requireResolvable(exceptionId);
+
+        //Checked before the transition, with the two edges a resolve can write, so an exhausted
+        //timeline refuses the whole call rather than closing an exception half-recorded.
+        if (!auditTimeline.hasCapacityFor(EVENTS_PER_RESOLVE)) {
+            throw new CapacityExceededException(
+                    "the audit timeline is at capacity, so this resolution cannot be recorded");
+        }
+
         String suppliedOwner = request.getOwner();
         Instant now = clock.instant();
 
@@ -217,7 +284,43 @@ public class PostTradeService {
     }
 
     public SettlementException markSettlementReady(String exceptionId, String actor) {
+        //The parent is resolved before the lock because this operation is addressed by exception id
+        //while the lock is per order, and an exception's parent never changes. An id that names
+        //nothing is therefore a missing resource before anything is locked or written.
+        String orderId =
+                requireException(exceptionId, exceptionStore.find(exceptionId)).getOrderId();
+        requireLegalNext(exceptionId, ExceptionStatus.SETTLEMENT_READY);
+
+        //Checked with both edges before anything moves: this one call transitions the exception
+        //and its parent order, so a timeline exhausted between them would leave the pair
+        //disagreeing with no event naming why. Identity and legality are answered first so a
+        //saturated timeline never masks a missing exception or an illegal edge.
+        if (!auditTimeline.hasCapacityFor(EVENTS_PER_SETTLEMENT_READY)) {
+            throw new CapacityExceededException("the audit timeline is at capacity, so this "
+                    + "settlement-ready step cannot be recorded");
+        }
+
+        return withSla(orderStore.inOrderLock(orderId, () -> release(exceptionId, orderId, actor)));
+    }
+
+    //Clearing an exception and releasing its order move two entities in two independent maps, so
+    //both run under the parent order's lock and the order is inspected before the exception is
+    //touched: the maps share no rollback, so an exception left cleared against an order that could
+    //not follow would be a break no later call could repair.
+    private SettlementException release(String exceptionId, String orderId, String actor) {
         Instant now = clock.instant();
+        PostTradeStatus parentState =
+                requireOrder(orderId, orderStore.find(orderId)).getPostTradeStatus();
+
+        //Exactly EXCEPTION, not merely a state the table would allow to reach SETTLEMENT_READY:
+        //PENDING_AFFIRMATION -> SETTLEMENT_READY is the clean-affirmation edge and must not become
+        //reachable by clearing an exception, which is a different event with a different meaning.
+        if (parentState != PostTradeStatus.EXCEPTION) {
+            throw new StateConflictException("Settlement exception " + exceptionId
+                    + " cannot be marked settlement-ready while order " + orderId
+                    + " is in post-trade state "
+                    + ((parentState == null) ? LifecycleTransitions.NONE : parentState.name()));
+        }
 
         SettlementException ready = requireException(exceptionId,
                 exceptionStore.transition(exceptionId, current -> {
@@ -230,23 +333,24 @@ public class PostTradeService {
                     return replacement;
                 }));
 
-        String orderId = ready.getOrderId();
         requireOrder(orderId, orderStore.transition(orderId, current -> {
-            LifecycleTransitions.assertLegal(current.getPostTradeStatus(),
-                    PostTradeStatus.SETTLEMENT_READY);
+            PostTradeStatus from = current.getPostTradeStatus();
+            LifecycleTransitions.assertLegal(from, PostTradeStatus.SETTLEMENT_READY);
             Order settling = current.withPostTradeStatus(PostTradeStatus.SETTLEMENT_READY, now);
-            auditTimeline.append(ENTITY_ORDER, orderId, StateMachine.POST_TRADE,
-                    PostTradeStatus.EXCEPTION.name(), PostTradeStatus.SETTLEMENT_READY.name(),
-                    actor, "settlement exception " + exceptionId + " marked settlement-ready",
-                    clock);
+            auditTimeline.append(ENTITY_ORDER, orderId, StateMachine.POST_TRADE, from.name(),
+                    PostTradeStatus.SETTLEMENT_READY.name(), actor,
+                    "settlement exception " + exceptionId + " marked settlement-ready", clock);
             return settling;
         }));
 
-        return withSla(ready);
+        return ready;
     }
 
     public List<SettlementException> list(ExceptionStatus status, String owner) {
-        String ownerFilter = (owner == null || owner.trim().isEmpty()) ? null : owner.trim();
+        //isBlank and strip, matching requireOwner: the stored owner is stripped, so a filter that
+        //trimmed only ASCII space would fail to match the very name it was given, and a filter of
+        //Unicode whitespace alone would narrow to nothing instead of meaning "no filter".
+        String ownerFilter = (owner == null || owner.isBlank()) ? null : owner.strip();
         List<SettlementException> matches = new ArrayList<>();
 
         for (SettlementException exception : exceptionStore.list()) {
@@ -265,6 +369,26 @@ public class PostTradeService {
         return matches;
     }
 
+    /* Filtered first and paged second, so a page is a page of what the caller asked for rather
+       than whatever survived a page of the whole store: paging before filtering would answer a
+       status query with mostly empty pages. The filtered list is already in the store's
+       exceptionId order, which is what makes consecutive pages contiguous. */
+    public List<SettlementException> list(ExceptionStatus status, String owner, int offset,
+            int limit) {
+        List<SettlementException> matches = list(status, owner);
+        int from = Math.min(Math.max(offset, 0), matches.size());
+        int to = (limit <= 0) ? matches.size()
+                : (int) Math.min((long) from + limit, matches.size());
+
+        return Collections.unmodifiableList(new ArrayList<>(matches.subList(from, to)));
+    }
+
+    //Delegated rather than checked inside onExecuted: the headroom has to be established while
+    //the submission can still be refused whole, which is before the order is affirmed at all.
+    public boolean hasCapacityToOpenException() {
+        return exceptionStore.hasCapacity();
+    }
+
     public SettlementException get(String exceptionId) {
         return withSla(requireException(exceptionId, exceptionStore.find(exceptionId)));
     }
@@ -274,6 +398,15 @@ public class PostTradeService {
         //as an exception that happens to have no history.
         requireException(exceptionId, exceptionStore.find(exceptionId));
         return auditTimeline.forEntity(ENTITY_EXCEPTION, exceptionId);
+    }
+
+    /* Paged as well as narrowed, unlike an order's history: an exception's timeline has no bound
+       of its own, because every re-assignment adds an edge to the same entity. The store read
+       still comes first, so an unknown id answers as a missing exception rather than as an empty
+       page. */
+    public List<AuditEvent> events(String exceptionId, int offset, int limit) {
+        requireException(exceptionId, exceptionStore.find(exceptionId));
+        return auditTimeline.page(ENTITY_EXCEPTION, exceptionId, offset, limit);
     }
 
     private static List<MismatchField> compareSettlementInstructions(ClientAccount client) {
@@ -326,11 +459,45 @@ public class PostTradeService {
         return exception.withSlaSnapshot(ageHours, slaBreached);
     }
 
+    /* isBlank and strip rather than trim: trim only removes characters up to U+0020, so an owner
+       of U+2003 (EM SPACE) would pass as present and an exception would carry a break with nobody
+       readably accountable for it. The stripped value is what this method returns, so the owner
+       stored, audited and matched by the owner filter is one form of the same name. */
     private static String requireOwner(String owner) {
-        if (owner == null || owner.trim().isEmpty()) {
+        if (owner == null || owner.isBlank()) {
             throw new ValidationException(OWNER_REQUIRED);
         }
-        return owner.trim();
+
+        String assignee = owner.strip();
+        if (assignee.length() > MAX_OWNER_LENGTH) {
+            throw new ValidationException("owner must not exceed " + MAX_OWNER_LENGTH
+                    + " characters");
+        }
+
+        return assignee;
+    }
+
+    /* Identity and legality are settled before a workflow step asks for audit headroom, so an
+       exhausted service still answers the question the caller asked: an unknown identifier is 404
+       and an illegal edge is 409 whatever the ceilings hold, rather than a 503 that hides both.
+       These two pre-checks are advisory - the operator the store runs inside its compute asserts
+       the same edge again and remains the authority, so a concurrent transition between the peek
+       and the compute is still caught there, on the entity itself. */
+    private void requireLegalNext(String exceptionId, ExceptionStatus target) {
+        SettlementException current = requireException(exceptionId, exceptionStore.find(exceptionId));
+        LifecycleTransitions.assertLegal(current.getStatus(), target);
+    }
+
+    private void requireResolvable(String exceptionId) {
+        SettlementException current = requireException(exceptionId, exceptionStore.find(exceptionId));
+
+        //OPEN is deliberately not judged against RESOLVED here: resolving an unassigned exception
+        //with an owner is the legal composite path, whose two edges are asserted together inside
+        //the compute. Every other status is judged, which is what keeps a repeated resolution and
+        //a settlement-ready exception answering 409 rather than 503.
+        if (current.getStatus() != ExceptionStatus.OPEN) {
+            LifecycleTransitions.assertLegal(current.getStatus(), ExceptionStatus.RESOLVED);
+        }
     }
 
     //Both stores answer a transition on an absent key with null, leaving it to the caller to say

@@ -15,25 +15,13 @@
    limitations under the License.
  */
 
-package com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json;
+package com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.lifecycle;
 
-/** JSON-B POJO class representing an exception assignment request */
-public class AssignRequest {
-    private String owner;
+/** Signals that an in-memory admission capacity is exhausted, surfaced to the caller as HTTP 503 */
+public class CapacityExceededException extends RuntimeException {
+    private static final long serialVersionUID = 1L;
 
-
-    public AssignRequest() {
-    }
-
-    public AssignRequest(String initialOwner) {
-        setOwner(initialOwner);
-    }
-
-    public String getOwner() {
-        return owner;
-    }
-
-    public void setOwner(String newOwner) {
-        owner = newOwner;
+    public CapacityExceededException(String message) {
+        super(message);
     }
 }

@@ -32,9 +32,11 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
 //Jakarta REST 3.1
+import jakarta.ws.rs.DefaultValue;
 import jakarta.ws.rs.GET;
 import jakarta.ws.rs.Path;
 import jakarta.ws.rs.Produces;
+import jakarta.ws.rs.QueryParam;
 import jakarta.ws.rs.core.MediaType;
 
 
@@ -65,6 +67,8 @@ public class ReferenceDataResource {
 				controlLimits.getExceptionSlaHours());
 	}
 
+	//Unpaged deliberately: the client records are the three written by the startup seed and no
+	//code path adds a fourth, so this response cannot grow.
 	@GET
 	@Path("clients")
 	public List<ClientAccount> getClients() {
@@ -73,7 +77,11 @@ public class ReferenceDataResource {
 
 	@GET
 	@Path("positions")
-	public List<Position> getPositions() {
-		return referenceDataStore.listPositions();
+	public List<Position> getPositions(@QueryParam("offset") @DefaultValue("0") int offset, @QueryParam("limit") @DefaultValue("0") int limit) {
+		//Positions grow with every first fill in a new client-and-symbol pair, so this response is
+		//one page of the holdings rather than all of them.
+		PageBounds bounds = PageBounds.clamp(offset, limit);
+
+		return referenceDataStore.listPositions(bounds.getOffset(), bounds.getLimit());
 	}
 }

@@ -28,6 +28,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
 //Jakarta REST 3.1
+import jakarta.ws.rs.DefaultValue;
 import jakarta.ws.rs.GET;
 import jakarta.ws.rs.Path;
 import jakarta.ws.rs.Produces;
@@ -48,30 +49,18 @@ public class AuditResource {
 	@Inject private AuditTimeline auditTimeline;
 
 	@GET
-	public List<AuditEvent> getAuditEvents(@QueryParam("entityType") String entityType, @QueryParam("entityId") String entityId) {
-		boolean filterByType = (entityType != null) && !entityType.isBlank();
-		boolean filterById = (entityId != null) && !entityId.isBlank();
+	public List<AuditEvent> getAuditEvents(@QueryParam("entityType") String entityType, @QueryParam("entityId") String entityId,
+			@QueryParam("offset") @DefaultValue("0") int offset, @QueryParam("limit") @DefaultValue("0") int limit) {
+		/* One call for every shape of this query: the timeline narrows on each key it was given and
+		   ignores a key it was not, so the both-key, single-key and unfiltered reads all come back
+		   from the same walk and all come back as one page. The timeline is this service's only
+		   structure with no entity ceiling of its own, which is why nothing here projects from all().
+		   A filter matching nothing returns an empty page rather than a 404: the audit collection
+		   itself always exists, and reporting an unknown entity as missing is the job of
+		   GET /orders/{orderId}/events and GET /exceptions/{exceptionId}/events, which resolve the
+		   entity through their services first. */
+		PageBounds bounds = PageBounds.clamp(offset, limit);
 
-		//AuditTimeline answers on both keys together or not at all, so a single-key query is
-		//projected from all() here rather than growing the timeline a third accessor nothing
-		//else needs. A filter matching nothing returns an empty timeline rather than a 404: the
-		//audit collection itself always exists, and reporting an unknown entity as missing is
-		//the job of GET /orders/{orderId}/events and GET /exceptions/{exceptionId}/events,
-		//which resolve the entity through their services first.
-		if (filterByType && filterById) {
-			return auditTimeline.forEntity(entityType, entityId);
-		}
-		if (filterByType) {
-			return auditTimeline.all().stream()
-					.filter(event -> entityType.equals(event.getEntityType()))
-					.toList();
-		}
-		if (filterById) {
-			return auditTimeline.all().stream()
-					.filter(event -> entityId.equals(event.getEntityId()))
-					.toList();
-		}
-
-		return auditTimeline.all();
+		return auditTimeline.page(entityType, entityId, bounds.getOffset(), bounds.getLimit());
 	}
 }

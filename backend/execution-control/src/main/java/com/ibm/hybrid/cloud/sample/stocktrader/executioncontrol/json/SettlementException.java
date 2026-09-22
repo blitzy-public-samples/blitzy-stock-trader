@@ -31,13 +31,11 @@ public class SettlementException {
     //operator asserts the transition is legal and appends the audit event in the same compute
     //step. An in-place mutator would let a state change escape the timeline.
 
-    //Identity
     private final String exceptionId;
     private final String exceptionType;
     private final String orderId;
     private final String executionId;
 
-    //Denormalised trade data, copied at opening time
     private final String clientId;
     private final String clientName;
     private final String symbol;
@@ -48,10 +46,8 @@ public class SettlementException {
     private final Instant executedAt;
     private final String venue;
 
-    //Mismatch context
     private final List<MismatchField> mismatchFields;
 
-    //Workflow
     private final ExceptionStatus status;
     private final String owner;
     private final String resolutionNote;
@@ -63,7 +59,6 @@ public class SettlementException {
     private final Instant resolvedAt;
     private final Instant settlementReadyAt;
 
-    //Labels
     private final RecordSource source;
     private final boolean simulated;
     private final String disclaimer;

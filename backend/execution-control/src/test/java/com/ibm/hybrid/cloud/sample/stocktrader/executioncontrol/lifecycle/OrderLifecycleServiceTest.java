@@ -39,27 +39,22 @@ import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.SettlementE
 import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.SettlementInstruction;
 import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.StateMachine;
 
-//Arbitrary-precision arithmetic
 import java.math.BigDecimal;
 
-//Time (java.time)
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
 
-//Collections
 import java.util.Arrays;
 import java.util.List;
 import java.util.Queue;
 
-//Concurrency
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
-//JUnit 5 Jupiter
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.function.Executable;
@@ -105,6 +100,14 @@ public class OrderLifecycleServiceTest {
     private static final int SEEDED_POSITIONS = 5;
     private static final int DUPLICATE_SUBMITTERS = 8;
     private static final int LATCH_TIMEOUT_SECONDS = 30;
+
+    //Comfortably above the longest refusal the service composes and far below the megabyte a
+    //rendered out-of-range amount would run to, so the assertion tells the two apart.
+    private static final int MAX_REFUSAL_MESSAGE_LENGTH = 300;
+
+    //Written as an escape so this source file stays ASCII whatever encoding an editor saves it in,
+    //while the assertions still pin the U+2003 character a client can send.
+    private static final String EM_SPACE = "\u2003";
 
     private OrderStore orderStore;
     private ReferenceDataStore referenceData;
@@ -394,11 +397,58 @@ public class OrderLifecycleServiceTest {
     }
 
     @Test
+    void testCompactExponentLimitPriceIsRefusedBeforeItCanBeExpanded() {
+        /* A BigDecimal carries its exponent as a scale, so each of these prices is a handful of
+           characters until something converts or renders it - and the cent conversion inside submit
+           is exactly that. At 1E+1000000 it materializes a megabyte of digits; a larger exponent
+           exhausts the heap before any pre-trade control gets to refuse the order. The refusal is
+           therefore made on the representation, while the value is still narrow. */
+        assertBoundedValidationMessage("limitPrice",
+                () -> service.submit(request("API-017", "INST-001", "SYNA", "BUY", 100L,
+                        "1E+1000000"), ACTOR));
+        //The mirror image, and the reason a magnitude check alone is not enough: a scale that large
+        //expands inside toPlainString rather than inside setScale, on a value smaller than a cent.
+        assertBoundedValidationMessage("limitPrice",
+                () -> service.submit(request("API-017", "INST-001", "SYNA", "BUY", 100L,
+                        "1E-1000000"), ACTOR));
+        //Representable, and still refused: it sits one cent above the absolute ceiling that keeps
+        //notional - this price times a share count up to Long.MAX_VALUE - inside the same bounds.
+        assertBoundedValidationMessage("limitPrice",
+                () -> service.submit(request("API-017", "INST-001", "SYNA", "BUY", 100L,
+                        "1000000000000.01"), ACTOR));
+
+        assertEquals(0, orderStore.count(), "an out-of-range price stores no order");
+        assertTrue(auditTimeline.all().isEmpty(), "an out-of-range price records no audit event");
+        assertEquals(10000L, referenceData.findPosition("INST-001", "SYNA").getQuantity(),
+                "an out-of-range price leaves the position untouched");
+
+        /* The ceiling bounds the representation and judges nothing: a price sitting exactly on it
+           is admitted, and the configured MAX_ORDER_NOTIONAL is what refuses the order - as a
+           recorded control result carrying the breach, which is what a control rejection owes the
+           audit trail and a 400 would have thrown away. */
+        Order judged = service.submit(
+                request("API-018", "INST-001", "SYNA", "BUY", 1L, "1000000000000.00"), ACTOR);
+
+        assertEquals(OrderStatus.REJECTED, judged.getStatus(),
+                "a price at the ceiling is judged by the configured controls, not by validation");
+        assertFalse(control(judged, CONTROL_MAX_ORDER_NOTIONAL).isPassed(),
+                "a notional of 1000000000000.00 must breach MAX_ORDER_NOTIONAL");
+        assertAmount("1000000000000.00", judged.getNotional(),
+                "the notional derived from a price at the ceiling");
+
+        //The value object holds the same bound, so an amount no submitted order could carry cannot
+        //be stored by a caller that bypassed submit either.
+        assertMonetaryGuard("limitPrice", () -> new Order("ORD-000002", "API-019", "INST-001",
+                "SYNA", "BUY", 100L, new BigDecimal("1E+1000000"), ACTOR, FIXED_INSTANT,
+                RecordSource.API));
+    }
+
+    @Test
     void testResultingPositionBeyondTheLongShareRangeIsRefused() {
         /* Reachable only where an operator has configured ceilings high enough to permit a position
-           no long can hold, which is exactly when the arithmetic used to wrap: the stored quantity
-           would have flipped sign and shrunk. The request is refused instead, and because the
-           refusal happens inside the store's compute step the holding is left as it was. */
+           no long can hold. Arithmetic past the long range wraps: the stored quantity would flip
+           sign and shrink, so the holding would read as a different position than it is. The request
+           is refused inside the store's compute step, so the holding is left exactly as it was. */
         ControlLimits permissive = new ControlLimits(new BigDecimal("1E+30"),
                 new BigDecimal("1E+30"), new BigDecimal("1E+30"), RESTRICTED_SYMBOLS,
                 EXCEPTION_SLA_HOURS);
@@ -423,9 +473,9 @@ public class OrderLifecycleServiceTest {
         assertEquals(OrderStatus.SUBMITTED, orderStore.list().get(0).getStatus(),
                 "the order stops at SUBMITTED: no fill, no acceptance and no execution happened");
 
-        /* Math.abs(Long.MIN_VALUE) is itself negative, so a holding at that quantity used to derive
-           a negative notional - a figure below every positive ceiling however large the exposure.
-           The magnitude is now exact, and a short reports the same notional as the equivalent long. */
+        /* Math.abs(Long.MIN_VALUE) is itself negative, so deriving a notional through it yields a
+           negative figure that sits below every positive ceiling however large the exposure. Exact
+           magnitude arithmetic makes a short report the same notional as the equivalent long. */
         Position extremeShort = new Position("INST-001", "SYND", Long.MIN_VALUE,
                 new BigDecimal("0.01"));
 
@@ -742,6 +792,276 @@ public class OrderLifecycleServiceTest {
                 "a refused write appends no audit event");
     }
 
+    @Test
+    void testUnicodeWhitespaceOnlyFieldIsRefusedAndStoresNothing() {
+        /* U+2003 (EM SPACE) is whitespace that trim() does not remove - trim stops at U+0020 - so
+           a trim-based check passes a value made only of it as present, and an order would be
+           stored under a client order id that reads as blank and can never be typed back. EM SPACE
+           is deliberately the character used here: U+00A0 is not whitespace by Java's definition,
+           so isBlank and strip leave it alone on purpose. */
+        assertValidationMessage("clientOrderId",
+                () -> service.submit(request(EM_SPACE, "INST-001", "SYNA", "BUY", 100L, "100.00"),
+                        ACTOR));
+        assertValidationMessage("symbol",
+                () -> service.submit(request("API-017", "INST-001", EM_SPACE, "BUY", 100L,
+                        "100.00"), ACTOR));
+        assertValidationMessage("clientId",
+                () -> service.submit(request("API-017", EM_SPACE, "SYNA", "BUY", 100L, "100.00"),
+                        ACTOR));
+
+        assertEquals(0, orderStore.count(), "a blank-by-Unicode field stores no order");
+        assertTrue(auditTimeline.all().isEmpty(),
+                "a blank-by-Unicode field records no audit event");
+        assertEquals(SEEDED_POSITIONS, referenceData.positionCount(),
+                "a refused submission creates no position");
+    }
+
+    @Test
+    void testUnicodePaddedFieldsAreStoredStripped() {
+        Order order = service.submit(request(EM_SPACE + "API-020" + EM_SPACE, "INST-001",
+                EM_SPACE + "syna" + EM_SPACE, "BUY", 100L, "100.00"), ACTOR);
+
+        assertEquals("API-020", order.getClientOrderId(),
+                "the stored clientOrderId is stripped of Unicode padding");
+        assertEquals("SYNA", order.getSymbol(), "the stored symbol is stripped and upper-cased");
+        assertEquals(OrderStatus.EXECUTED, order.getStatus(),
+                "a padded symbol still resolves its own unrestricted, in-limit position");
+
+        //Stripping in the validation helper is what makes the idempotency key canonical: the
+        //padded and unpadded forms have to claim the same key, or one client order id could be
+        //submitted twice by varying invisible characters.
+        assertNotNull(orderStore.findByClientOrderId("API-020"),
+                "the client order id is reserved in its stripped form");
+        assertEquals(SEEDED_POSITIONS, referenceData.positionCount(),
+                "stripping reaches the seeded SYNA position instead of creating a second one");
+        assertEquals(10100L, referenceData.findPosition("INST-001", "SYNA").getQuantity(),
+                "the fill lands on the pre-existing INST-001 SYNA holding");
+    }
+
+    @Test
+    void testOverLengthOrIllegallyWrittenFieldIsRefused() {
+        /* Unbounded strings on a stored, never-expiring entity are the cheapest way to exhaust the
+           heap of an in-memory service: one request per key, each carrying megabytes the service
+           then keeps. The limits are semantic - what an identifier and a ticker are - so they are
+           asserted here rather than left to a control threshold. */
+        assertValidationMessage("clientOrderId",
+                () -> service.submit(request("A".repeat(65), "INST-001", "SYNA", "BUY", 100L,
+                        "100.00"), ACTOR));
+        assertValidationMessage("clientId",
+                () -> service.submit(request("API-018", "I".repeat(65), "SYNA", "BUY", 100L,
+                        "100.00"), ACTOR));
+        assertValidationMessage("symbol",
+                () -> service.submit(request("API-018", "INST-001", "S".repeat(13), "BUY", 100L,
+                        "100.00"), ACTOR));
+        //A symbol is a ticker, so anything outside its alphabet - here a character that could
+        //carry markup or a line break into a stored order and an audit reason - is refused too.
+        assertValidationMessage("symbol",
+                () -> service.submit(request("API-018", "INST-001", "SYN$A", "BUY", 100L,
+                        "100.00"), ACTOR));
+
+        assertEquals(0, orderStore.count(), "an over-length or ill-formed field stores no order");
+        assertTrue(auditTimeline.all().isEmpty(),
+                "an over-length or ill-formed field records no audit event");
+
+        //The boundary passes rather than rejects, as everywhere else in this module: a value
+        //exactly at the limit is inside it.
+        Order atTheLimit = service.submit(request("A".repeat(64), "INST-001", "SYNA", "BUY", 100L,
+                "100.00"), ACTOR);
+        assertEquals(OrderStatus.EXECUTED, atTheLimit.getStatus(),
+                "a clientOrderId of exactly 64 characters is inside the limit");
+    }
+
+    @Test
+    void testOrderAdmissionCeilingRefusesFurtherSubmissions() {
+        /* Claimed directly rather than by submitting ten thousand orders: admission is an exact
+           atomic claim taken before the order object exists, so exhausting it through the store is
+           the same state the ceiling would reach through the API and costs no allocation. */
+        int claimed = 0;
+        for (int slot = 0; slot < OrderStore.MAX_ORDERS; slot++) {
+            if (orderStore.tryAdmitOrder()) {
+                claimed++;
+            }
+        }
+
+        assertEquals(OrderStore.MAX_ORDERS, claimed, "every slot up to the ceiling is claimable");
+        assertFalse(orderStore.tryAdmitOrder(), "the ceiling refuses the next claim");
+
+        CapacityExceededException refused = assertThrows(CapacityExceededException.class,
+                () -> service.submit(request("API-021", "INST-001", "SYNA", "BUY", 100L, "100.00"),
+                        ACTOR),
+                "a submission beyond the order ceiling must be refused");
+        assertTrue(refused.getMessage().contains("capacity"),
+                "the refusal must say what ran out: " + refused.getMessage());
+
+        /* The refusal is taken before the client order id is reserved and before any transition,
+           so it leaves no trace at all: a 503 that had already stored an order or appended an
+           event would be indistinguishable from a submission that half happened. */
+        assertEquals(0, orderStore.count(), "a refused submission stores no order");
+        assertTrue(auditTimeline.all().isEmpty(), "a refused submission records no audit event");
+        assertEquals(10000L, referenceData.findPosition("INST-001", "SYNA").getQuantity(),
+                "a refused submission leaves the position exactly as it was");
+    }
+
+    @Test
+    void testReleasedAdmissionSlotAdmitsExactlyOneFurtherSubmission() {
+        for (int slot = 0; slot < OrderStore.MAX_ORDERS; slot++) {
+            orderStore.tryAdmitOrder();
+        }
+
+        //A duplicate client order id is refused after its slot was claimed, so the claim is handed
+        //back; without that, every refused duplicate would retire one slot of the ceiling for the
+        //life of the process.
+        orderStore.releaseOrderAdmission();
+
+        Order admitted = service.submit(
+                request("API-022", "INST-001", "SYNA", "BUY", 100L, "100.00"), ACTOR);
+        assertEquals(OrderStatus.EXECUTED, admitted.getStatus(),
+                "the released slot admits exactly one further submission");
+        assertEquals(1, orderStore.count(), "that submission is stored");
+
+        assertThrows(CapacityExceededException.class,
+                () -> service.submit(request("API-023", "INST-001", "SYNA", "BUY", 100L, "100.00"),
+                        ACTOR),
+                "one release frees one slot and no more");
+        assertEquals(1, orderStore.count(), "the second submission stores nothing");
+    }
+
+    @Test
+    void testDuplicateClientOrderIdIsAConflictEvenAtTheOrderCeiling() {
+        Order first = service.submit(
+                request("API-027", "INST-001", "SYNA", "BUY", 100L, "100.00"), ACTOR);
+        assertEquals(OrderStatus.EXECUTED, first.getStatus(), "the first submission executes");
+
+        //Claimed directly rather than by submitting ten thousand orders, as in the ceiling test
+        //above: the claim is the same state the ceiling reaches through the API.
+        for (int slot = orderStore.count(); slot < OrderStore.MAX_ORDERS; slot++) {
+            orderStore.tryAdmitOrder();
+        }
+        assertFalse(orderStore.tryAdmitOrder(), "the order ceiling is exhausted");
+
+        int ordersBefore = orderStore.count();
+        int eventsBefore = auditTimeline.count();
+
+        /* A saturated service must still answer the question the caller asked. A repeat
+           clientOrderId can never be accepted however much headroom returns, so answering it 503
+           would invite a retry that is certain to fail again and would hide the one fact the
+           client needs - that this key is already theirs. */
+        StateConflictException refused = assertThrows(StateConflictException.class,
+                () -> service.submit(request("API-027", "INST-001", "SYNA", "BUY", 100L, "100.00"),
+                        ACTOR),
+                "a repeat clientOrderId must be refused as a conflict, not as exhausted capacity");
+        assertTrue(refused.getMessage().contains("API-027"),
+                "the conflict must name the key: " + refused.getMessage());
+
+        assertEquals(ordersBefore, orderStore.count(), "the refused submission stores no order");
+        assertEquals(eventsBefore, auditTimeline.count(),
+                "the refused submission records no audit event");
+        assertEquals(10100L, referenceData.findPosition("INST-001", "SYNA").getQuantity(),
+                "the refused submission leaves the position as the first order left it");
+    }
+
+    @Test
+    void testConcurrentFirstFillsClaimThePositionCeilingExactly() throws InterruptedException {
+        /* Filled through putPosition rather than by submitting: the claim under test is the same
+           one whichever path creates the key, and the point of the test is the last free slot. */
+        for (int slot = referenceData.positionCount();
+                slot < ReferenceDataStore.MAX_POSITIONS - 1; slot++) {
+            referenceData.putPosition(
+                    new Position("INST-001", "FIL" + slot, 100L, new BigDecimal("1.00")));
+        }
+        assertEquals(ReferenceDataStore.MAX_POSITIONS - 1, referenceData.positionCount(),
+                "exactly one position slot is left free");
+
+        Queue<Throwable> failures = new ConcurrentLinkedQueue<>();
+        //The same two-gate idiom as the duplicate-submission test above: a release latch opened as
+        //soon as the eight are queued would let an unscheduled worker arrive at an open gate and
+        //run on its own, proving nothing about simultaneity.
+        CountDownLatch ready = new CountDownLatch(DUPLICATE_SUBMITTERS);
+        CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch finished = new CountDownLatch(DUPLICATE_SUBMITTERS);
+        ExecutorService submitters = Executors.newFixedThreadPool(DUPLICATE_SUBMITTERS);
+
+        try {
+            for (int submitter = 0; submitter < DUPLICATE_SUBMITTERS; submitter++) {
+                //Eight distinct symbols of one client, so every submission is a first fill and
+                //each one needs a position key of its own: the eight genuinely contend for one.
+                String symbol = "NEW" + submitter;
+                submitters.execute(() -> {
+                    try {
+                        ready.countDown();
+                        release.await();
+                        service.submit(request("API-" + symbol, "INST-001", symbol, "BUY", 100L,
+                                "100.00"), ACTOR);
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        failures.add(interrupted);
+                    } catch (RuntimeException refused) {
+                        failures.add(refused);
+                    } finally {
+                        finished.countDown();
+                    }
+                });
+            }
+
+            assertTrue(ready.await(LATCH_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+                    "every submitter must reach the gate before it opens");
+            release.countDown();
+            assertTrue(finished.await(LATCH_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+                    "every submitter must finish inside the timeout");
+        } finally {
+            submitters.shutdown();
+        }
+
+        assertTrue(submitters.awaitTermination(LATCH_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+                "the executor must terminate rather than leave a thread running");
+
+        /* Exact, not approximate: the slot is taken with a compare-and-set claim inside the same
+           compute that would create the key, so one submitter is granted it whatever the
+           scheduling order and the other seven are refused - whether they were refused by the
+           pre-mutation gate or by the claim itself depends only on how they interleaved. */
+        assertEquals(DUPLICATE_SUBMITTERS - 1, failures.size(),
+                "seven of eight first fills must be refused, saw " + failures);
+        for (Throwable failure : failures) {
+            assertTrue(failure instanceof CapacityExceededException,
+                    "a losing first fill must be refused at the ceiling, not " + failure);
+        }
+
+        assertEquals(ReferenceDataStore.MAX_POSITIONS, referenceData.positionCount(),
+                "the position ceiling is reached exactly and never passed");
+        assertEquals(1, orderStore.list().stream()
+                        .filter(order -> order.getStatus() == OrderStatus.EXECUTED).count(),
+                "exactly one of the eight submissions filled and executed");
+        for (Order order : orderStore.list()) {
+            //A submission refused inside the fill step stops at SUBMITTED, exactly where a fill
+            //refused by the resulting-share-range check stops: no fill, no acceptance, no
+            //execution, and the position it could not open was never created.
+            assertTrue(order.getStatus() == OrderStatus.EXECUTED
+                            || order.getStatus() == OrderStatus.SUBMITTED,
+                    "a refused first fill must rest at SUBMITTED, not at " + order.getStatus());
+        }
+    }
+
+    @Test
+    void testListPagesTheOrderEstate() {
+        service.submit(request("API-024", "INST-001", "SYNA", "BUY", 10L, "100.00"), ACTOR);
+        service.submit(request("API-025", "INST-001", "SYNA", "BUY", 10L, "100.00"), ACTOR);
+        service.submit(request("API-026", "INST-001", "SYNA", "BUY", 10L, "100.00"), ACTOR);
+
+        List<Order> secondOnly = service.list(1, 1);
+        assertEquals(1, secondOnly.size(), "a page of one holds one order");
+        assertEquals("ORD-000002", secondOnly.get(0).getOrderId(),
+                "the page starts at the requested offset of the store's own ordering");
+
+        /* A non-positive limit means "do not cut the page" rather than "return nothing": the REST
+           layer clamps a caller's limit to the maximum page size, and an in-process caller must
+           not have to restate it to read a small collection. */
+        assertEquals(3, service.list(0, 0).size(), "a zero limit yields the whole small set");
+        assertEquals(3, service.list(-5, -5).size(),
+                "a negative offset and limit are taken as the first, uncut page");
+        assertTrue(service.list(3, 2).isEmpty(), "an offset past the end is an empty page");
+        assertEquals(3, service.list().size(), "the unpaged read still answers with everything");
+    }
+
     private static OrderLifecycleService lifecycleService(OrderStore orders,
             SettlementExceptionStore exceptions, ReferenceDataStore reference, AuditTimeline timeline) {
         ControlLimits limits = new ControlLimits(MAX_ORDER_NOTIONAL, MAX_POSITION_NOTIONAL,
@@ -820,6 +1140,20 @@ public class OrderLifecycleServiceTest {
                 "an invalid or absent " + field + " must be refused");
         assertTrue(failure.getMessage().contains(field),
                 "the message must name " + field + ": " + failure.getMessage());
+    }
+
+    /* Everything assertValidationMessage asserts, and one thing more: that the refusal never
+       rendered the amount it refused. A message carrying the expanded value would be the second
+       half of the allocation the bound exists to prevent, so the length of the message is part of
+       what makes the refusal cheap. */
+    private static void assertBoundedValidationMessage(String field, Executable submission) {
+        ValidationException failure = assertThrows(ValidationException.class, submission,
+                "an out-of-range " + field + " must be refused");
+        assertTrue(failure.getMessage().contains(field),
+                "the message must name " + field + ": " + failure.getMessage());
+        assertTrue(failure.getMessage().length() < MAX_REFUSAL_MESSAGE_LENGTH,
+                "the refusal must describe the amount rather than render it, but its message ran to "
+                        + failure.getMessage().length() + " characters");
     }
 
     //compareTo rather than equals because BigDecimal.equals is scale-sensitive, and the assertion

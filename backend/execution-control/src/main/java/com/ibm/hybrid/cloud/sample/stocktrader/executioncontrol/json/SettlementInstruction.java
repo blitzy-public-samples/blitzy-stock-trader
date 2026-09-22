@@ -19,12 +19,12 @@ package com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json;
 
 /** One side's synthetic Standing Settlement Instruction */
 public class SettlementInstruction {
-    /* These four names are published, not internal: PostTradeService compares the firm and
-       counterparty instructions field by field in declaration order and writes the name of
-       the differing field into MismatchField.field, so renaming or re-casing one here
-       silently changes the exception body an analyst works from. Values are stored exactly
-       as seeded, with no trimming or upper-casing, because a mismatch is a difference
-       between two literal instructions and normalizing could hide one. */
+    /* These four names are published, not internal: they are the instruction's JSON keys and the
+       values MismatchField.field can take. PostTradeService names the fields it compares through
+       its own string constants, so a rename or re-casing here does not propagate - update those
+       constants to match, or the exception body names a property the instruction no longer
+       publishes. Values are stored exactly as seeded, with no trimming or upper-casing, because a
+       mismatch is a difference between two literal instructions and normalizing could hide one. */
     private final String custodianBic;
     private final String safekeepingAccount;
     private final String cashAccount;

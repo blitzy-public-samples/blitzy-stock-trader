@@ -61,8 +61,9 @@ public class ControlLimitsProducer {
                         restrictedSymbols.getValue(), restrictedSymbols.getSourceName()),
                 exceptionSlaHours);
 
-        //These values decide whether every order is accepted or rejected, so the operator
-        //diagnosing a rejection gets them once at start-up without turning on trace.
+        //The four pre-trade controls decide whether an order is accepted or rejected and the last
+        //value ages settlement exceptions, so an operator diagnosing a rejection or an SLA figure
+        //gets the effective set once at start-up without turning on trace.
         logger.info("Effective pre-trade controls: MAX_ORDER_NOTIONAL=" + limits.getMaxOrderNotional()
                 + ", MAX_POSITION_NOTIONAL=" + limits.getMaxPositionNotional()
                 + ", FAT_FINGER_NOTIONAL_THRESHOLD=" + limits.getFatFingerNotionalThreshold()

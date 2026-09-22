@@ -32,7 +32,7 @@ public class OrderRequest {
     private BigDecimal limitPrice;
 
 
-    public OrderRequest() { //default constructor
+    public OrderRequest() {
     }
 
     public OrderRequest(String initialClientOrderId, String initialClientId, String initialSymbol,

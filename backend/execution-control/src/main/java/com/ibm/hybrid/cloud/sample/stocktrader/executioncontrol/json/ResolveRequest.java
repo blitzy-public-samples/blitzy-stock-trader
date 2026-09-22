@@ -27,7 +27,7 @@ public class ResolveRequest {
     private String resolutionNote;
 
 
-    public ResolveRequest() { //default constructor
+    public ResolveRequest() {
     }
 
     public ResolveRequest(String initialOwner, String initialResolutionNote) {

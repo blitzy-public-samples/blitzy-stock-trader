@@ -54,8 +54,8 @@ public class ControlLimits {
             BigDecimal fatFingerNotionalThreshold, Collection<String> restrictedSymbols,
             int exceptionSlaHours) {
         //Every consumer renders these amounts with two decimals - the pre-trade control reason
-        //strings and the GET /controls body - so normalizing once here means an operator override
-        //of MAX_ORDER_NOTIONAL=1000000 still reports 1000000.00 and no consumer re-derives a scale.
+        //strings and the GET /controls body - so the scale is normalized once here and no
+        //consumer re-derives it.
         this.maxOrderNotional = Objects.requireNonNull(maxOrderNotional,
                 "maxOrderNotional is required").setScale(AMOUNT_SCALE, RoundingMode.HALF_UP);
         this.maxPositionNotional = Objects.requireNonNull(maxPositionNotional,
@@ -66,14 +66,14 @@ public class ControlLimits {
         this.exceptionSlaHours = exceptionSlaHours;
     }
 
-    //Exists only so CDI can generate the @ApplicationScoped client proxy, which requires a
-    //non-private no-arg constructor; no application code calls it and the proxy reads no field.
+    //Retained because ControlLimitsProducer declares the bean it returns @ApplicationScoped, and CDI
+    //generates that bean's client proxy only from a non-private no-arg constructor; nothing calls it.
     protected ControlLimits() {
         this(BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, Collections.emptySet(), 0);
     }
 
     //Canonicalized here rather than at the configuration boundary because unit tests construct this object
-    //directly, and the invariant "the stored set is trimmed and upper-cased" has to hold for every
+    //directly, and the invariant "the stored set is stripped and upper-cased" has to hold for every
     //caller: the control evaluation matches an already-canonical order symbol against this set with
     //no further normalization. LinkedHashSet preserves the configured order, which is what lets
     //GET /controls report the restricted list deterministically.
@@ -87,7 +87,11 @@ public class ControlLimits {
             if (symbol == null || symbol.isBlank()) {
                 continue;
             }
-            canonical.add(symbol.trim().toUpperCase(Locale.ROOT));
+            //strip rather than trim, to match the isBlank above and the form a submitted symbol
+            //reaches the evaluation in: trim stops at U+0020, so an entry padded with Unicode
+            //whitespace would be kept unstripped and would then match no order at all - a
+            //restricted symbol nobody could see was unenforced.
+            canonical.add(symbol.strip().toUpperCase(Locale.ROOT));
         }
 
         return Collections.unmodifiableSet(canonical);

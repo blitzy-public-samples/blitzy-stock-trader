@@ -130,10 +130,9 @@ public class SeedDataLoader {
                 new BigDecimal("50.00")));
         referenceData.putPosition(new Position(CONTOSO_ID, "SYNC", 20000L,
                 new BigDecimal("40.00")));
-        //Worth 4,500,000 of the 5,000,000 resulting-position ceiling the service defaults to, so a
-        //buy of more than 5000 shares at 100.00 crosses that ceiling and anything up to 5000 stays
-        //under it: this holding is what makes the boundary reachable, so its quantity and price
-        //are not free to change.
+        //Sized so a further buy of this symbol can push the resulting position past the configured
+        //resulting-position ceiling while a smaller one stays under it, which is what makes that
+        //control boundary reachable in a test, so its quantity and price are not free to change.
         referenceData.putPosition(new Position(CONTOSO_ID, "SYND", 45000L,
                 new BigDecimal("100.00")));
         referenceData.putPosition(new Position(FABRIKAM_ID, "SYNA", 2000L,

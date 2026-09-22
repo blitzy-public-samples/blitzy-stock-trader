@@ -19,17 +19,15 @@ package com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.audit;
 
 import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.AuditEvent;
 import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.StateMachine;
+import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.lifecycle.CapacityExceededException;
 
-//Time (java.time)
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
 
-//Collections
 import java.util.List;
 import java.util.Locale;
 
-//JUnit 5 Jupiter
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -138,7 +136,6 @@ class AuditTimelineTest {
         assertEquals(StateMachine.ORDER, history.get(0).getStateMachine(), "first state machine");
         assertEquals(StateMachine.POST_TRADE, history.get(1).getStateMachine(), "second state machine");
 
-        //An entity with no history is an empty timeline, never a failure.
         assertTrue(timeline.forEntity("ORDER", "ORD-999999").isEmpty(), "unknown entityId");
         assertTrue(timeline.forEntity("EXCEPTION", "ORD-000001").isEmpty(), "mismatched entityType");
     }
@@ -189,5 +186,108 @@ class AuditTimelineTest {
         assertEquals(1, everything.size(), "all() snapshot must not grow");
         assertEquals(1, history.size(), "forEntity() snapshot must not grow");
         assertEquals(2, timeline.all().size(), "a fresh read sees the later append");
+    }
+
+    @Test
+    void testCapacityIsReportedAgainstTheCeiling() {
+        assertEquals(0, timeline.count(), "a fresh timeline holds nothing");
+        assertTrue(timeline.hasCapacityFor(AuditTimeline.MAX_EVENTS),
+                "an empty timeline has room for the whole ceiling");
+        assertFalse(timeline.hasCapacityFor(AuditTimeline.MAX_EVENTS + 1),
+                "no timeline has room for more than the ceiling");
+
+        /* Filled in one loop with nothing asserted per event: what matters here is the ceiling,
+           and the per-event guarantees - ordinal, timestamp, labels, snapshot semantics - are
+           each asserted once in the tests above rather than a hundred thousand times. A flow asks
+           for the headroom its edges need before it moves anything, which is why the reported
+           figure has to be exact at the boundary and not merely close to it. */
+        for (int event = timeline.count(); event < AuditTimeline.MAX_EVENTS; event++) {
+            timeline.append("ORDER", "ORD-000001", StateMachine.ORDER, "SUBMITTED", "ACCEPTED",
+                    "stock", "all pre-trade controls passed", CLOCK);
+        }
+
+        assertEquals(AuditTimeline.MAX_EVENTS, timeline.count(), "the timeline is at its ceiling");
+        assertEquals(AuditTimeline.MAX_EVENTS, timeline.all().size(),
+                "every appended event is still readable at the ceiling");
+        assertTrue(timeline.hasCapacityFor(0),
+                "a flow that records nothing is never refused, even at the ceiling");
+        assertFalse(timeline.hasCapacityFor(1),
+                "a full timeline reports no room for one further event");
+    }
+
+    @Test
+    void testAppendAtTheCeilingIsRefusedAndConsumesNoSequenceNumber() {
+        //Filled in the tightest loop the timeline offers, because the ceiling itself is the
+        //subject here and the per-event guarantees are each asserted once above.
+        for (int event = timeline.count(); event < AuditTimeline.MAX_EVENTS; event++) {
+            timeline.append("ORDER", "ORD-000001", StateMachine.ORDER, "SUBMITTED", "ACCEPTED",
+                    "stock", "all pre-trade controls passed", CLOCK);
+        }
+
+        List<AuditEvent> full = timeline.all();
+        AuditEvent last = full.get(full.size() - 1);
+        assertEquals(AuditTimeline.MAX_EVENTS, last.getSequence(),
+                "the ordinal of the last event at the ceiling");
+
+        /* The gates the callers ask are reads that two threads can pass against the same headroom,
+           so the ceiling has to be enforced here too - under the monitor that fixes the size - or
+           it would be exact only when nothing raced. */
+        CapacityExceededException refused = assertThrows(CapacityExceededException.class,
+                () -> timeline.append("ORDER", "ORD-000002", StateMachine.ORDER, "SUBMITTED",
+                        "ACCEPTED", "stock", "one event past the ceiling", CLOCK),
+                "an append at the ceiling must be refused rather than recorded");
+        assertTrue(refused.getMessage().contains("capacity"),
+                "the refusal must say what ran out: " + refused.getMessage());
+
+        /* A refused append takes no ordinal, which at the ceiling cannot be shown by a later
+           successful append - there is none to be had - so the evidence is that nothing moved: the
+           count stands and the last recorded event still carries the last ordinal issued. */
+        assertEquals(AuditTimeline.MAX_EVENTS, timeline.count(),
+                "a refused append leaves the timeline at its ceiling");
+        assertEquals(AuditTimeline.MAX_EVENTS, timeline.all().size(),
+                "every recorded event is still readable after the refusal");
+        AuditEvent lastAfterRefusal = timeline.all().get(AuditTimeline.MAX_EVENTS - 1);
+        assertSame(last, lastAfterRefusal, "the last recorded event is untouched");
+        assertEquals(last.getSequence(), lastAfterRefusal.getSequence(),
+                "a refused append consumes no sequence number");
+    }
+
+    @Test
+    void testPageNarrowsOnEachKeyItWasGivenAndBoundsTheResult() {
+        AuditEvent orderEvent = timeline.append("ORDER", "ORD-000001", StateMachine.ORDER,
+                "ACCEPTED", "EXECUTED", "stock", "execution EXE-000001", CLOCK);
+        AuditEvent postTradeEvent = timeline.append("ORDER", "ORD-000001", StateMachine.POST_TRADE,
+                "(none)", "PENDING_AFFIRMATION", "stock", "execution EXE-000001", CLOCK);
+        timeline.append("ORDER", "ORD-000002", StateMachine.ORDER,
+                "SUBMITTED", "REJECTED", "stock", "Symbol RSTRA is on the restricted list", CLOCK);
+        timeline.append("EXCEPTION", "EXC-000001", StateMachine.EXCEPTION,
+                "(none)", "OPEN", "seed", "safekeepingAccount differs", CLOCK);
+
+        /* One walk answers every shape of the audit query: a key that was given narrows, a key
+           that was not is ignored. That is what lets the audit endpoint stop projecting a
+           single-key query from a copy of the whole timeline - the one structure here that has no
+           entity ceiling to bound it. */
+        assertEquals(2, timeline.page("ORDER", "ORD-000001", 0, 10).size(),
+                "both keys narrow to one entity, across both of its state machines");
+        assertEquals(3, timeline.page("ORDER", null, 0, 10).size(),
+                "an absent entityId narrows on entityType alone");
+        assertEquals(1, timeline.page(null, "EXC-000001", 0, 10).size(),
+                "an absent entityType narrows on entityId alone");
+        assertEquals(4, timeline.page("   ", "   ", 0, 0).size(),
+                "a blank key is no key, so neither narrows and the page is uncut");
+
+        List<AuditEvent> firstPage = timeline.page("ORDER", "ORD-000001", 0, 1);
+        assertEquals(1, firstPage.size(), "a page of one holds one event");
+        assertSame(orderEvent, firstPage.get(0), "the first page starts at the first match");
+        assertSame(postTradeEvent, timeline.page("ORDER", "ORD-000001", 1, 1).get(0),
+                "the offset is counted in matches, not in timeline positions");
+
+        assertTrue(timeline.page(null, null, 10, 5).isEmpty(),
+                "an offset past the end is an empty page, never a failure");
+        assertTrue(timeline.page("ORDER", "ORD-999999", 0, 10).isEmpty(),
+                "an entity with no history is an empty page");
+        assertThrows(UnsupportedOperationException.class,
+                () -> timeline.page(null, null, 0, 10).remove(0),
+                "a page is as unmodifiable as every other read view here");
     }
 }

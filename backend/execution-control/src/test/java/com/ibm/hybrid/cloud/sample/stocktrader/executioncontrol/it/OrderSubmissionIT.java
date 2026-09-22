@@ -17,7 +17,6 @@
 
 package com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.it;
 
-//Jakarta REST client 3.1
 import jakarta.ws.rs.client.Client;
 import jakarta.ws.rs.client.ClientBuilder;
 import jakarta.ws.rs.client.Entity;
@@ -25,7 +24,6 @@ import jakarta.ws.rs.client.Invocation;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 
-//JSON-P 2.1, for building request bodies and reading response bodies
 import jakarta.json.Json;
 import jakarta.json.JsonArray;
 import jakarta.json.JsonObject;
@@ -36,7 +34,6 @@ import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.UUID;
 
-//JUnit 5 Jupiter
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -158,9 +155,10 @@ class OrderSubmissionIT {
         /* All four controls are recorded whatever the verdict, in the fixed order MAX_ORDER_NOTIONAL,
            MAX_POSITION_NOTIONAL, RESTRICTED_SYMBOL, FAT_FINGER and never short-circuited, so an
            accepted order carries four passes rather than an empty list. Every one of the four has
-           room to spare here - notional 10,000 against 1,000,000 and 2,500,000, a resulting position
-           near 1,020,000 against 5,000,000, and SYNA absent from the restricted list - so no sibling
-           class's fills can flip a verdict this test pins. */
+           room to spare here - notional 10,000 against 1,000,000 and 2,500,000, SYNA absent from the
+           restricted list, and a suite whose fills against this position are bounded to a few
+           hundred shares at 100.00, leaving it comfortably below MAX_POSITION_NOTIONAL 5,000,000 -
+           so no sibling class's fills can flip a verdict this test pins. */
         JsonArray controlResults = order.getJsonArray("controlResults");
         Assertions.assertEquals(4, controlResults.size(),
                 "Expected one result per pre-trade control: " + result.body);
@@ -276,6 +274,22 @@ class OrderSubmissionIT {
            limitPrice, like any other unusable field in the body. */
         assertBadRequest(orderBody(uniqueClientOrderId(), 100L, "0.001"), "limitPrice");
         assertBadRequest(orderBody(uniqueClientOrderId(), 100L, "100.005"), "limitPrice");
+    }
+
+    @Test
+    void testCompactExponentLimitPriceIsRejected() {
+        /* One ordinary-sized JSON body whose limitPrice is 1E+1000000: the exponent lives in the
+           number's scale, so the body stays small and the digits appear only when the price is
+           converted to cents or rendered. Over the wire the service must answer 400 and name
+           limitPrice, having refused the representation rather than allocated the number - a larger
+           exponent in the same body would otherwise exhaust the server's heap. */
+        assertBadRequest(orderBody(uniqueClientOrderId(), 100L, "1E+1000000"), "limitPrice");
+        //The same shape with the exponent the other way round, which expands while being rendered
+        //rather than while being converted.
+        assertBadRequest(orderBody(uniqueClientOrderId(), 100L, "1E-1000000"), "limitPrice");
+        //Representable, and one cent above the absolute ceiling that keeps a notional bounded for
+        //every share count a long can hold.
+        assertBadRequest(orderBody(uniqueClientOrderId(), 100L, "1000000000000.01"), "limitPrice");
     }
 
     @Test

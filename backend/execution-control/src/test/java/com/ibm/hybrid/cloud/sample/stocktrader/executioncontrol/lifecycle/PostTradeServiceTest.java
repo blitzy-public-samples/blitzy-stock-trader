@@ -36,19 +36,22 @@ import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.SettlementE
 import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.SettlementInstruction;
 import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.StateMachine;
 
-//Arbitrary-precision arithmetic
 import java.math.BigDecimal;
 
-//Time (java.time)
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
 
-//Collections
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Queue;
 
-//JUnit 5 Jupiter
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -79,6 +82,10 @@ public class PostTradeServiceTest {
     private static final String NOTE = "Counterparty safekeeping account corrected to the firm instruction";
     private static final String UNKNOWN_EXCEPTION_ID = "EXC-999999";
 
+    //Written as an escape so this source file stays ASCII whatever encoding an editor saves it in,
+    //while the assertions still pin the U+2003 character a client can send.
+    private static final String EM_SPACE = "\u2003";
+
     /* The clients and their settlement instructions are the literals SeedDataLoader seeds, so a
        change to the seeded SSI contract breaks these tests rather than leaving them asserting
        against strings that no longer exist anywhere in the service. */
@@ -102,6 +109,10 @@ public class PostTradeServiceTest {
     private static final String FILL_PRICE = "100.00";
     private static final long QUANTITY = 300L;
     private static final int SLA_HOURS = 24;
+
+    /* A bound, not a pause: the race test's two threads hand over through latches, so this only
+       fails a run in which one of them never arrives rather than pacing the test. */
+    private static final long RACE_TIMEOUT_SECONDS = 5L;
 
     private OrderStore orderStore;
     private SettlementExceptionStore exceptionStore;
@@ -561,6 +572,329 @@ public class PostTradeServiceTest {
         assertFalse(stillFrozen.isSlaBreached(), "settlement-ready keeps the frozen verdict");
     }
 
+    @Test
+    void testExceptionIsPublishedOnlyWithItsParentOrderInException() throws InterruptedException {
+        Order executed = storedExecutedOrder(FABRIKAM_ID, "C1", QUANTITY);
+        String orderId = executed.getOrderId();
+        String exceptionId = "EXC-000001";
+
+        Queue<Throwable> failures = new ConcurrentLinkedQueue<>();
+        AtomicReference<PostTradeStatus> parentAtPublication = new AtomicReference<>();
+        CountDownLatch published = new CountDownLatch(1);
+        CountDownLatch clearing = new CountDownLatch(1);
+
+        /* insert is the instant an exception becomes workable by anybody, so the parent order's
+           state at that instant is the invariant under test. The same hook holds the publishing
+           thread there until the analyst thread has reached its settlement-ready call, which is
+           the interleaving an uncoordinated publication loses: the analyst clears the exception
+           while the order still reads PENDING_AFFIRMATION, the timeline gains an event claiming
+           to have left EXCEPTION, and this thread's own transition then fails. */
+        SettlementExceptionStore publishing = new SettlementExceptionStore() {
+            @Override
+            public void insert(SettlementException exception) {
+                super.insert(exception);
+                parentAtPublication.set(
+                        orderStore.find(exception.getOrderId()).getPostTradeStatus());
+                published.countDown();
+                await(clearing, "the analyst thread never reached settlement-ready", failures);
+            }
+        };
+
+        PostTradeService racing = new PostTradeService(orderStore, publishing, referenceData,
+                auditTimeline, CLOCK, limits);
+
+        Thread analyst = new Thread(() -> {
+            try {
+                if (await(published, "no exception was ever published", failures)) {
+                    racing.assign(exceptionId, OWNER, ACTOR);
+                    racing.resolve(exceptionId, new ResolveRequest(null, NOTE), ACTOR);
+                    clearing.countDown();
+                    racing.markSettlementReady(exceptionId, ACTOR);
+                }
+            } catch (RuntimeException failure) {
+                failures.add(failure);
+            } finally {
+                //Releases the publishing thread on every exit path, so a failure here surfaces as
+                //that failure rather than as a test that hangs until the timeout.
+                clearing.countDown();
+            }
+        }, "ops-analyst");
+        analyst.setDaemon(true);
+
+        analyst.start();
+        racing.onExecuted(executed, ACTOR);
+        analyst.join(TimeUnit.SECONDS.toMillis(RACE_TIMEOUT_SECONDS));
+
+        assertFalse(analyst.isAlive(), "the analyst thread must finish");
+        assertTrue(failures.isEmpty(), "the concurrent workflow must not fail: " + failures);
+
+        assertEquals(PostTradeStatus.EXCEPTION, parentAtPublication.get(),
+                "an exception must not be reachable before its parent order is in EXCEPTION");
+        assertEquals(PostTradeStatus.SETTLEMENT_READY,
+                orderStore.find(orderId).getPostTradeStatus(),
+                "the order follows its cleared exception");
+        assertEquals(ExceptionStatus.SETTLEMENT_READY, publishing.find(exceptionId).getStatus(),
+                "the exception is cleared");
+
+        assertContiguousChain(postTradeEvents(orderId),
+                PostTradeStatus.PENDING_AFFIRMATION.name(), PostTradeStatus.EXCEPTION.name(),
+                PostTradeStatus.SETTLEMENT_READY.name());
+        assertContiguousChain(auditTimeline.forEntity(ENTITY_EXCEPTION, exceptionId),
+                ExceptionStatus.OPEN.name(), ExceptionStatus.ASSIGNED.name(),
+                ExceptionStatus.RESOLVED.name(), ExceptionStatus.SETTLEMENT_READY.name());
+    }
+
+    @Test
+    void testSettlementReadyIsRefusedUnlessTheParentOrderIsInException() {
+        /* Neither state below can be produced through the service - publishing an exception only
+           once its order is in EXCEPTION is exactly what forecloses them - so both are built
+           directly: a resolved exception standing against an order still awaiting affirmation,
+           and one standing against an order whose post-trade machine never started, which is what
+           a caller that reaches an exception ahead of its parent's transition would hold. */
+        Order pending = buildExecutedOrder(orderStore.nextOrderId(), FABRIKAM_ID, "C1", QUANTITY)
+                .withPostTradeStatus(PostTradeStatus.PENDING_AFFIRMATION, T0);
+        orderStore.insert(pending);
+        String pendingException = resolvedExceptionAgainst(pending);
+
+        int before = auditTimeline.all().size();
+        StateConflictException awaiting = assertThrows(StateConflictException.class,
+                () -> postTrade.markSettlementReady(pendingException, ACTOR),
+                "clearing an exception must not release an order that never reached EXCEPTION");
+        assertTrue(awaiting.getMessage().contains(pending.getOrderId())
+                        && awaiting.getMessage().contains(PostTradeStatus.PENDING_AFFIRMATION.name()),
+                "the refusal must name the order and the state it is in: " + awaiting.getMessage());
+
+        /* The order is inspected before the exception is touched, so the refusal leaves both
+           entities and the timeline exactly as they were - the two stores share no rollback. */
+        assertEquals(ExceptionStatus.RESOLVED, exceptionStore.find(pendingException).getStatus(),
+                "the refused request must leave the exception resolved");
+        assertNull(exceptionStore.find(pendingException).getSettlementReadyAt(),
+                "no settlement-ready instant may be written");
+        assertEquals(PostTradeStatus.PENDING_AFFIRMATION,
+                orderStore.find(pending.getOrderId()).getPostTradeStatus(),
+                "the refused request must leave the order awaiting affirmation");
+        assertEquals(before, auditTimeline.all().size(),
+                "a refused precondition appends no event to either entity");
+
+        //An order whose post-trade machine never started renders as the "(none)" origin instead of
+        //failing on a null state, so this refusal stays a conflict an analyst can read.
+        Order unaffirmed = buildExecutedOrder(orderStore.nextOrderId(), FABRIKAM_ID, "C2", QUANTITY);
+        orderStore.insert(unaffirmed);
+        String unaffirmedException = resolvedExceptionAgainst(unaffirmed);
+
+        StateConflictException unstarted = assertThrows(StateConflictException.class,
+                () -> postTrade.markSettlementReady(unaffirmedException, ACTOR),
+                "an order with no post-trade state cannot be released either");
+        assertTrue(unstarted.getMessage().contains(LifecycleTransitions.NONE),
+                "the refusal must render an absent state as the origin: " + unstarted.getMessage());
+    }
+
+    @Test
+    void testUnicodeWhitespaceOwnerOrNoteIsRejected() {
+        String exceptionId = openException();
+        int before = auditTimeline.count();
+
+        /* U+2003 (EM SPACE) is whitespace that trim() does not remove - trim stops at U+0020 - so
+           a trim-based check passes a value made only of it as present: an exception could be
+           assigned to an owner that reads as nobody, or closed with a note that reads as no
+           evidence at all.
+           EM SPACE is deliberately the character used here; U+00A0 is not whitespace by Java's
+           definition, so isBlank and strip leave it alone on purpose. */
+        ValidationException blankOwner = assertThrows(ValidationException.class,
+                () -> postTrade.assign(exceptionId, EM_SPACE, ACTOR),
+                "an owner of Unicode whitespace must be rejected");
+        assertEquals("owner is required", blankOwner.getMessage(), "Unicode-blank owner message");
+
+        ValidationException blankOwnerResolve = assertThrows(ValidationException.class,
+                () -> postTrade.resolve(exceptionId, new ResolveRequest(EM_SPACE, NOTE), ACTOR),
+                "resolving an open exception with a Unicode-blank owner must be rejected");
+        assertEquals("owner is required", blankOwnerResolve.getMessage(),
+                "Unicode-blank owner resolve message");
+
+        ValidationException blankNote = assertThrows(ValidationException.class,
+                () -> postTrade.resolve(exceptionId, new ResolveRequest(OWNER, EM_SPACE), ACTOR),
+                "a resolution note of Unicode whitespace must be rejected");
+        assertEquals("resolutionNote is required", blankNote.getMessage(),
+                "Unicode-blank note message");
+
+        assertEquals(ExceptionStatus.OPEN, exceptionStore.find(exceptionId).getStatus(),
+                "a rejected request leaves the exception open");
+        assertNull(exceptionStore.find(exceptionId).getOwner(),
+                "no owner may be recorded by a rejected request");
+        assertEquals(before, auditTimeline.count(), "a rejected request appends no event");
+    }
+
+    @Test
+    void testUnicodePaddedOwnerAndNoteAreStoredStripped() {
+        String exceptionId = openException();
+
+        SettlementException assigned =
+                postTrade.assign(exceptionId, EM_SPACE + OWNER + EM_SPACE, ACTOR);
+        assertEquals(OWNER, assigned.getOwner(), "the stored owner is stripped of its padding");
+
+        //The owner filter has to match the stripped value that was stored, or a padded assignment
+        //would create an owner nobody can query for.
+        assertEquals(1, postTrade.list(null, OWNER).size(),
+                "the owner filter matches the stripped owner");
+        assertEquals(1, postTrade.list(null, EM_SPACE + OWNER).size(),
+                "a padded owner filter matches the same exception");
+        assertEquals(1, postTrade.list(null, EM_SPACE).size(),
+                "a filter of Unicode whitespace alone is no filter at all");
+
+        SettlementException resolved = postTrade.resolve(exceptionId,
+                new ResolveRequest(null, EM_SPACE + NOTE + EM_SPACE), ACTOR);
+        assertEquals(NOTE, resolved.getResolutionNote(),
+                "the stored resolution note is stripped of its padding");
+
+        List<AuditEvent> events = auditTimeline.forEntity(ENTITY_EXCEPTION, exceptionId);
+        assertEquals(NOTE, events.get(events.size() - 1).getReason(),
+                "the audit reason carries the stripped note, not the padded one");
+    }
+
+    @Test
+    void testOverLengthOwnerOrNoteIsRejectedAndLeavesNoTrace() {
+        String exceptionId = openException();
+        int before = auditTimeline.count();
+
+        /* An owner and a note are stored on an entity that never expires and are repeated in the
+           audit reason of every edge, so an unbounded string here is an in-memory exhaustion
+           vector one request wide. */
+        ValidationException longOwner = assertThrows(ValidationException.class,
+                () -> postTrade.assign(exceptionId, "o".repeat(65), ACTOR),
+                "an over-length owner must be rejected");
+        assertEquals("owner must not exceed 64 characters", longOwner.getMessage(),
+                "over-length owner message");
+
+        ValidationException longNote = assertThrows(ValidationException.class,
+                () -> postTrade.resolve(exceptionId, new ResolveRequest(OWNER, "n".repeat(1025)),
+                        ACTOR),
+                "an over-length resolution note must be rejected");
+        assertEquals("resolutionNote must not exceed 1024 characters", longNote.getMessage(),
+                "over-length note message");
+
+        assertEquals(ExceptionStatus.OPEN, exceptionStore.find(exceptionId).getStatus(),
+                "a rejected request leaves the exception open");
+        assertNull(exceptionStore.find(exceptionId).getOwner(),
+                "no owner may be recorded by a rejected request");
+        assertEquals(before, auditTimeline.count(), "a rejected request appends no event");
+
+        //The boundary passes rather than rejects, as everywhere else in this module.
+        assertEquals("o".repeat(64), postTrade.assign(exceptionId, "o".repeat(64), ACTOR).getOwner(),
+                "an owner of exactly 64 characters is inside the limit");
+    }
+
+    @Test
+    void testAssignAndResolveAreRefusedWhenTheTimelineIsFull() {
+        String exceptionId = openException();
+
+        /* Re-assignment is the module's one unbounded audit vector: ASSIGNED -> ASSIGNED is a
+           legal edge, so an analyst could append events to an exception that already exists
+           without ever creating an order, an exception or a position. Filling the timeline to its
+           ceiling is what proves the gate that closes it. */
+        for (int event = auditTimeline.count(); event < AuditTimeline.MAX_EVENTS; event++) {
+            auditTimeline.append(ENTITY_EXCEPTION, exceptionId, StateMachine.EXCEPTION,
+                    ExceptionStatus.ASSIGNED.name(), ExceptionStatus.ASSIGNED.name(), ACTOR,
+                    "filling the timeline to its ceiling", CLOCK);
+        }
+
+        assertEquals(AuditTimeline.MAX_EVENTS, auditTimeline.count(), "the timeline is full");
+        assertThrows(CapacityExceededException.class,
+                () -> postTrade.assign(exceptionId, OWNER, ACTOR),
+                "an assignment that cannot be recorded must be refused");
+        assertThrows(CapacityExceededException.class,
+                () -> postTrade.resolve(exceptionId, new ResolveRequest(OWNER, NOTE), ACTOR),
+                "a resolution that cannot be recorded must be refused");
+
+        //Refused before the transition, so the exception is exactly as it was and the timeline
+        //gained nothing: the record can never be the reason a state change went unrecorded.
+        assertEquals(ExceptionStatus.OPEN, exceptionStore.find(exceptionId).getStatus(),
+                "a refused workflow step leaves the exception open");
+        assertNull(exceptionStore.find(exceptionId).getOwner(),
+                "no owner may be recorded by a refused assignment");
+        assertEquals(AuditTimeline.MAX_EVENTS, auditTimeline.count(),
+                "a refused workflow step appends no event");
+    }
+
+    @Test
+    void testCapacityRefusalDoesNotMaskAnUnknownIdOrAnIllegalTransition() {
+        String exceptionId = openException();
+        postTrade.assign(exceptionId, OWNER, ACTOR);
+        postTrade.resolve(exceptionId, new ResolveRequest(null, NOTE), ACTOR);
+
+        for (int event = auditTimeline.count(); event < AuditTimeline.MAX_EVENTS; event++) {
+            auditTimeline.append(ENTITY_EXCEPTION, exceptionId, StateMachine.EXCEPTION,
+                    ExceptionStatus.ASSIGNED.name(), ExceptionStatus.ASSIGNED.name(), ACTOR,
+                    "filling the timeline to its ceiling", CLOCK);
+        }
+        assertEquals(AuditTimeline.MAX_EVENTS, auditTimeline.count(), "the timeline is full");
+
+        /* Identity and legality are settled before capacity, so an exhausted service still answers
+           the question the caller asked. A 503 for either of these would be a retry invitation for
+           a request that can never be accepted, and it would hide the reason. */
+        EntityNotFoundException missing = assertThrows(EntityNotFoundException.class,
+                () -> postTrade.assign(UNKNOWN_EXCEPTION_ID, OWNER, ACTOR),
+                "an unknown exception id stays a missing resource on a saturated service");
+        assertTrue(missing.getMessage().contains(UNKNOWN_EXCEPTION_ID),
+                "the message must name the identifier: " + missing.getMessage());
+
+        StateConflictException illegal = assertThrows(StateConflictException.class,
+                () -> postTrade.resolve(exceptionId, new ResolveRequest(null, "again"), ACTOR),
+                "a repeated resolution stays a conflict on a saturated service");
+        assertEquals("RESOLVED \u2192 RESOLVED is not a legal transition", illegal.getMessage(),
+                "refusal message");
+
+        //Only a step that would otherwise have been taken is refused at the ceiling, and it is
+        //refused before either entity moves: the exception and its parent order stay as they were.
+        assertThrows(CapacityExceededException.class,
+                () -> postTrade.markSettlementReady(exceptionId, ACTOR),
+                "a legal settlement-ready step that cannot be recorded must be refused");
+
+        assertEquals(ExceptionStatus.RESOLVED, exceptionStore.find(exceptionId).getStatus(),
+                "the refused step leaves the exception resolved");
+        assertNull(exceptionStore.find(exceptionId).getSettlementReadyAt(),
+                "no settlement-ready instant may be written");
+        assertEquals(PostTradeStatus.EXCEPTION, orderStore.find("ORD-000001").getPostTradeStatus(),
+                "the parent order stays in exception");
+        assertEquals(AuditTimeline.MAX_EVENTS, auditTimeline.count(),
+                "no refused step appends an event");
+    }
+
+    @Test
+    void testListAndEventsPageTheFilteredSet() {
+        postTrade.onExecuted(storedExecutedOrder(FABRIKAM_ID, "C1", QUANTITY), ACTOR);
+        postTrade.onExecuted(storedExecutedOrder(FABRIKAM_ID, "C2", QUANTITY), ACTOR);
+        postTrade.onExecuted(storedExecutedOrder(FABRIKAM_ID, "C3", QUANTITY), ACTOR);
+        postTrade.assign("EXC-000002", OWNER, ACTOR);
+
+        /* The page is cut from the filtered set rather than from the store, so a status query
+           answers with a page of its own matches: paging first would answer mostly empty pages
+           once most exceptions were closed. */
+        List<SettlementException> firstOpen = postTrade.list(ExceptionStatus.OPEN, null, 0, 1);
+        assertEquals(1, firstOpen.size(), "a page of one holds one exception");
+        assertEquals("EXC-000001", firstOpen.get(0).getExceptionId(),
+                "the first page of the OPEN set starts at the lowest open exception id");
+        assertEquals("EXC-000003",
+                postTrade.list(ExceptionStatus.OPEN, null, 1, 1).get(0).getExceptionId(),
+                "the second page of the OPEN set skips the assigned exception");
+        assertEquals(1, postTrade.list(null, OWNER, 0, 500).size(),
+                "the owner filter pages its own matches");
+        assertEquals(3, postTrade.list(null, null, 0, 0).size(),
+                "a zero limit yields the whole small set");
+        assertTrue(postTrade.list(null, null, 3, 5).isEmpty(),
+                "an offset past the end is an empty page");
+
+        //An exception's own history is paged too, because every re-assignment adds an edge to it.
+        assertEquals(1, postTrade.events("EXC-000002", 0, 1).size(), "a page of one event");
+        assertEquals(ExceptionStatus.ASSIGNED.name(),
+                postTrade.events("EXC-000002", 1, 1).get(0).getToState(),
+                "the second page of the history is the assign edge");
+        assertEquals(2, postTrade.events("EXC-000002", 0, 0).size(),
+                "a zero limit yields the whole short history");
+        assertEquals(postTrade.events("EXC-000002").size(),
+                postTrade.events("EXC-000002", 0, 0).size(),
+                "the unpaged read and the uncut page agree");
+    }
+
     private void assertExceptionEvent(AuditEvent event, String exceptionId, String fromState,
             String toState) {
         assertEquals(ENTITY_EXCEPTION, event.getEntityType(), "entityType of " + event.getEventId());
@@ -569,6 +903,67 @@ public class PostTradeServiceTest {
                 "stateMachine of " + event.getEventId());
         assertEquals(fromState, event.getFromState(), "fromState of " + event.getEventId());
         assertEquals(toState, event.getToState(), "toState of " + event.getEventId());
+    }
+
+    //Builds what the service can no longer produce: an exception resolved against an order that is
+    //not in EXCEPTION. It is inserted straight into the store because opening one through the
+    //service is precisely what now requires the parent order to be in EXCEPTION first.
+    private String resolvedExceptionAgainst(Order order) {
+        String exceptionId = exceptionStore.nextExceptionId();
+        exceptionStore.insert(new SettlementException(exceptionId, "SSI_MISMATCH",
+                order.getOrderId(), order.getExecution().getExecutionId(), FABRIKAM_ID,
+                FABRIKAM_NAME, SYMBOL, BUY, QUANTITY, new BigDecimal("30000.00"),
+                new BigDecimal(FILL_PRICE), T0, "SIMULATED",
+                List.of(new MismatchField("safekeepingAccount", FABRIKAM_FIRM_SAFEKEEPING_ACCOUNT,
+                        FABRIKAM_COUNTERPARTY_SAFEKEEPING_ACCOUNT)),
+                T0, T0.plus(SLA_HOURS, ChronoUnit.HOURS), RecordSource.API));
+        postTrade.resolve(exceptionId, new ResolveRequest(OWNER, NOTE), ACTOR);
+        return exceptionId;
+    }
+
+    private List<AuditEvent> postTradeEvents(String orderId) {
+        //One order files both its machines under the entityType ORDER, so the post-trade chain has
+        //to be narrowed by stateMachine before its edges can be read as a chain at all.
+        List<AuditEvent> postTrade = new ArrayList<>();
+        for (AuditEvent event : auditTimeline.forEntity(ENTITY_ORDER, orderId)) {
+            if (event.getStateMachine() == StateMachine.POST_TRADE) {
+                postTrade.add(event);
+            }
+        }
+        return postTrade;
+    }
+
+    /* A chain in which every fromState is the previous toState is the assertion a false origin
+       fails: the race guarded against here left an order at PENDING_AFFIRMATION and then filed an
+       event claiming to have left EXCEPTION, a break invisible to any single-event assertion. */
+    private void assertContiguousChain(List<AuditEvent> events, String... expectedToStates) {
+        assertEquals(expectedToStates.length, events.size(), "recorded edges");
+        String previous = LifecycleTransitions.NONE;
+
+        for (int edge = 0; edge < events.size(); edge++) {
+            AuditEvent event = events.get(edge);
+            assertEquals(previous, event.getFromState(), "fromState of " + event.getEventId());
+            assertEquals(expectedToStates[edge], event.getToState(),
+                    "toState of " + event.getEventId());
+            previous = event.getToState();
+        }
+    }
+
+    //Bounded so a thread that never arrives fails the run with its own message instead of hanging
+    //it, and interruption is recorded rather than swallowed; no checked exception escapes, which is
+    //what lets this be called from the overridden store method.
+    private static boolean await(CountDownLatch latch, String timeoutMessage,
+            Queue<Throwable> failures) {
+        try {
+            if (latch.await(RACE_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                return true;
+            }
+            failures.add(new IllegalStateException(timeoutMessage));
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            failures.add(interrupted);
+        }
+        return false;
     }
 
     private PostTradeService serviceAt(Instant instant) {

@@ -19,35 +19,30 @@ package com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.health;
 
 import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.dao.SeedDataLoader;
 
-//Standard I/O classes
-import java.io.PrintWriter;
-import java.io.StringWriter;
-
 //Logging (JSR 47)
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
-//CDI 2.0
+//CDI 4.0
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
-//mpHealth 1.0
+//mpHealth 4.0
 import org.eclipse.microprofile.health.HealthCheck;
 import org.eclipse.microprofile.health.HealthCheckResponse;
 import org.eclipse.microprofile.health.HealthCheckResponseBuilder;
 import org.eclipse.microprofile.health.Startup;
 
 
+/** Reports the service started once the synthetic seed data has finished loading. */
 @Startup
 @ApplicationScoped
-/** Use mpHealth for startup probe */
 public class StartupProbe implements HealthCheck {
     private static Logger logger = Logger.getLogger(StartupProbe.class.getName());
 
     private @Inject SeedDataLoader seedDataLoader;
 
 
-    //mpHealth probe
     @Override
     public HealthCheckResponse call() {
         HealthCheckResponse response = null;
@@ -56,8 +51,8 @@ public class StartupProbe implements HealthCheck {
             HealthCheckResponseBuilder builder = HealthCheckResponse.named("ExecutionControl");
 
             //Startup waits on the seed load because every order names a seeded client and every
-            //control is evaluated against a seeded position: traffic admitted any earlier would be
-            //rejected for reference data that is merely still loading.
+            //execution settles against that client's seeded instructions: traffic admitted any
+            //earlier would be rejected for reference data that is merely still loading.
             if (seedDataLoader.isLoaded()) {
                 builder = builder.up();
                 logger.fine("Returning started!");
@@ -81,12 +76,6 @@ public class StartupProbe implements HealthCheck {
 
     private static void logException(Throwable t) {
         logger.warning(t.getClass().getName()+": "+t.getMessage());
-
-        //only log the stack trace if the level has been set to at least INFO
-        if (logger.isLoggable(Level.INFO)) {
-            StringWriter writer = new StringWriter();
-            t.printStackTrace(new PrintWriter(writer));
-            logger.info(writer.toString());
-        }
+        logger.log(Level.INFO, "Startup health check failed", t);
     }
 }

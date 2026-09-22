@@ -33,6 +33,7 @@ import jakarta.inject.Inject;
 
 //Jakarta REST 3.1
 import jakarta.ws.rs.Consumes;
+import jakarta.ws.rs.DefaultValue;
 import jakarta.ws.rs.GET;
 import jakarta.ws.rs.PUT;
 import jakarta.ws.rs.Path;
@@ -55,8 +56,13 @@ public class SettlementExceptionResource {
 	@Inject private PostTradeService postTradeService;
 
 	@GET
-	public List<SettlementException> getExceptions(@QueryParam("status") ExceptionStatus status, @QueryParam("owner") String owner) {
-		return postTradeService.list(status, owner);
+	public List<SettlementException> getExceptions(@QueryParam("status") ExceptionStatus status, @QueryParam("owner") String owner,
+			@QueryParam("offset") @DefaultValue("0") int offset, @QueryParam("limit") @DefaultValue("0") int limit) {
+		//The page is cut from the filtered set, so a status or owner query answers with a page of its
+		//own matches rather than with whatever survived a page of the whole store.
+		PageBounds bounds = PageBounds.clamp(offset, limit);
+
+		return postTradeService.list(status, owner, bounds.getOffset(), bounds.getLimit());
 	}
 
 	@GET
@@ -67,8 +73,13 @@ public class SettlementExceptionResource {
 
 	@GET
 	@Path("/{exceptionId}/events")
-	public List<AuditEvent> getExceptionEvents(@PathParam("exceptionId") String exceptionId) {
-		return postTradeService.events(exceptionId);
+	public List<AuditEvent> getExceptionEvents(@PathParam("exceptionId") String exceptionId,
+			@QueryParam("offset") @DefaultValue("0") int offset, @QueryParam("limit") @DefaultValue("0") int limit) {
+		//Paged, unlike an order's history: ASSIGNED -> ASSIGNED is a legal edge, so one exception's
+		//timeline grows with every re-assignment and has no bound of its own.
+		PageBounds bounds = PageBounds.clamp(offset, limit);
+
+		return postTradeService.events(exceptionId, bounds.getOffset(), bounds.getLimit());
 	}
 
 	@PUT

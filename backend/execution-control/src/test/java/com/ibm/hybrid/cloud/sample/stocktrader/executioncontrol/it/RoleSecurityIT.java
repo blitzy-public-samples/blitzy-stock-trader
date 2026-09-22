@@ -17,7 +17,6 @@
 
 package com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.it;
 
-//Jakarta REST client 3.1
 import jakarta.ws.rs.client.Client;
 import jakarta.ws.rs.client.ClientBuilder;
 import jakarta.ws.rs.client.Entity;
@@ -25,7 +24,6 @@ import jakarta.ws.rs.client.Invocation;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 
-//JSON-P 2.1, for building the request body
 import jakarta.json.Json;
 
 import java.math.BigDecimal;
@@ -33,7 +31,6 @@ import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.UUID;
 
-//JUnit 5 Jupiter
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -60,11 +57,11 @@ class RoleSecurityIT {
     private static final String AUTHORIZATION_HEADER = "Authorization";
 
     /* Two identities, and deliberately only these two. Under AUTH_TYPE=none the basicRegistry of
-       includes/none.xml puts "stock" in the StockTrader group and "read" in StockViewer and in no
-       other group, so this pair separates the two application roles cleanly. The registry's
-       remaining accounts authenticate yet resolve no application role at all, so substituting one
-       of them would satisfy the 403 expectation for the wrong reason - refused for holding no
-       role rather than for holding the read-only one - while failing the 201 outright. */
+       includes/none.xml puts "stock" in the StockTrader group, which is what makes the 201 below
+       reachable, and "read" in StockViewer and in no other group. That viewer-only membership is
+       what makes the 403 below meaningful: an identity carrying any StockTrader membership would
+       be granted the POST, so only an account holding StockViewer alone can show a mutating verb
+       refused for the role the caller resolves rather than for the credentials it presented. */
     private static final String TRADER_IDENTITY = "stock:trader";
     private static final String VIEWER_IDENTITY = "read:only";
     private static final String ANONYMOUS_IDENTITY = "anonymous (no Authorization header)";
@@ -76,11 +73,11 @@ class RoleSecurityIT {
 
     /* One valid, comfortably in-limit order serves all three POSTs. INST-001's notional of 100.00
        clears MAX_ORDER_NOTIONAL (1,000,000.00) and FAT_FINGER_NOTIONAL_THRESHOLD (2,500,000.00)
-       by three orders of magnitude, and its SYNA position stays near 1,010,200 against a
-       MAX_POSITION_NOTIONAL of 5,000,000.00 even after every sibling class has filled it. The
-       body is kept valid for the 401 and 403 cases on purpose: the container refuses those before
-       JAX-RS ever reads the entity, so a valid body guarantees a validation 400 can never be
-       mistaken for the security status under test. */
+       by orders of magnitude, and this class's single-share fill leaves the resulting SYNA
+       position comfortably within the configured MAX_POSITION_NOTIONAL however many times the
+       suite fills it. The body is kept valid for the 401 and 403 cases on purpose: the container
+       refuses those before JAX-RS ever reads the entity, so a valid body guarantees a validation
+       400 can never be mistaken for the security status under test. */
     private static final String CLIENT_ID = "INST-001";
     private static final String SYMBOL = "SYNA";
     private static final String BUY = "BUY";

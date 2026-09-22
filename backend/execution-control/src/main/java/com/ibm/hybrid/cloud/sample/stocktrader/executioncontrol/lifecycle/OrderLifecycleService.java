@@ -42,6 +42,7 @@ import java.time.Instant;
 //Collections
 import java.util.List;
 import java.util.Locale;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 //CDI 4.0
@@ -65,6 +66,30 @@ public class OrderLifecycleService {
     private static final String REASON_SEPARATOR = "; ";
     private static final String REASON_CONTROLS_PASSED = "all pre-trade controls passed";
     private static final int AMOUNT_SCALE = 2;
+
+    //One trillion of currency per share: far above any price this simulation is asked to fill and
+    //far below the point where the price times a long share count leaves the amount bounds every
+    //stored and rendered value is held to. See price().
+    private static final BigDecimal MAX_LIMIT_PRICE = new BigDecimal("1000000000000.00");
+
+    /* Semantic lengths, held as code constants rather than configuration: these are what the
+       fields mean - an identifier a caller's own system issued and an exchange ticker - not a
+       tuning knob, and a client that could raise them could store a megabyte under a key the
+       service then keeps for the life of the process. */
+    private static final int MAX_CLIENT_ORDER_ID_LENGTH = 64;
+    private static final int MAX_CLIENT_ID_LENGTH = 64;
+    private static final int MAX_SYMBOL_LENGTH = 12;
+
+    /* Precompiled once: this runs on every submission, and Pattern.matches would recompile the
+       expression each time. The alphabet is the one a ticker is written in, so a symbol that
+       passes here cannot carry control characters, a newline or bidirectional text into a stored
+       order, an audit reason or a position key. */
+    private static final Pattern SYMBOL_PATTERN = Pattern.compile("^[A-Z0-9.-]+$");
+
+    //The most audit events one submission can write: SUBMITTED, then either REJECTED or
+    //ACCEPTED and EXECUTED, then the post-trade PENDING_AFFIRMATION and either SETTLEMENT_READY
+    //or an exception's OPEN plus the order's EXCEPTION edge.
+    private static final int MAX_EVENTS_PER_SUBMISSION = 6;
 
     private OrderStore orderStore;
     private ReferenceDataStore referenceData;
@@ -100,11 +125,14 @@ public class OrderLifecycleService {
     }
 
     public Order submit(OrderRequest request, String actor, RecordSource source) {
-        //One instant for the whole submission, so the order's timestamps, the simulated fill's
-        //executedAt and every audit event agree instead of drifting apart within one request.
+        //One instant for the whole submission, so the entity fields this method writes - the
+        //order's submittedAt and updatedAt and the simulated fill's executedAt - are all built
+        //from it rather than from separate reads of the clock as the submission progresses.
         Instant now = clock.instant();
 
         SubmittedOrder submitted = validate(request);
+        requireUnsubmitted(submitted.clientOrderId);
+        requireCapacity(submitted);
         String orderId = reserveOrderId(submitted.clientOrderId);
         Order stored = insertSubmitted(submitted, orderId, actor, now, source);
 
@@ -121,9 +149,20 @@ public class OrderLifecycleService {
 
     private SubmittedOrder validate(OrderRequest request) {
         String clientOrderId = required((request == null) ? null : request.getClientOrderId(),
-                "clientOrderId");
-        String clientId = required(request.getClientId(), "clientId");
-        String symbol = canonical(required(request.getSymbol(), "symbol"));
+                "clientOrderId", MAX_CLIENT_ORDER_ID_LENGTH);
+        String clientId = required(request.getClientId(), "clientId", MAX_CLIENT_ID_LENGTH);
+        String symbol = canonical(required(request.getSymbol(), "symbol", MAX_SYMBOL_LENGTH));
+
+        //Measured again after canonicalization, because upper-casing can lengthen a value - U+00DF
+        //upper-cases to "SS" - so the length that was checked on the way in is not necessarily the
+        //length of the symbol this order is stored, keyed and audited under.
+        if (symbol.length() > MAX_SYMBOL_LENGTH) {
+            throw new ValidationException("symbol must not exceed " + MAX_SYMBOL_LENGTH
+                    + " characters");
+        }
+        if (!SYMBOL_PATTERN.matcher(symbol).matches()) {
+            throw new ValidationException("symbol must contain only A-Z, 0-9, '.' or '-'");
+        }
 
         String side = canonical(request.getSide());
         if (!BUY.equals(side) && !SELL.equals(side)) {
@@ -161,8 +200,37 @@ public class OrderLifecycleService {
         if (limitPrice == null) {
             throw new ValidationException("limitPrice is required");
         }
+        //signum() reads the sign off the magnitude the caller already parsed, so it is safe to ask
+        //before the bounds below; nothing above this line expands the value.
         if (limitPrice.signum() <= 0) {
             throw new ValidationException("limitPrice must be greater than zero");
+        }
+
+        /* The representation is bounded before the cent conversion below, because that conversion
+           is where a compact exponent stops being compact: a body whose limitPrice reads
+           1e200000000 costs a dozen characters to send, and setScale would turn it into a
+           two-hundred-million digit number and exhaust the heap before any control could refuse the
+           order. The bound is Order's rather than this file's so the model and the services cannot
+           drift apart, and the message reports the scale and digit count instead of the amount -
+           rendering the amount is the other half of the allocation being refused. */
+        if (!Order.isAmountWithinBounds(limitPrice)) {
+            throw new ValidationException("limitPrice is outside the supported amount range ("
+                    + Order.describeAmount(limitPrice) + "): at most "
+                    + Order.MAX_AMOUNT_DECIMAL_PLACES + " decimal places, "
+                    + Order.MAX_AMOUNT_SIGNIFICANT_DIGITS
+                    + " significant digits and a magnitude below 1E+"
+                    + (Order.MAX_AMOUNT_ADJUSTED_EXPONENT + 1) + " are supported");
+        }
+
+        /* The absolute ceiling is what extends that bound to every amount derived from the price.
+           A notional is this price times a share count no larger than Long.MAX_VALUE, so a price
+           within the ceiling can never produce an order or position notional outside the bounds
+           above - which is why the order's own notional guard is unreachable from a submitted body.
+           It is a representation ceiling and not a control: a price sitting on it is admitted and
+           then judged by the configured pre-trade limits like any other. */
+        if (limitPrice.compareTo(MAX_LIMIT_PRICE) > 0) {
+            throw new ValidationException("limitPrice must not exceed "
+                    + MAX_LIMIT_PRICE.toPlainString());
         }
 
         BigDecimal cents = limitPrice.setScale(AMOUNT_SCALE, RoundingMode.DOWN);
@@ -174,14 +242,67 @@ public class OrderLifecycleService {
         return cents;
     }
 
+    /* Asked before the capacity gates so a saturated service still answers the question the
+       caller actually asked: a repeat clientOrderId is a conflict whatever the ceilings hold, and
+       refusing it with 503 would invite a retry of a key that can never be accepted. This peek is
+       read-only and decides only which refusal is given - reserveClientOrderId's putIfAbsent
+       remains the authority, so two concurrent submissions of one key that both pass here still
+       leave exactly one order. */
+    private void requireUnsubmitted(String clientOrderId) {
+        if (orderStore.findByClientOrderId(clientOrderId) != null) {
+            throw duplicateClientOrderId(clientOrderId);
+        }
+    }
+
+    //One factory for both refusal paths - this peek and the reservation below - so the 409 body a
+    //client reads is identical whichever of them produced it.
+    private static StateConflictException duplicateClientOrderId(String clientOrderId) {
+        return new StateConflictException(
+                "clientOrderId " + clientOrderId + " has already been submitted");
+    }
+
+    /* Every capacity this submission could consume is settled here, before the client order id is
+       reserved and before any store or the timeline is written, so a refusal at a ceiling leaves
+       no order, no position movement and no audit event behind: a 503 that had already changed
+       state would be indistinguishable from a submission that half happened. The three read-only
+       checks run first and the exact order claim last, which is what leaves exactly one claim to
+       release and no claim taken for a check that then refused. */
+    private void requireCapacity(SubmittedOrder submitted) {
+        if (!auditTimeline.hasCapacityFor(MAX_EVENTS_PER_SUBMISSION)) {
+            throw new CapacityExceededException(
+                    "the audit timeline is at capacity, so no further order can be recorded");
+        }
+
+        //Asked of every submission although most orders open no break: any execution may find one,
+        //and an order must not reach EXECUTED with nowhere to record it.
+        if (!postTrade.hasCapacityToOpenException()) {
+            throw new CapacityExceededException("the settlement-exception store is at capacity, so "
+                    + "no order that might open a break can be admitted");
+        }
+
+        if (!referenceData.hasPositionCapacityFor(submitted.clientId, submitted.symbol)) {
+            throw new CapacityExceededException("the position store is at capacity, so no new "
+                    + submitted.symbol + " position can be opened for clientId "
+                    + submitted.clientId);
+        }
+
+        if (!orderStore.tryAdmitOrder()) {
+            throw new CapacityExceededException(
+                    "the order store is at capacity, so no further order can be admitted");
+        }
+    }
+
     private String reserveOrderId(String clientOrderId) {
         String orderId = orderStore.nextOrderId();
         //The client order id is claimed before an order object exists, so exactly one of any
         //number of concurrent submissions carrying the same key proceeds and every loser writes
         //neither an order nor an audit event.
         if (!orderStore.reserveClientOrderId(clientOrderId, orderId)) {
-            throw new StateConflictException(
-                    "clientOrderId " + clientOrderId + " has already been submitted");
+            //The admission claim taken a moment ago is handed back before the refusal: this
+            //submission stores no order, and a claim left behind would retire one slot of the
+            //ceiling for the life of the process.
+            orderStore.releaseOrderAdmission();
+            throw duplicateClientOrderId(clientOrderId);
         }
 
         return orderId;
@@ -288,6 +409,13 @@ public class OrderLifecycleService {
         return orderStore.list();
     }
 
+    //The paged read a REST caller comes through: the store cuts the page under the same ordering
+    //it gives a full read, so page boundaries cannot shift between calls and an order estate at
+    //its ceiling is never serialized whole into one response.
+    public List<Order> list(int offset, int limit) {
+        return orderStore.list(offset, limit);
+    }
+
     public List<AuditEvent> events(String orderId) {
         //Read through the store first so an unknown id answers as a missing order rather than as
         //an order that happens to have no history.
@@ -300,11 +428,22 @@ public class OrderLifecycleService {
         return auditTimeline.forEntity(ORDER, orderId);
     }
 
-    private static String required(String value, String field) {
-        if (value == null || value.trim().isEmpty()) {
+    /* isBlank and strip rather than trim: trim only removes characters up to U+0020, so a value of
+       U+2003 (EM SPACE) would pass as present and Unicode padding would survive into the stored
+       order and into the idempotency key. The stripped value is what this method returns, so the
+       caller cannot accidentally store the raw one. Length is measured after stripping, because
+       padding is not content the caller asked to store. */
+    private static String required(String value, String field, int maxLength) {
+        if (value == null || value.isBlank()) {
             throw new ValidationException(field + " is required");
         }
-        return value;
+
+        String stripped = value.strip();
+        if (stripped.length() > maxLength) {
+            throw new ValidationException(field + " must not exceed " + maxLength + " characters");
+        }
+
+        return stripped;
     }
 
     /* Canonicalized once, on the way in, so the client's position key, the control evaluation, the
@@ -312,7 +451,7 @@ public class OrderLifecycleService {
        than the default locale: a Turkish locale upper-cases "i" to a dotted capital, and the
        symbol would then miss both its own position and its own restricted-list entry. */
     private static String canonical(String value) {
-        return (value == null) ? null : value.trim().toUpperCase(Locale.ROOT);
+        return (value == null) ? null : value.strip().toUpperCase(Locale.ROOT);
     }
 
     private static Order requireOrder(String orderId, Order order) {
@@ -322,10 +461,11 @@ public class OrderLifecycleService {
         return order;
     }
 
-    /* The validated, canonical form of one submit body, so the checks run once and every later step
-       - the stored order, the control evaluation, the position key, the fill and the simulated
-       execution - is built from the same values rather than re-reading a mutable request. */
+    /** The validated, canonical form of one submit body */
     private static final class SubmittedOrder {
+        //Every later step reads these fields instead of the request, so the stored order, the
+        //control evaluation, the position key, the fill and the simulated execution are all built
+        //from the stripped and canonical values rather than from a mutable request POJO.
         private final String clientOrderId;
         private final String clientId;
         private final String symbol;

@@ -17,13 +17,11 @@
 
 package com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.it;
 
-//Jakarta REST client 3.1
 import jakarta.ws.rs.client.Client;
 import jakarta.ws.rs.client.ClientBuilder;
 import jakarta.ws.rs.client.Invocation;
 import jakarta.ws.rs.core.Response;
 
-//JUnit 5 Jupiter
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 

@@ -41,7 +41,34 @@
     <variable name="default.http.port" defaultValue="9080"/>
     <variable name="default.https.port" defaultValue="9443"/>
 
-    <httpEndpoint httpPort="${default.http.port}" httpsPort="${default.https.port}" host="*" id="defaultHttpEndpoint"/>
+    <!-- One listener per scheme, because Liberty's response-header policy is scoped to an
+         endpoint and not to a scheme: HSTS means something only to a client that already
+         arrived over TLS, so the cleartext listener must not assert it while the TLS one
+         must. Each endpoint disables the port it does not serve with -1. $WSEP is removed
+         because the web container emits it on every response, naming the product to anyone
+         who asks; removeServerHeader and disableXPoweredBy do not cover it. -->
+    <httpEndpoint httpPort="${default.http.port}" httpsPort="-1" host="*" id="defaultHttpEndpoint">
+        <headers>
+            <set>X-Content-Type-Options: nosniff</set>
+            <set>Cache-Control: no-store</set>
+            <remove>$WSEP</remove>
+        </headers>
+    </httpEndpoint>
+
+    <httpEndpoint httpPort="-1" httpsPort="${default.https.port}" host="*" id="defaultHttpsEndpoint">
+        <headers>
+            <set>X-Content-Type-Options: nosniff</set>
+            <set>Cache-Control: no-store</set>
+            <set>Strict-Transport-Security: max-age=31536000</set>
+            <remove>$WSEP</remove>
+        </headers>
+    </httpEndpoint>
+
+    <!-- The id is the one both endpoints reach through the default httpOptionsRef, so a
+         single element suppresses the server signature on either listener. -->
+    <httpOptions id="defaultHttpOptions" removeServerHeader="true"/>
+
+    <webContainer disableXPoweredBy="true"/>
 
     <keyStore id="defaultKeyStore" password="St0ckTr@der" type="pkcs12"
          location="${server.config.dir}/resources/security/key.p12" />

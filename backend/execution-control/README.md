@@ -321,8 +321,8 @@ mvn -B clean package -DskipTests
 ```
 
 `mvn verify` starts and stops a real Open Liberty server around the integration tests
-(`liberty-maven-plugin` 3.11.5, assembly `wlp-webProfile10:25.0.0.9`): the server is created and
-its features installed at `prepare-package`, started and the WAR deployed at
+(`liberty-maven-plugin` 3.11.5, assembly `io.openliberty:openliberty-runtime:26.0.0.9`): the server
+is created and its features installed at `prepare-package`, started and the WAR deployed at
 `pre-integration-test`, and stopped at `post-integration-test`. The test server runs with
 `AUTH_TYPE=none`, so `includes/none.xml` is active and the integration tests authenticate with HTTP
 Basic as `stock:trader` (`StockTrader`) and `read:only` (`StockViewer`). It binds port 9080; move it
@@ -333,8 +333,12 @@ with `-Dliberty.var.default.http.port=<port>`, which shifts the server port and 
 mvn -B clean verify -Dliberty.var.default.http.port=19080 -Dliberty.var.default.https.port=19443
 ```
 
-**Coverage target:** at least 80% line coverage on the `control` and `lifecycle` packages — the new
-business logic — enforced by the JaCoCo `check` rule at `verify` and readable from
+The test assembly is deliberately the same Open Liberty release the container base image runs
+(26.0.0.9), so an integration test can never pass on a runtime the deployed image does not have.
+Keep the two in step on every runtime upgrade.
+
+**Coverage target:** at least 80% line coverage on the `control` and `lifecycle` packages — the
+module's business logic — enforced by the JaCoCo `check` rule at `verify` and readable from
 `target/site/jacoco/jacoco.xml` or the HTML report. Coverage is measured in the Surefire JVM only;
 the integration-test fork and the Liberty JVM are deliberately not instrumented, so client-side
 activity cannot inflate the figure.
@@ -347,7 +351,8 @@ produced:
 ```bash
 mvn -B clean package -DskipTests && \
   docker build -t execution-control:local . && \
-  docker run -d --name ec -p 9080:9080 -e AUTH_TYPE=none execution-control:local
+  docker run -d --name ec -p 127.0.0.1:9080:9080 -p 127.0.0.1:9443:9443 \
+    -e AUTH_TYPE=none execution-control:local
 ```
 
 The three steps are chained with `&&` deliberately: run them separately and a failed Maven build
@@ -355,19 +360,99 @@ leaves `docker build` copying whatever WAR was in `target/` beforehand, and a fa
 leaves `docker run` starting the previous image under the same tag. Chained, the first failure
 stops the pipeline.
 
-The base image is `icr.io/appcafe/open-liberty:25.0.0.9-full-java21-openj9-ubi-minimal` — the same
-base the sibling Liberty services use. It carries every Liberty feature, so the `microProfile-7.1`,
-`mpTelemetry-2.1` and `appSecurity-5.0` features `server.xml` enables need no install step. The
-module's release-17 class files run unchanged on the image's Java 21 runtime.
+Both published ports name `127.0.0.1` explicitly. A bare `-p 9080:9080` does not mean localhost: it
+binds the Docker daemon's default host address, which is `0.0.0.0` unless the daemon was configured
+otherwise, and that publishes the cleartext listener on every interface of the machine.
+
+The base image is `icr.io/appcafe/open-liberty:26.0.0.9-full-java21-openj9-ubi-minimal`, pinned in
+the `Dockerfile` by digest alongside that tag:
+
+```
+FROM icr.io/appcafe/open-liberty:26.0.0.9-full-java21-openj9-ubi-minimal@sha256:4c84a4fc73413adf3406513b7827eee721591bf139b245fea51b71e00b0dc4bc
+```
+
+It carries every Liberty feature, so the `microProfile-7.1`, `mpTelemetry-2.1` and
+`appSecurity-5.0` features `server.xml` enables need no install step, and the module's release-17
+class files run unchanged on the image's Java 21 runtime.
+
+**Runtime provenance.** The 26.0.0.9 release line is a security floor, not a cosmetic choice: the
+servlet request/response smuggling fixes land in 26.0.0.8, so every earlier release — including
+the older base the sibling Liberty services still run — is inside the affected range. The digest is
+pinned because the tag is mutable: the same tag rebuilt later can resolve to different bytes, and
+the digest makes the image reviewable and the rollback exact while the tag keeps the release
+readable.
+
+A digest fixes *which* bytes you run. It says nothing about *who* built them, so the digest is the
+end of the procedure below, not the whole of it. Before adopting a base image — at the next runtime
+upgrade, or any time the pinned digest changes — verify its provenance and record what you verified:
+
+```bash
+BASE=icr.io/appcafe/open-liberty:<tag>
+
+# 1. The digest the tag resolves to right now. This is what gets pinned, and
+#    what every later step must be about.
+docker buildx imagetools inspect "$BASE" --format '{{println .Manifest.Digest}}'
+
+# 2. The build provenance the publisher attests to. Open Liberty publishes an
+#    in-toto attestation with predicate type https://slsa.dev/provenance/v1,
+#    carried in an attestation manifest alongside each platform manifest.
+docker buildx imagetools inspect "$BASE" --format '{{ json (index .Provenance "linux/amd64") }}'
+
+# 3. If that comes back empty, read the attestation manifest straight from the
+#    registry: the index entry annotated vnd.docker.reference.type=attestation-manifest
+#    has one application/vnd.in-toto+json layer, and its in-toto.io/predicate-type
+#    annotation names the predicate.
+docker buildx imagetools inspect "$BASE" --raw
+```
+
+Check the returned build definition names the builder, source and workflow you expect for an
+official Open Liberty release, and reject the image if it does not. Note the limit honestly: at the
+time of writing IBM Container Registry publishes SLSA provenance for these images but no Cosign
+signature — `sha256-<digest>.sig` is absent — so the verifiable evidence is the attestation plus the
+digest, and the digest recorded in the `Dockerfile` is the trust anchor. If your organisation
+requires a signature, mirror the base into a registry you control and sign it there as part of
+admission, rather than treating an unsigned upstream tag as trusted.
+
+Hold the image you build to a higher standard than the base, because you own its builder. Produce
+provenance and an SBOM at build time, verify both after the push, and sign the digest with the
+identity your cluster's admission policy trusts:
+
+```bash
+IMG=<your-image-repo>/ibmstocktrader/execution-control:1.0.0
+
+docker buildx build --provenance=true --sbom=true -t "$IMG" --push .
+
+# Read both attestations back from the registry copy, not the local one.
+docker buildx imagetools inspect "$IMG" --format '{{ json (index .Provenance "linux/amd64") }}'
+docker buildx imagetools inspect "$IMG" --format '{{ json (index .SBOM "linux/amd64") }}'
+
+# Sign the digest, and verify against the signer identity you expect. Keyless
+# example; substitute your key or your CI's OIDC issuer and subject.
+DIGEST=$(docker buildx imagetools inspect "$IMG" --format '{{println .Manifest.Digest}}')
+cosign sign "${IMG%:*}@${DIGEST}"
+cosign verify "${IMG%:*}@${DIGEST}" \
+  --certificate-identity <your-build-identity> \
+  --certificate-oidc-issuer <your-oidc-issuer>
+```
+
+Only the digest that passed those checks belongs in the manifest's `image:` field, and it is worth
+recording alongside the release which digest was verified, by whom and against which signer — that
+record, not the tag, is what makes a later rollback or incident review possible.
 
 Add `-e OTEL_SDK_DISABLED=true` for a local run to suppress the OTLP exporter's retries against the
 cluster-local collector endpoint. Verify the container with:
 
 ```bash
 curl -s http://localhost:9080/health/ready
-curl -s -u stock:trader http://localhost:9080/execution-control/controls
+curl -k -u stock:trader https://localhost:9443/execution-control/controls
 docker rm -f ec
 ```
+
+The health call carries no credential, so it uses the cleartext listener — the same one the kubelet
+probes in a cluster. The second call carries one, so it uses the TLS listener, exactly as the review
+section below does; `-k` is needed because the shipped keystore is self-signed sample material. The
+rule does not relax for a local container: the cleartext port is for credential-free traffic
+wherever it is published.
 
 ## Standalone Kubernetes deployment
 
@@ -376,8 +461,21 @@ hand. Push the image to a registry your cluster can pull from, then apply the ma
 deploys into the `stocktrader` namespace — create that namespace first if it does not exist, or
 substitute your own.
 
+Reference the image you pushed by digest rather than by a tag, so the manifest names exactly the
+bytes you verified and a restart cannot silently pick up different ones. Use the digest that came
+out of the provenance and signature checks in the Container section above — read it back from the
+registry rather than from the local daemon:
+
+```bash
+docker buildx imagetools inspect <your-image-repo>/ibmstocktrader/execution-control:1.0.0 \
+  --format '{{println .Manifest.Digest}}'
+```
+
+`docker inspect --format='{{index .RepoDigests 0}}' <image>` gives the same value for an image the
+local daemon has pushed or pulled, if you would rather not reach the registry.
+
 Save the manifest as `execution-control.yml`, replacing the `image:` placeholder with your own
-repository and tag:
+repository and that verified digest:
 
 ```yaml
 #       Copyright 2025 Kyndryl, All Rights Reserved
@@ -394,7 +492,6 @@ repository and tag:
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 
-#Deploy the pod
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -411,15 +508,29 @@ spec:
       labels:
         app: execution-control
     spec:
+      # This service calls no Kubernetes API, so a projected token would only be an
+      # unused credential in the pod.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        # The user the image's own `USER 1001` and `chown -R 1001:0` establish.
+        runAsUser: 1001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
       - name: execution-control
-        image: <your-image-repo>/ibmstocktrader/execution-control:latest
+        image: <your-image-repo>/ibmstocktrader/execution-control@sha256:<the digest you verified>
         ports:
           - containerPort: 9080
           - containerPort: 9443
-        imagePullPolicy: Always
+        # A digest cannot move, so there is nothing to re-pull on restart.
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
         env:
-          # Identity. Every value here is the shipped default; the service also starts with no env at all.
+          # Identity settings.
           - name: AUTH_TYPE
             value: "basic"
           - name: JWT_AUDIENCE
@@ -470,7 +581,6 @@ spec:
             memory: 512Mi
             ephemeral-storage: 32Mi
 ---
-#Deploy the service
 apiVersion: v1
 kind: Service
 metadata:
@@ -480,6 +590,8 @@ metadata:
 spec:
   type: ClusterIP
   ports:
+    # Cleartext: kubelet probes and in-cluster callers only. Anything carrying
+    # credentials belongs on 9443 or behind a TLS-terminating ingress.
     - name: http
       protocol: TCP
       port: 9080
@@ -506,43 +618,87 @@ there are no `prometheus.io/*` annotations, because the requested feature set in
 annotation, because this service has no repository of its own to name — it is tracked content of
 the parent aggregation, not a seventeenth microservice repository.
 
+The pod runs with least privilege: no service-account token is mounted (the service calls no
+Kubernetes API), the container runs as the image's non-root UID 1001 under the `RuntimeDefault`
+seccomp profile, privilege escalation is refused and every Linux capability is dropped. One
+restricted-profile setting is deliberately absent: `readOnlyRootFilesystem` is not set, because
+Liberty writes its workarea, output and logs under `/opt/ol/wlp` at startup and would fail to
+start against a read-only root without `emptyDir` mounts for those paths.
+
 The `Service` is `ClusterIP` — the minimal exposure — because nothing in the estate routes to this
 service: no trader page, no broker adapter, no Istio route. Substituting `type: NodePort` with the
 same two ports also works and is what `portfolio-assistant` uses, if you would rather reach it
-without a port-forward.
+without a port-forward; note that it puts the cleartext 9080 listener on every node, so restrict it
+to 9443 if you do.
+
+Of the two published ports, **9080 is cleartext HTTP** and exists for the kubelet probes and
+in-cluster callers; **9443 is the TLS listener** and is where authenticated application traffic
+belongs, either directly or through a TLS-terminating ingress.
+
+The two ports are separate `httpEndpoint` elements in `server.xml` for one reason: a response-header
+policy in Liberty is scoped to an endpoint, not to a scheme. Both listeners suppress the server
+signature and `X-Powered-By`, and both set `X-Content-Type-Options: nosniff` and
+`Cache-Control: no-store` — the latter because every application response here is authenticated
+JSON that no intermediary or browser should retain. Only the TLS listener adds
+`Strict-Transport-Security`, which a client that arrived over cleartext would be right to ignore. An
+ingress in front of this service may set the same headers; it must not weaken them.
 
 ## Reviewing the service
 
-Forward the service port into your shell:
+**Send credentials over 9443, never over 9080.** Port 9080 is plain HTTP: it applies no encryption,
+and a `kubectl port-forward` does not add any — the hop from the API server to the pod carries
+whatever the listener speaks. An `Authorization: Bearer` header or an HTTP Basic credential sent to
+9080 is therefore readable by anything on that path. Use 9080 for the health probes and in-cluster
+calls that carry no credential; put every authenticated call on the TLS listener 9443, or behind a
+TLS-terminating ingress in front of it.
+
+Forward the TLS port, in a shell you can leave running:
+
+```bash
+kubectl -n stocktrader port-forward svc/execution-control-service 9443:9443
+```
+
+That gives the API base URL `https://localhost:9443/execution-control`.
+
+The server presents the estate's shared *sample* keystore — self-signed demonstration material
+copied from the broker, not a certificate any client trusts — so `curl` needs `-k` to talk to it,
+or `--cacert <file>` if you extract the certificate first. That `-k` is itself the reminder: this
+material proves nothing about the peer and must be replaced with real certificates (or fronted by
+an ingress that terminates real TLS) before anything but a demonstration runs here.
+
+The health endpoints carry no credential, so the cleartext port is adequate for them — it is what
+the kubelet probes use in the cluster. Forward it as well, in its own shell:
 
 ```bash
 kubectl -n stocktrader port-forward svc/execution-control-service 9080:9080
 ```
 
-That gives the API base URL `http://localhost:9080/execution-control` and the health URLs
-`http://localhost:9080/health/started`, `http://localhost:9080/health/ready` and
-`http://localhost:9080/health/live`.
+```bash
+curl -s http://localhost:9080/health/started
+curl -s http://localhost:9080/health/ready
+curl -s http://localhost:9080/health/live
+```
 
 Authenticate according to the deployment's `AUTH_TYPE`. With the default `basic`, present the same
 `Authorization: Bearer` token the estate already issues (the trader front end's `jwtSso` builder
 issues a compatible one, readable from the browser's cookies):
 
 ```bash
-curl -H "Authorization: Bearer <jwt>" http://localhost:9080/execution-control/exceptions
+curl -k -H "Authorization: Bearer <jwt>" https://localhost:9443/execution-control/exceptions
 ```
 
 With `AUTH_TYPE=none` — development and tests only — HTTP Basic against the development registry
 works instead:
 
 ```bash
-curl -u stock:trader http://localhost:9080/execution-control/exceptions
+curl -k -u stock:trader https://localhost:9443/execution-control/exceptions
 ```
 
 Submit an order (the trader persona). The response is the order in its terminal state, with all
 four control results attached:
 
 ```bash
-curl -u stock:trader -X POST http://localhost:9080/execution-control/orders \
+curl -k -u stock:trader -X POST https://localhost:9443/execution-control/orders \
   -H 'Content-Type: application/json' \
   -d '{"clientOrderId":"C1","clientId":"INST-001","symbol":"SYNA","side":"BUY","quantity":100,"limitPrice":100.00}'
 ```
@@ -551,36 +707,36 @@ Submit a comparable order for `INST-003` and the execution opens a settlement ex
 that client's counterparty SSI disagrees with the firm's:
 
 ```bash
-curl -u stock:trader -X POST http://localhost:9080/execution-control/orders \
+curl -k -u stock:trader -X POST https://localhost:9443/execution-control/orders \
   -H 'Content-Type: application/json' \
   -d '{"clientOrderId":"C2","clientId":"INST-003","symbol":"SYNA","side":"BUY","quantity":300,"limitPrice":100.00}'
-curl -u stock:trader "http://localhost:9080/execution-control/exceptions?status=OPEN"
+curl -k -u stock:trader "https://localhost:9443/execution-control/exceptions?status=OPEN"
 ```
 
 Work that exception through to settlement-ready (the operations-analyst persona), substituting the
 `exceptionId` the list returned:
 
 ```bash
-curl -u stock:trader -X PUT http://localhost:9080/execution-control/exceptions/EXC-000002/assign \
+curl -k -u stock:trader -X PUT https://localhost:9443/execution-control/exceptions/EXC-000002/assign \
   -H 'Content-Type: application/json' \
   -d '{"owner":"ops.analyst"}'
 
-curl -u stock:trader -X PUT http://localhost:9080/execution-control/exceptions/EXC-000002/resolve \
+curl -k -u stock:trader -X PUT https://localhost:9443/execution-control/exceptions/EXC-000002/resolve \
   -H 'Content-Type: application/json' \
   -d '{"owner":"ops.analyst","resolutionNote":"Counterparty safekeeping account corrected with custodian"}'
 
-curl -u stock:trader -X PUT http://localhost:9080/execution-control/exceptions/EXC-000002/settlement-ready
+curl -k -u stock:trader -X PUT https://localhost:9443/execution-control/exceptions/EXC-000002/settlement-ready
 ```
 
 Then read the evidence — the effective rules, the reference data and the audit timeline:
 
 ```bash
-curl -u stock:trader http://localhost:9080/execution-control/controls
-curl -u stock:trader http://localhost:9080/execution-control/clients
-curl -u stock:trader http://localhost:9080/execution-control/positions
-curl -u stock:trader http://localhost:9080/execution-control/audit
-curl -u stock:trader "http://localhost:9080/execution-control/audit?entityType=EXCEPTION&entityId=EXC-000002"
-curl -u read:only http://localhost:9080/execution-control/orders
+curl -k -u stock:trader https://localhost:9443/execution-control/controls
+curl -k -u stock:trader https://localhost:9443/execution-control/clients
+curl -k -u stock:trader https://localhost:9443/execution-control/positions
+curl -k -u stock:trader https://localhost:9443/execution-control/audit
+curl -k -u stock:trader "https://localhost:9443/execution-control/audit?entityType=EXCEPTION&entityId=EXC-000002"
+curl -k -u read:only https://localhost:9443/execution-control/orders
 ```
 
 The last call shows the read-only role at work; the same credentials on any `POST` or `PUT` answer
@@ -701,3 +857,98 @@ event created through the API disappears, and the seed set described above is re
 scratch on every startup. That is acceptable for simulated, synthetic data and is the reason no
 datastore is introduced; it also means the identifiers restart from `ORD-000001`, `EXE-000001` and
 `EXC-000001` each time, so do not treat them as durable references across restarts.
+
+#### Admission capacity
+
+Because nothing here expires and nothing is ever deleted, every structure carries a ceiling. The
+ceilings are code constants, not configuration: raising them does not make the design hold more
+state safely, it only moves the point at which the heap runs out, and a deployment that needs more
+state needs a datastore rather than a larger number here.
+
+| Structure | Ceiling | What is refused at it |
+| --- | --- | --- |
+| Orders (with their executions) | 10,000 | `POST /orders` — no further order is admitted |
+| Settlement exceptions | 10,000 | `POST /orders` — an order that might open a break is not admitted, because an execution must never find nowhere to record one |
+| Positions (distinct client and symbol) | 5,000 | `POST /orders` — only an order that would open a *new* holding; an order in a holding the client already has stays admissible, since a fill rewrites that entry and adds no key |
+| Audit events | 150,000 | `POST /orders`, `PUT …/assign`, `PUT …/resolve` and `PUT …/settlement-ready` — the step is refused rather than taken unrecorded |
+
+A refusal answers **`503 Service Unavailable`** with the usual `ErrorResponse` body. It is `503`
+and not `429` because the exhausted ceiling belongs to the whole service rather than to the calling
+client: no caller clears it by slowing down, and no per-client quota was crossed. There is no
+`Retry-After` header, because the headroom returns when the service restarts and at no interval
+this service could honestly name.
+
+Every refusal is decided **before any state change and before any audit event**, so a `503` leaves
+no order, no position movement, no exception and no timeline entry behind — a refusal is
+indistinguishable from a request that was never sent. The one qualification is the race the
+position claim settles: where several first fills in *distinct* symbols contend for the last free
+slot, a loser that had already passed the gate is refused inside the fill step, so its order stops
+at `SUBMITTED` with its one submission event and no position is created — the same place a fill
+refused by the resulting-share-range check stops.
+
+**Every ceiling is an atomic claim, so every one of them is exact.** Orders, exceptions and
+positions are claimed with a compare-and-set counter taken inside the step that would create the
+record — for a position, inside the same `compute` that creates its key — and the audit ceiling is
+enforced under the monitor that fixes the timeline's size, before an event's ordinal is taken. The
+size comparison a flow makes first is a **gate, not a reservation**: it decides *which* refusal a
+caller gets, declining the whole flow at its first statement rather than abandoning it part-way,
+while the claim inside each structure is the **authority** that no amount of concurrency can pass.
+A claim that produced no record — a duplicate `clientOrderId` refused after admission, or controls
+that rejected the order before its position was created — is handed back, so a refusal never
+retires a slot for the life of the process.
+
+**A ceiling never masks the answer a caller earned.** Identity and legality are settled before
+capacity, so a duplicate `clientOrderId` still answers `409` naming the key, an unknown order or
+exception id still answers `404`, and an unsupported lifecycle transition still answers `409` — on
+a saturated service exactly as on an empty one. A malformed body still answers `400` ahead of all
+of them. Only a request that would otherwise have been accepted is answered `503`.
+
+For scale: 10,000 orders, 10,000 exceptions, 5,000 positions and 150,000 audit events retain
+roughly 75 MB. The audit ceiling sits above what the entity ceilings imply: an order whose
+settlement instructions mismatch and which is then worked to the end consumes ten events — six for
+its submission, including the exception's `OPEN`, then one assign, one resolve and two for
+settlement-ready — so 10,000 fully worked orders imply 100,000. Keeping the ceiling above that
+figure is what lets a fully worked estate record its own last transitions, and what keeps the
+record from ever being the thing that refuses a state change.
+
+#### Field limits
+
+The same reasoning bounds what one request may store. These are semantic limits — what an
+identifier and a ticker are — and a value that crosses one answers `400 Bad Request` naming the
+field, before any identifier is reserved.
+
+| Field | Limit |
+| --- | --- |
+| `clientOrderId` | 64 characters |
+| `clientId` | 64 characters |
+| `symbol` | 12 characters, written in `A-Z`, `0-9`, `.` or `-` after canonicalization |
+| `owner` | 64 characters |
+| `resolutionNote` | 1024 characters |
+
+Required text fields are checked with Java's `isBlank` and stored with `strip`, so a value made
+only of Unicode whitespace — `U+2003` EM SPACE, for instance — is refused as absent rather than
+accepted as present, and surrounding padding never reaches a stored record, an audit reason or the
+`clientOrderId` idempotency key. `U+00A0` NO-BREAK SPACE is not whitespace by that definition and
+is deliberately left in place.
+
+#### Paging the collection endpoints
+
+Every collection that grows takes `offset` and `limit` query parameters and serializes at most one
+page, so no response can duplicate and serialize the whole estate:
+
+| Endpoint | Paged |
+| --- | --- |
+| `GET /orders` | yes |
+| `GET /exceptions` | yes — the page is cut from the filtered set, so a `status` or `owner` query pages its own matches |
+| `GET /exceptions/{exceptionId}/events` | yes — `ASSIGNED → ASSIGNED` is a legal edge, so one exception's history grows with every re-assignment |
+| `GET /audit` | yes, including when narrowed by `entityType` and `entityId` |
+| `GET /positions` | yes |
+| `GET /clients` | no — the three client records are written by the startup seed and no code path adds a fourth |
+| `GET /orders/{orderId}/events` | no — an order can never carry more than six events, because neither the order nor the post-trade transition table has a self-edge |
+
+Both parameters are clamped rather than validated, so no existing caller breaks: `offset` below
+zero becomes zero, an `offset` past the end returns an empty page, and a `limit` that is absent,
+zero, negative or above the maximum page size of **500** becomes 500. Ordering is the one each
+endpoint already documented — order id, exception id, client then symbol, audit sequence — and it
+is established over the whole collection before the page is cut, so consecutive pages neither
+overlap nor skip a record.

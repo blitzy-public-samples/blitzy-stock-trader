@@ -22,10 +22,10 @@ public class ClientAccount {
     private final String clientId;
     private final String clientName;
     /* Both sides of the settlement instruction hang off the client because comparing them is what
-       produces a settlement exception: on every execution PostTradeService walks the four fields of
-       the firm instruction against the counterparty instruction and opens an SSI_MISMATCH the moment
-       one differs. Seeded INST-003 therefore carries a counterparty safekeepingAccount that is
-       deliberately unequal to the firm's, which is what makes the mismatch flow reproducible. */
+       produces a settlement exception: on every execution PostTradeService compares all four fields
+       of the two instructions and, when one or more of them differ, opens a single SSI_MISMATCH
+       carrying every field that did. Seeded INST-003 therefore carries a counterparty
+       safekeepingAccount deliberately unequal to the firm's, which makes the flow reproducible. */
     private final SettlementInstruction firmSettlementInstruction;
     private final SettlementInstruction counterpartySettlementInstruction;
     private final boolean synthetic;

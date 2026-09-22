@@ -21,28 +21,24 @@ import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.dao.OrderStore;
 import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.dao.ReferenceDataStore;
 import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.dao.SettlementExceptionStore;
 
-//Standard I/O classes
-import java.io.PrintWriter;
-import java.io.StringWriter;
-
 //Logging (JSR 47)
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
-//CDI 2.0
+//CDI 4.0
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
-//mpHealth 1.0
+//mpHealth 4.0
 import org.eclipse.microprofile.health.HealthCheck;
 import org.eclipse.microprofile.health.HealthCheckResponse;
 import org.eclipse.microprofile.health.HealthCheckResponseBuilder;
 import org.eclipse.microprofile.health.Liveness;
 
 
+/** Reports the service live while its in-memory stores answer, carrying their record counts. */
 @Liveness
 @ApplicationScoped
-/** Use mpHealth for liveness probe */
 public class LivenessProbe implements HealthCheck {
     private static Logger logger = Logger.getLogger(LivenessProbe.class.getName());
 
@@ -53,7 +49,6 @@ public class LivenessProbe implements HealthCheck {
     private @Inject ReferenceDataStore referenceDataStore;
 
 
-    //mpHealth probe
     @Override
     public HealthCheckResponse call() {
         HealthCheckResponse response = null;
@@ -88,12 +83,6 @@ public class LivenessProbe implements HealthCheck {
 
     private static void logException(Throwable t) {
         logger.warning(t.getClass().getName()+": "+t.getMessage());
-
-        //only log the stack trace if the level has been set to at least INFO
-        if (logger.isLoggable(Level.INFO)) {
-            StringWriter writer = new StringWriter();
-            t.printStackTrace(new PrintWriter(writer));
-            logger.info(writer.toString());
-        }
+        logger.log(Level.INFO, "Liveness health check failed", t);
     }
 }

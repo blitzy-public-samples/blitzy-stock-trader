@@ -13,27 +13,22 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 
-# Runtime-only image: it compiles nothing. Run `mvn -B clean package` first so that
-# target/ExecutionControl.war exists, then `docker build .` - the sibling .dockerignore
-# admits only that artefact and src/main/liberty/config, so a stale or missing WAR
-# fails the build here rather than producing an image without the application.
-
 # The 'full' tag already contains every Liberty feature, so the microProfile-7.1,
 # mpTelemetry-2.1 and appSecurity-5.0 features server.xml enables need no features.sh
-# or featureUtility step (those exist for the 'kernel-slim' tags). MicroProfile 7.1
-# shipped in Open Liberty 25.0.0.8, so this 25.0.0.9 base carries it; the module's
-# release-17 class files run unchanged on the image's Java 21 runtime.
-FROM icr.io/appcafe/open-liberty:25.0.0.9-full-java21-openj9-ubi-minimal
+# or featureUtility step (those exist for the 'kernel-slim' tags). 26.0.0.9 is a
+# security floor, not a preference: the servlet request-smuggling advisories are fixed
+# only from 26.0.0.8 onwards. The digest follows the tag because the tag is mutable -
+# it holds every rebuild to the base layers that were reviewed, while the tag keeps the
+# release readable; re-review both on the next runtime upgrade.
+FROM icr.io/appcafe/open-liberty:26.0.0.9-full-java21-openj9-ubi-minimal@sha256:4c84a4fc73413adf3406513b7827eee721591bf139b245fea51b71e00b0dc4bc
 
 USER root
 
-# server.xml, includes/${AUTH_TYPE}.xml, the configDropins keystore override and the
-# PKCS12 key/trust stores all land under the default server in one copy.
 COPY src/main/liberty/config /opt/ol/wlp/usr/servers/defaultServer/
 
 # The destination file name must stay ExecutionControl.war: server.xml loads the
-# application by that literal location, and any other name starts a server with no
-# application deployed and no error to say so.
+# application by that literal location, so any other name leaves the application
+# undeployed.
 COPY target/ExecutionControl.war /opt/ol/wlp/usr/servers/defaultServer/apps/ExecutionControl.war
 
 # Grant the non-root runtime user (1001, root group) ownership of everything just

@@ -19,10 +19,10 @@ package com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json;
 
 /** One settlement-instruction field on which the firm and the counterparty disagree */
 public class MismatchField {
-    /* Holds the Java field name of the offending SettlementInstruction property -
-       custodianBic, safekeepingAccount, cashAccount or placeOfSettlement - rather than
+    /* Holds the Java field name of the offending SettlementInstruction property rather than
        a prose label, so an analyst reading the exception can locate the break on the
-       instruction itself. Renaming a field there changes this published value. */
+       instruction itself. PostTradeService supplies that name from its own field-name
+       constants, which must be kept aligned by hand with the names the instruction publishes. */
     private final String field;
     private final String firmValue;
     private final String counterpartyValue;

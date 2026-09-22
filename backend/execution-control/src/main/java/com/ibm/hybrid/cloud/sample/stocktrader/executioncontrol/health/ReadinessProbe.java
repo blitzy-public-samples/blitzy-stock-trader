@@ -19,10 +19,6 @@ package com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.health;
 
 import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.dao.SeedDataLoader;
 
-//Standard I/O classes
-import java.io.PrintWriter;
-import java.io.StringWriter;
-
 //Optional value
 import java.util.Optional;
 
@@ -30,23 +26,23 @@ import java.util.Optional;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
-//CDI 2.0
+//CDI 4.0
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
 //mpConfig 3.1
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 
-//mpHealth 1.0
+//mpHealth 4.0
 import org.eclipse.microprofile.health.HealthCheck;
 import org.eclipse.microprofile.health.HealthCheckResponse;
 import org.eclipse.microprofile.health.HealthCheckResponseBuilder;
 import org.eclipse.microprofile.health.Readiness;
 
 
+/** Reports the service ready once the seed data is loaded and both JWT settings resolve. */
 @Readiness
 @ApplicationScoped
-/** Use mpHealth for readiness probe */
 public class ReadinessProbe implements HealthCheck {
     private static Logger logger = Logger.getLogger(ReadinessProbe.class.getName());
 
@@ -54,15 +50,14 @@ public class ReadinessProbe implements HealthCheck {
 
     private @Inject SeedDataLoader seedDataLoader;
 
-    //Both settings arrive as server.xml <variable> defaults rather than from the environment, so
-    //they are read through MicroProfile Config - which exposes those variables as a config source
-    //- and read optionally, because a mandatory injection point would fail CDI deployment
-    //validation and take the whole application down wherever the variable does not resolve.
+    //Both settings have server.xml <variable> defaults and resolve through MicroProfile Config,
+    //which exposes those variables as a config source alongside any deployment environment
+    //override. They are read optionally because a mandatory injection point would fail CDI
+    //deployment validation and take the whole application down wherever neither source resolves.
     private @Inject @ConfigProperty(name = "JWT_AUDIENCE") Optional<String> jwtAudience;
     private @Inject @ConfigProperty(name = "JWT_ISSUER") Optional<String> jwtIssuer;
 
 
-    //mpHealth probe
     @Override
     public HealthCheckResponse call() {
         HealthCheckResponse response = null;
@@ -106,12 +101,6 @@ public class ReadinessProbe implements HealthCheck {
 
     private static void logException(Throwable t) {
         logger.warning(t.getClass().getName()+": "+t.getMessage());
-
-        //only log the stack trace if the level has been set to at least INFO
-        if (logger.isLoggable(Level.INFO)) {
-            StringWriter writer = new StringWriter();
-            t.printStackTrace(new PrintWriter(writer));
-            logger.info(writer.toString());
-        }
+        logger.log(Level.INFO, "Readiness health check failed", t);
     }
 }

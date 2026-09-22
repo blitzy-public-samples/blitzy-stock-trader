@@ -31,11 +31,13 @@ import jakarta.inject.Inject;
 
 //Jakarta REST 3.1
 import jakarta.ws.rs.Consumes;
+import jakarta.ws.rs.DefaultValue;
 import jakarta.ws.rs.GET;
 import jakarta.ws.rs.POST;
 import jakarta.ws.rs.Path;
 import jakarta.ws.rs.PathParam;
 import jakarta.ws.rs.Produces;
+import jakarta.ws.rs.QueryParam;
 import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
@@ -67,8 +69,13 @@ public class OrderResource {
 	}
 
 	@GET
-	public List<Order> getOrders() {
-		return orderLifecycleService.list();
+	public List<Order> getOrders(@QueryParam("offset") @DefaultValue("0") int offset, @QueryParam("limit") @DefaultValue("0") int limit) {
+		//The order estate grows for the life of the process, so this response is one page of it and
+		//never the whole of it: PageBounds turns an absent, zero, negative or oversized parameter
+		//into the nearest page that exists, which is what keeps this bound off the caller's contract.
+		PageBounds bounds = PageBounds.clamp(offset, limit);
+
+		return orderLifecycleService.list(bounds.getOffset(), bounds.getLimit());
 	}
 
 	@GET
@@ -77,6 +84,9 @@ public class OrderResource {
 		return orderLifecycleService.get(orderId);
 	}
 
+	//Unpaged deliberately: an order can never carry more than six events, because neither the
+	//ORDER nor the POST_TRADE transition table has a self-edge, so this response is bounded by the
+	//state machines themselves rather than by a page size.
 	@GET
 	@Path("/{orderId}/events")
 	public List<AuditEvent> getOrderEvents(@PathParam("orderId") String orderId) {

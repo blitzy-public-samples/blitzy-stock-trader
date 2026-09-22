@@ -75,9 +75,8 @@ public class PreTradeControlService {
 
         //Nothing short-circuits: Order.controlResults persists all four outcomes and
         //OrderLifecycleService joins every failing reason into one rejectionReason, so a rejection
-        //has to carry the whole picture rather than the first breach found. Under the default
-        //limits an order of notional 2500000.00 therefore reports FAT_FINGER passed in the same
-        //list as a failed MAX_ORDER_NOTIONAL.
+        //has to carry the whole picture rather than the first breach found - one order can sit
+        //within one notional ceiling and outside another, and both verdicts are evidence.
         List<ControlResult> results = new ArrayList<>(CONTROL_COUNT);
         results.add(evaluateMaxOrderNotional(order));
         results.add(evaluateMaxPositionNotional(order, resultingQuantity(order, existing)));
@@ -195,6 +194,22 @@ public class PreTradeControlService {
     //Locale-independent by construction, unlike a "%.2f" format, which would render 1000000,00 on a
     //JVM whose default locale uses a comma separator and break text compared character for character.
     private static String amount(BigDecimal value) {
+        /* Refused on its representation before the conversion and the rendering below, because a
+           BigDecimal keeps its exponent as a scale: setScale and toPlainString are where a compact
+           exponent becomes millions of digits, and every amount the three notional controls report
+           passes through here. The order's own amounts are already bounded when Order is
+           constructed, so what this guard actually catches is a configured limit wide enough to
+           exhaust the heap while being reported - and it reports the representation rather than the
+           value, since rendering the value is exactly what it is refusing to do. */
+        if (!Order.isAmountWithinBounds(value)) {
+            throw new IllegalArgumentException("a control amount outside the supported range "
+                    + "cannot be rendered (" + Order.describeAmount(value) + "): at most "
+                    + Order.MAX_AMOUNT_DECIMAL_PLACES + " decimal places, "
+                    + Order.MAX_AMOUNT_SIGNIFICANT_DIGITS
+                    + " significant digits and a magnitude below 1E+"
+                    + (Order.MAX_AMOUNT_ADJUSTED_EXPONENT + 1) + " are supported");
+        }
+
         return value.setScale(AMOUNT_SCALE, RoundingMode.HALF_UP).toPlainString();
     }
 }
