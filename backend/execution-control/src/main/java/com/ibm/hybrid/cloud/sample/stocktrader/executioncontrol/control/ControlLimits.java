@@ -1,0 +1,100 @@
+/*
+       Copyright 2020-2021 IBM Corp All Rights Reserved
+       Copyright 2022-2025 Kyndryl, All Rights Reserved
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+ */
+
+package com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.control;
+
+//Arbitrary-precision arithmetic
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+
+//Collections
+import java.util.Collection;
+import java.util.Collections;
+import java.util.LinkedHashSet;
+import java.util.Locale;
+import java.util.Objects;
+import java.util.Set;
+
+
+/** Immutable holder of the effective pre-trade control limits and the settlement-exception SLA */
+public final class ControlLimits {
+    private static final int AMOUNT_SCALE = 2;
+
+    private final BigDecimal maxOrderNotional;
+    private final BigDecimal maxPositionNotional;
+    private final BigDecimal fatFingerNotionalThreshold;
+    private final Set<String> restrictedSymbols;
+    private final int exceptionSlaHours;
+
+
+    public ControlLimits(BigDecimal maxOrderNotional, BigDecimal maxPositionNotional,
+            BigDecimal fatFingerNotionalThreshold, Collection<String> restrictedSymbols,
+            int exceptionSlaHours) {
+        //Every consumer renders these amounts with two decimals - the pre-trade control reason
+        //strings and the GET /controls body - so normalizing once here means an operator override
+        //of MAX_ORDER_NOTIONAL=1000000 still reports 1000000.00 and no consumer re-derives a scale.
+        this.maxOrderNotional = Objects.requireNonNull(maxOrderNotional,
+                "maxOrderNotional is required").setScale(AMOUNT_SCALE, RoundingMode.HALF_UP);
+        this.maxPositionNotional = Objects.requireNonNull(maxPositionNotional,
+                "maxPositionNotional is required").setScale(AMOUNT_SCALE, RoundingMode.HALF_UP);
+        this.fatFingerNotionalThreshold = Objects.requireNonNull(fatFingerNotionalThreshold,
+                "fatFingerNotionalThreshold is required").setScale(AMOUNT_SCALE, RoundingMode.HALF_UP);
+        this.restrictedSymbols = canonicalize(restrictedSymbols);
+        this.exceptionSlaHours = exceptionSlaHours;
+    }
+
+    //Canonicalized here rather than only in the producer because unit tests construct this object
+    //directly, and the invariant "the stored set is trimmed and upper-cased" has to hold for every
+    //caller: the control evaluation matches an already-canonical order symbol against this set with
+    //no further normalization. LinkedHashSet preserves the configured order, which is what lets
+    //GET /controls report the restricted list deterministically.
+    private static Set<String> canonicalize(Collection<String> symbols) {
+        if (symbols == null) {
+            return Collections.emptySet();
+        }
+
+        Set<String> canonical = new LinkedHashSet<>();
+        for (String symbol : symbols) {
+            if (symbol == null || symbol.isBlank()) {
+                continue;
+            }
+            canonical.add(symbol.trim().toUpperCase(Locale.ROOT));
+        }
+
+        return Collections.unmodifiableSet(canonical);
+    }
+
+    public BigDecimal getMaxOrderNotional() {
+        return maxOrderNotional;
+    }
+
+    public BigDecimal getMaxPositionNotional() {
+        return maxPositionNotional;
+    }
+
+    public BigDecimal getFatFingerNotionalThreshold() {
+        return fatFingerNotionalThreshold;
+    }
+
+    public Set<String> getRestrictedSymbols() {
+        return restrictedSymbols;
+    }
+
+    public int getExceptionSlaHours() {
+        return exceptionSlaHours;
+    }
+}
