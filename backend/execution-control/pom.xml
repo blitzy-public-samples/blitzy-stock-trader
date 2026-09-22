@@ -1,0 +1,318 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!--
+       Copyright 2020-2021 IBM Corp All Rights Reserved
+       Copyright 2022-2025 Kyndryl, All Rights Reserved
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-->
+
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.stocktrader</groupId>
+    <artifactId>execution-control</artifactId>
+    <version>1.0-SNAPSHOT</version>
+    <packaging>war</packaging>
+
+    <name>StockTrader - execution-control</name>
+    <description>
+        Institutional Execution and Post-Trade Control Hub: a self-contained Open Liberty
+        microservice that simulates institutional equity order handling - configurable
+        pre-trade controls, simulated executions, settlement-exception (SSI mismatch)
+        workflow and an append-only audit timeline - over in-memory synthetic data.
+    </description>
+
+    <properties>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+        <maven.compiler.release>17</maven.compiler.release>
+
+        <app.name>execution-control</app.name>
+        <warContext>${app.name}</warContext>
+
+        <!-- Liberty configuration. The two port properties are written into the test
+             server's variable configuration, where src/main/liberty/config/server.xml
+             declares matching <variable> elements; overriding them on the command line
+             therefore moves the server listener and the Failsafe liberty.test.port
+             together. The liberty.env.* values select the AUTH_TYPE=none include, whose
+             basicRegistry supplies the stock:trader / read:only accounts the ITs use. -->
+        <liberty.var.default.http.port>9080</liberty.var.default.http.port>
+        <liberty.var.default.https.port>9443</liberty.var.default.https.port>
+        <liberty.env.AUTH_TYPE>none</liberty.env.AUTH_TYPE>
+        <liberty.env.JWT_AUDIENCE>stock-trader</liberty.env.JWT_AUDIENCE>
+        <liberty.env.JWT_ISSUER>http://stock-trader.ibm.com</liberty.env.JWT_ISSUER>
+
+        <sonar.organization>ibmstocktrader</sonar.organization>
+        <sonar.host.url>https://sonarcloud.io</sonar.host.url>
+    </properties>
+
+    <dependencies>
+        <!-- Jakarta REST 3.1, CDI 4.0, JSON-B 3.0, JSON-P 2.1, Servlet 6.0 and the
+             security/annotation APIs. Provided: Liberty supplies the implementations. -->
+        <dependency>
+            <groupId>jakarta.platform</groupId>
+            <artifactId>jakarta.jakartaee-web-api</artifactId>
+            <version>10.0.0</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <!-- 7.1 deliberately matches the microProfile-7.1 feature server.xml enables,
+                 so the compile-time API cannot drift from the runtime. -->
+            <groupId>org.eclipse.microprofile</groupId>
+            <artifactId>microprofile</artifactId>
+            <version>7.1</version>
+            <type>pom</type>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <!-- Supplies io.opentelemetry.instrumentation.annotations.WithSpan, matching
+                 the mpTelemetry-2.1 feature server.xml enables. -->
+            <groupId>org.eclipse.microprofile.telemetry</groupId>
+            <artifactId>microprofile-telemetry-api</artifactId>
+            <version>2.1</version>
+            <type>pom</type>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- Test scope: Jupiter for both *Test and *IT classes, a Jakarta REST client
+             implementation for the ITs, and a JSON-P API plus implementation for
+             asserting on IT response bodies. -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>5.10.0</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.cxf</groupId>
+            <artifactId>cxf-rt-rs-client</artifactId>
+            <version>4.1.1</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <!-- Runtime requirement of the CXF client. -->
+            <groupId>jakarta.xml.bind</groupId>
+            <artifactId>jakarta.xml.bind-api</artifactId>
+            <version>4.0.2</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>jakarta.json</groupId>
+            <artifactId>jakarta.json-api</artifactId>
+            <version>2.1.3</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.eclipse.parsson</groupId>
+            <artifactId>parsson</artifactId>
+            <version>1.1.7</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <!-- Load-bearing: target/ExecutionControl.war is the name server.xml loads via
+             <webApplication location="ExecutionControl.war"/>, the file the Dockerfile
+             copies into apps/, and the artefact liberty:deploy installs for the ITs. -->
+        <finalName>ExecutionControl</finalName>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-war-plugin</artifactId>
+                <version>3.4.0</version>
+                <configuration>
+                    <failOnMissingWebXml>false</failOnMissingWebXml>
+                    <packagingExcludes>pom.xml</packagingExcludes>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.14.0</version>
+                <configuration>
+                    <!-- release (not source/target) so the JDK 17 API surface is enforced
+                         even when the build runs on a newer JDK. -->
+                    <release>${maven.compiler.release}</release>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-resources-plugin</artifactId>
+                <version>3.3.1</version>
+            </plugin>
+            <!-- Declared before Surefire because Surefire consumes the agent argLine this
+                 plugin publishes. The agent is published under the named property
+                 jacocoArgLine rather than the default argLine so only Surefire opts in:
+                 the Failsafe fork stays uninstrumented and can never overwrite
+                 target/jacoco.exec with client-side coverage. Coverage is therefore
+                 measured in the unit-test JVM alone; the Liberty JVM is not instrumented. -->
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <version>0.8.13</version>
+                <executions>
+                    <execution>
+                        <id>prepare-agent</id>
+                        <phase>initialize</phase>
+                        <goals>
+                            <goal>prepare-agent</goal>
+                        </goals>
+                        <configuration>
+                            <propertyName>jacocoArgLine</propertyName>
+                        </configuration>
+                    </execution>
+                    <execution>
+                        <id>report</id>
+                        <phase>verify</phase>
+                        <goals>
+                            <goal>report</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>check</id>
+                        <phase>verify</phase>
+                        <goals>
+                            <goal>check</goal>
+                        </goals>
+                        <configuration>
+                            <rules>
+                                <!-- The gate covers the new business logic only: pre-trade
+                                     control evaluation and the order/exception lifecycles. -->
+                                <rule>
+                                    <element>PACKAGE</element>
+                                    <includes>
+                                        <include>com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.control</include>
+                                        <include>com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.lifecycle</include>
+                                    </includes>
+                                    <limits>
+                                        <limit>
+                                            <counter>LINE</counter>
+                                            <value>COVEREDRATIO</value>
+                                            <minimum>0.80</minimum>
+                                        </limit>
+                                    </limits>
+                                </rule>
+                            </rules>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <!-- Unit tests (*Test). Bound explicitly so the phase cannot be lost. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.5.4</version>
+                <configuration>
+                    <!-- @{...} defers evaluation to execution time, when the JaCoCo agent
+                         path published at initialize is available. -->
+                    <argLine>@{jacocoArgLine}</argLine>
+                    <useModulePath>false</useModulePath>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>default-test</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>test</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+            <!-- A real Liberty server is created and has its features installed before
+                 packaging finishes, started once the WAR exists, and stopped after the
+                 ITs - so the *IT classes always run against a running service. -->
+            <plugin>
+                <groupId>io.openliberty.tools</groupId>
+                <artifactId>liberty-maven-plugin</artifactId>
+                <version>3.11.5</version>
+                <executions>
+                    <execution>
+                        <id>install-feature</id>
+                        <phase>prepare-package</phase>
+                        <goals>
+                            <goal>create</goal>
+                            <goal>install-feature</goal>
+                        </goals>
+                        <configuration>
+                            <features>
+                                <feature>microProfile-7.1</feature>
+                                <feature>mpTelemetry-2.1</feature>
+                                <feature>appSecurity-5.0</feature>
+                            </features>
+                        </configuration>
+                    </execution>
+                    <execution>
+                        <id>start-server</id>
+                        <phase>pre-integration-test</phase>
+                        <goals>
+                            <goal>test-start</goal>
+                            <goal>deploy</goal>
+                        </goals>
+                        <configuration>
+                            <looseApplication>false</looseApplication>
+                        </configuration>
+                    </execution>
+                    <execution>
+                        <id>stop-server</id>
+                        <phase>post-integration-test</phase>
+                        <goals>
+                            <goal>test-stop</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <assemblyArtifact>
+                        <groupId>com.ibm.websphere.appserver.runtime</groupId>
+                        <artifactId>wlp-webProfile10</artifactId>
+                        <version>25.0.0.9</version>
+                        <type>zip</type>
+                    </assemblyArtifact>
+                    <configDirectory>${basedir}/src/main/liberty/config</configDirectory>
+                    <features>
+                        <acceptLicense>true</acceptLicense>
+                    </features>
+                    <!-- Deploy the packaged WAR itself: a loose application would expose
+                         target/classes instead of the artefact the image ships. -->
+                    <looseApplication>false</looseApplication>
+                    <stripVersion>true</stripVersion>
+                </configuration>
+            </plugin>
+            <!-- Integration tests (*IT). Both goals are bound, so verify fails the build
+                 on any IT failure. No argLine here - see the JaCoCo comment above. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-failsafe-plugin</artifactId>
+                <version>3.5.4</version>
+                <executions>
+                    <execution>
+                        <id>integration-test</id>
+                        <goals>
+                            <goal>integration-test</goal>
+                            <goal>verify</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <systemPropertyVariables>
+                        <liberty.test.port>${liberty.var.default.http.port}</liberty.test.port>
+                        <!-- Must equal the context root declared in server.xml and
+                             ibm-web-ext.xml: the ITs build their application root as
+                             http://localhost:{liberty.test.port}/{war.context}. -->
+                        <war.context>${warContext}</war.context>
+                    </systemPropertyVariables>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>
