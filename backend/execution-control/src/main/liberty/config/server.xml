@@ -1,0 +1,294 @@
+<!--
+       Copyright 2020-2021 IBM Corp All Rights Reserved
+       Copyright 2022-2025 Kyndryl All Rights Reserved
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-->
+
+<server description="Execution Control server">
+    <!-- Two things the sibling services carry are deliberately absent, not overlooked: a
+         metrics element, whose feature is not part of the microProfile-7.1 umbrella and
+         so would be dead configuration, and an application binding granting every
+         authenticated caller the StockTrader role, which would make StockViewer
+         unenforceable and defeat web.xml's restriction of POST/PUT/DELETE. Roles resolve
+         instead from the token's groups claim, or from the basicRegistry groups of
+         includes/none.xml. Neither may be added back for the sake of parity. -->
+    <featureManager>
+        <feature>microProfile-7.1</feature>
+        <feature>mpTelemetry-2.1</feature>
+        <feature>appSecurity-5.0</feature>
+    </featureManager>
+
+    <variable name="TRACE_SPEC" defaultValue="*=info"/>
+
+    <!-- Two messages are hidden, both raised by the runtime for something this service cannot
+         answer in code, and both driven by callers who need no credentials to repeat them:
+         SRVE0190E, which the file-serving extension logs as a WARNING with a stack trace for any
+         unknown sub-path under a runtime web app (/health, /openapi, /jwt), and SRVE0315E, which
+         the web container logs as an ERROR with a stack trace whenever an exception reaches it -
+         for this WAR only when the container itself refuses the request, a URI carrying an encoded
+         path separator being the reachable case, and otherwise from the runtime's own /jwt web app.
+         Neither hides an application diagnostic: Jakarta REST maps every failure this service
+         decides and answers it itself, so nothing of ours escapes to the container. Hiding
+         redirects rather than discards - both land in trace.log with their full stack, the FFDC
+         incident notice stays in messages.log, and TRAS3001I records the hiding at startup.
+         The file bounds matter for the same reason the messages do: redirected or not, an
+         anonymous caller drives them, so the logs are capped rather than left to grow, and maxFiles
+         bounds the FFDC exception summaries with them. FFDC incidents are de-duplicated by the
+         runtime per signature, which bounds the directory within a run but not across restarts;
+         maxFfdcAge ages the files out. -->
+    <logging traceSpecification="${TRACE_SPEC}" consoleLogLevel="INFO"
+         hideMessage="SRVE0190E,SRVE0315E"
+         maxFileSize="20" maxFiles="5" maxFfdcAge="1d" />
+
+    <!-- The ports are variables rather than literals so the listener can be moved on a
+         shared host: the build sets liberty.var.default.http.port, which Liberty maps
+         onto the variable of exactly that name and Failsafe reuses as liberty.test.port,
+         so one -Dliberty.var.default.http.port moves the server and every integration
+         test's expectation together. Renaming either variable breaks that coupling. -->
+    <variable name="default.http.port" defaultValue="9080"/>
+    <variable name="default.https.port" defaultValue="9443"/>
+
+    <!-- The ceiling below is the size of a whole incoming message - request line, headers
+         and body - not of the body alone, which is why it is not set at the 1 KB a
+         legitimate request needs. The largest body any endpoint accepts is a resolution
+         (a 64-character owner and a 1024-character note, 1,047 bytes), and the header
+         block a caller arrives with is the part that varies: a bearer token, an SSO
+         cookie and proxy headers together reach a few kilobytes. 8 KB leaves room for
+         both and still refuses a megabyte body at the channel. Raise it only for a
+         deployment whose identity provider issues unusually large tokens.
+
+         It bounds the bytes that arrive on the wire, which is the same thing as bounding
+         what the application allocates only while the body is not encoded: a content
+         coding expands it afterwards, and a few kilobytes of gzip inside the ceiling
+         reach megabytes of heap. Two settings below close that gap - AutoDecompression
+         false, so the channel never inflates an inbound body, and the application's own
+         RequestEncodingFilter, which answers 415 for a coded request entity before it is
+         read. The ratio-based alternative the channel offers, decompressionRatioLimit,
+         was measured not to hold on this service: a 1009:1 body was accepted in full
+         with that limit at its default of 200. -->
+    <variable name="MAX_REQUEST_SIZE_BYTES" defaultValue="8192"/>
+
+    <!-- One listener per scheme, because Liberty's response-header policy is scoped to an
+         endpoint and not to a scheme: HSTS means something only to a client that already
+         arrived over TLS, so the cleartext listener must not assert it while the TLS one
+         must. Each endpoint disables the port it does not serve with -1. $WSEP is removed
+         because the web container emits it on every response, naming the product to anyone
+         who asks; removeServerHeader and disableXPoweredBy do not cover it. The same goes
+         for io.openliberty.trace, which mpTelemetry puts on every response this application
+         produces: besides naming the runtime it hands any caller - including one whose
+         request was refused - the trace and span id of the request inside the server's own
+         traces. Removing it costs no diagnostic, because those ids are in trace.log and
+         reach the collector over OTLP, which is where a deployment correlates them; an
+         ingress that wants to return one to a client can add its own header.
+
+         Three document policies sit beside the two content policies because this origin does
+         answer with HTML a browser will render - the container's own 403 page and the
+         runtime's Swagger UI - even though every response this service decides is JSON,
+         including the ones it decides before a resource method runs. X-Frame-Options and
+         Referrer-Policy are set
+         unconditionally: nothing served here is meant to be framed, and no response on
+         either listener declares a referrer policy of its own. The Content-Security-Policy
+         is setIfMissing rather than set for one measured reason: a browser enforces the
+         intersection of two policies rather than the later one, and the Swagger UI ships a
+         policy its own inline bootstrap needs, so asserting a stricter one over it would
+         blank that page while protecting nothing this service serves. Every response this
+         service produces carries no policy of its own and so receives the restrictive one,
+         which names frame-ancestors, base-uri and form-action explicitly because default-src
+         does not cover them.
+
+         Compression is declared per endpoint because the element is scoped to one, and it
+         names text/* alongside application/json because listing a type replaces Liberty's
+         default list rather than extending it. It earns its place on this service's
+         collections specifically: every record repeats the same constant disclaimer, which
+         is the most compressible thing a payload can carry - a 500-event audit page of
+         about 235 KB is served in under 10 KB. A caller that offers no encoding still
+         receives the identical uncompressed body. -->
+    <httpEndpoint httpPort="${default.http.port}" httpsPort="-1" host="*" id="defaultHttpEndpoint">
+        <compression serverPreferredAlgorithm="gzip">
+            <types>application/json</types>
+            <types>text/*</types>
+        </compression>
+        <headers>
+            <set>X-Content-Type-Options: nosniff</set>
+            <set>Cache-Control: no-store</set>
+            <set>X-Frame-Options: DENY</set>
+            <set>Referrer-Policy: no-referrer</set>
+            <setIfMissing>Content-Security-Policy: default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'</setIfMissing>
+            <remove>$WSEP</remove>
+            <remove>io.openliberty.trace</remove>
+        </headers>
+    </httpEndpoint>
+
+    <httpEndpoint httpPort="-1" httpsPort="${default.https.port}" host="*" id="defaultHttpsEndpoint">
+        <compression serverPreferredAlgorithm="gzip">
+            <types>application/json</types>
+            <types>text/*</types>
+        </compression>
+        <headers>
+            <set>X-Content-Type-Options: nosniff</set>
+            <set>Cache-Control: no-store</set>
+            <set>Strict-Transport-Security: max-age=31536000</set>
+            <set>X-Frame-Options: DENY</set>
+            <set>Referrer-Policy: no-referrer</set>
+            <setIfMissing>Content-Security-Policy: default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'</setIfMissing>
+            <remove>$WSEP</remove>
+            <remove>io.openliberty.trace</remove>
+        </headers>
+    </httpEndpoint>
+
+    <!-- The id is the one both endpoints reach through the default httpOptionsRef, so a
+         single element suppresses the server signature and applies the request-size
+         ceiling on either listener.
+
+         The ceiling is reached by two different routes, and they answer differently. A
+         message declaring a Content-Length over the limit is refused at header-parse
+         time, so it is answered 413 by the channel with no ErrorResponse body: nothing in
+         the application ran, which is the point of bounding it here rather than in a
+         resource method. A chunked message has no declared length, so the limit can only
+         be enforced as the body is read - by which time the application has asked for the
+         entity - and the channel's refusal surfaces as an IOException inside it. That one
+         is answered 413 with the standard envelope by IOExceptionMapper. Both statuses
+         are the same; only one carries a body, and that is why.
+
+         AutoDecompression is off because the ceiling above counts wire bytes: with the
+         channel's default inbound decompression, 7 KB of gzip inside the limit expanded
+         to 7 MB of heap before any field was read, so a header defeated the bound. With
+         it off no inbound body is ever inflated, and the application refuses a coded
+         request entity outright (RequestEncodingFilter, 415), so nothing here depends on
+         a compression ratio holding. Responses are unaffected: outbound compression is
+         the compression element on each endpoint above. -->
+    <httpOptions id="defaultHttpOptions" removeServerHeader="true"
+         MessageSizeLimit="${MAX_REQUEST_SIZE_BYTES}" AutoDecompression="false"/>
+
+    <!-- disableXPoweredBy drops the header naming the product and its servlet level.
+         displayCustomizedExceptionText settles what an exception the container decides for
+         itself may say: at its default the container renders SRVE0232E carrying the runtime
+         class, line and exception message that threw (CWE-209), and those pages are the ones
+         no <error-page> of this WAR can reach, because the application was never entered. The
+         sentence below is the one rest/ContainerErrorServlet returns for an
+         application-decided 500, so both entrances to the error surface say the same thing to
+         a caller. The 401 and 403 the security collaborator renders are unaffected. The one
+         such page a caller could provoke - an encoded-separator URI canonicalizing above the
+         context root, twice - is closed at its cause by -DinvocationCacheSize=0 in
+         jvm.options; this attribute bounds what any other one could ever disclose. -->
+    <webContainer disableXPoweredBy="true"
+         displayCustomizedExceptionText="The request could not be completed; the failure is recorded in the service log"/>
+
+    <!-- The estate's inherited demonstration password, carried in securityUtility's {xor} form
+         so the literal itself is not in source, in an image layer, or in any log that echoes
+         this file. That is narrower than it looks: Liberty decodes {xor} with no key and no
+         configuration, which is what lets the copied stores - byte-identical to the broker's,
+         and left that way - open with nothing supplied, and equally why anyone holding this
+         file recovers the value. {aes} is not used because its encryption key would have to ship
+         beside the value, turning one piece of demonstration material into two and adding a
+         way to fail to start; the README offers it to operators who have somewhere to keep a
+         key. Replace these stores and this value together in any deployment that matters. -->
+    <keyStore id="defaultKeyStore" password="{xor}DCtvPDQLLR87Oi0=" type="pkcs12"
+         location="${server.config.dir}/resources/security/key.p12" />
+
+    <keyStore id="defaultTrustStore" password="{xor}DCtvPDQLLR87Oi0=" type="pkcs12"
+         location="${server.config.dir}/resources/security/trust.p12" />
+
+    <ssl id="defaultSSLConfig" keyStoreRef="defaultKeyStore" trustStoreRef="defaultTrustStore" trustDefaultCerts="true" />
+
+    <variable name="AUTH_TYPE" defaultValue="basic"/>
+    <variable name="JWT_AUDIENCE" defaultValue="stock-trader"/>
+    <variable name="JWT_ISSUER" defaultValue="http://stock-trader.ibm.com"/>
+
+    <!-- Load-bearing, not decoration: this attribute has no default in Liberty, and with
+         nothing supplying one the server invents a different password on every boot. The
+         key file it wrote on the first boot then cannot be decrypted on the second - a
+         BadPaddingException, CWWKS4106E, and every authenticated request answering 401
+         while all three health probes still report UP, because the failure is in the token
+         service rather than in the application. A stable value makes the file readable
+         across restarts, and is also what lets replicas of this service share a session.
+         The default is the same demonstration material the keystores above carry, in the same
+         {xor} form; a plaintext or {aes} value is accepted here too, because the attribute
+         this variable feeds decodes after substitution. Override it in any real deployment,
+         keep it identical across replicas, and note that changing it invalidates an existing
+         key file, which must be deleted before the server will start clean on it. -->
+    <variable name="LTPA_KEYS_PASSWORD" defaultValue="{xor}DCtvPDQLLR87Oi0="/>
+
+    <include optional="false" location="${server.config.dir}/includes/${AUTH_TYPE}.xml"/>
+
+    <ltpa keysPassword="${LTPA_KEYS_PASSWORD}" expiration="1h"/>
+
+    <!-- Both attributes below narrow the security collaborator the copied includes leave at
+         Liberty's defaults, and both are here rather than in an include so they hold for
+         every AUTH_TYPE and leave those files as the estate's own.
+
+         useAuthenticationDataForUnprotectedResource="false" - for an *unprotected* resource
+         Liberty otherwise authenticates opportunistically whenever a request merely carries
+         authentication data. The runtime web apps beside this one - /health/*, /openapi -
+         are exactly that, and under the default AUTH_TYPE=basic the include configures no
+         user registry (MP-JWT verification needs none), so the basic-auth authenticator
+         dereferenced a null UserRegistry and every probe carrying any Authorization header -
+         a valid bearer token, a garbage one or a Basic credential - answered 500 with an
+         internal NullPointerException. That turned the platform probe contract of AAP 0.4.5
+         and 0.7.1 into a failing probe for any ingress or mesh that forwards the caller's
+         credential to all paths, and let an anonymous caller force product internals into a
+         response body. With the attribute false the probes answer their own status whatever
+         header arrives, and nothing changes for a protected resource: the constraint in
+         web.xml still demands authentication, so the perimeter is untouched.
+
+         singleSignonEnabled="false" - the LTPA SSO cookie the includes name StockTraderSSO
+         was evaluated ahead of the Authorization header, so a caller presenting one identity
+         while holding another's cookie was audited as the cookie's identity, and the cookie
+         was a complete credential on its own once it had been observed on the cleartext
+         listener. AAP 0.4.2 and 0.7.2 require the audit actor to be the authenticated
+         principal of the request, which only holds if the credential presented on that
+         request is the one evaluated; with SSO off there is no cookie to issue, replay or
+         precede the header. ssoRequiresSSL and sameSiteCookie are defence in depth for a
+         deployment that re-enables SSO: they keep the cookie off the cleartext listener and
+         out of cross-site requests rather than relying on this element staying as it is. -->
+    <webAppSecurity useAuthenticationDataForUnprotectedResource="false"
+         singleSignonEnabled="false" ssoRequiresSSL="true" sameSiteCookie="Strict"/>
+
+    <!-- What the server answers for a path no web app claims, which is decided by the HTTP
+         dispatcher before any application, error page or servlet filter is reached. Left at
+         the defaults, an unauthenticated caller asking for / received Liberty's welcome page
+         naming the product and its exact release, and a caller asking for a near-miss of a
+         probe path - /HEALTH/ready, path matching being case-sensitive - received the
+         product's "Context Root Not Found" page. Neither is this service's, both name the
+         runtime to anyone who can route to the pod, and no application-level setting reaches
+         them. Turning the welcome page off and supplying the missing-context-root text makes
+         both a plain 404 carrying that text and nothing else. The text is deliberately the
+         reason phrase, so it identifies neither the product nor which of the two conditions
+         occurred. -->
+    <httpDispatcher enableWelcomePage="false" appOrContextRootMissingMessage="Not Found"/>
+
+    <!-- This service issues no tokens, and this element is what keeps it that way. The
+         /jwt web app and its token endpoint are published unconditionally, because
+         mpJwt-2.1 - which arrives with the mandated microProfile-7.1 umbrella - requires
+         the jwt-1.0 subsystem feature, and those bundles ship no metatype, so there is no
+         switch that unpublishes the endpoint. Nor is deleting the builder a defence:
+         Liberty auto-provides a defaultJWT builder whenever jwt-1.0 is active, and the
+         auto-provided one signs with the same estate jwtSigner key the copied includes
+         named - same kid, only a pod-local issuer and no audience. Claiming the id here
+         and pinning it to an alias no keystore holds is therefore the fix: every caller
+         that reaches the endpoint receives an empty body instead of an estate-signed
+         RS256 token, and /jwt/ibm/api/defaultJWT/jwk publishes no key. The first attempt
+         files a de-duplicated FFDC naming CWWKS6016E and the alias, which is the intended
+         record that something asked this service to mint. It lives in server.xml rather
+         than in an include so it holds for all four AUTH_TYPE modes, oidc included, and
+         it does not touch MP-JWT *consumption*: that is the separate mpJwt element of
+         includes/{basic,ldap,oidc}.xml, which still verifies estate-issued tokens against
+         jwtSigner in trust.p12. -->
+    <jwtBuilder id="defaultJWT" keyStoreRef="defaultKeyStore"
+         keyAlias="execution-control-mints-no-tokens"/>
+
+    <webApplication id="ExecutionControl" name="ExecutionControl" location="ExecutionControl.war" contextRoot="/execution-control">
+        <classloader apiTypeVisibility="+third-party"/>
+    </webApplication>
+</server>
