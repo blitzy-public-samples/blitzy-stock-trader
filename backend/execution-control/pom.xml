@@ -119,20 +119,64 @@
              <webApplication location="ExecutionControl.war"/>, the file the Dockerfile
              copies into apps/, and the artefact liberty:deploy installs for the ITs. -->
         <finalName>ExecutionControl</finalName>
+        <!-- Plugin versions are a security floor as much as a feature choice. maven-war-plugin
+             3.5.1, maven-compiler-plugin 3.16.0, maven-resources-plugin 3.5.0 and
+             liberty-maven-plugin 3.12.3 are the releases whose own dependencies drop the
+             advisory-bearing commons-io, plexus-archiver, commons-compress, commons-lang3 and
+             jackson-core artefacts the earlier pins put on the build classpath. None of those
+             artefacts ships in the WAR or the image, so the exposure is the build host - which is
+             where the estate's release engineering happens. Where no release of a plugin ships a
+             fixed transitive, the artefact is pinned on the plugin itself below. -->
         <plugins>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-war-plugin</artifactId>
-                <version>3.4.0</version>
+                <version>3.5.1</version>
                 <configuration>
                     <failOnMissingWebXml>false</failOnMissingWebXml>
                     <packagingExcludes>pom.xml</packagingExcludes>
+                    <archive>
+                        <!-- Without this the plugin writes META-INF/maven/<groupId>/<artifactId>/
+                             pom.xml and pom.properties into the WAR, handing anyone who obtains
+                             the deployed artefact a version-precise inventory of every dependency
+                             it was built against. packagingExcludes cannot remove them: they are
+                             added by the archiver, not copied from the webapp source - which is
+                             also why the flag belongs to <archive> and is ignored (with a warning)
+                             directly under <configuration>. Liberty never reads META-INF/maven,
+                             so nothing at runtime depends on them. -->
+                        <addMavenDescriptor>false</addMavenDescriptor>
+                    </archive>
                 </configuration>
+                <dependencies>
+                    <!-- 3.5.1 resolves plexus-utils 4.0.2, one patch below the 4.0.3 that fixes
+                         CVE-2025-67030 (Expand.extractFile writes outside the extraction
+                         directory), so the fixed artefact is pinned rather than waited for. 4.0.3
+                         is also what liberty-maven-plugin and maven-compiler-plugin resolve, so
+                         one version of plexus-utils covers the whole build. -->
+                    <dependency>
+                        <groupId>org.codehaus.plexus</groupId>
+                        <artifactId>plexus-utils</artifactId>
+                        <version>4.0.3</version>
+                    </dependency>
+                    <!-- 3.5.1 resolves plexus-archiver 4.10.4, whose own compressor dependency is
+                         io.airlift:aircompressor 0.27 - CVE-2025-67721, where a reused output
+                         buffer leaks bytes of an earlier stream. 4.14.0 drops that dependency
+                         altogether rather than upgrading it, so the coordinate leaves the build
+                         classpath instead of moving to a patched version. Pinning the archiver is
+                         also what keeps commons-compress and commons-io current underneath it.
+                         The WAR is written by this archiver, so a packaged artefact is proof the
+                         pin holds. -->
+                    <dependency>
+                        <groupId>org.codehaus.plexus</groupId>
+                        <artifactId>plexus-archiver</artifactId>
+                        <version>4.14.0</version>
+                    </dependency>
+                </dependencies>
             </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
-                <version>3.14.0</version>
+                <version>3.16.0</version>
                 <configuration>
                     <!-- release (not source/target) so the JDK 17 API surface is enforced
                          even when the build runs on a newer JDK. -->
@@ -142,7 +186,17 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-resources-plugin</artifactId>
-                <version>3.3.1</version>
+                <version>3.5.0</version>
+                <dependencies>
+                    <!-- Its newest release still resolves plexus-utils 3.6.0, below both fixes
+                         for CVE-2025-67030 (3.6.1 and 4.0.3), so the artefact is pinned here for
+                         the same reason it is pinned on the war plugin. -->
+                    <dependency>
+                        <groupId>org.codehaus.plexus</groupId>
+                        <artifactId>plexus-utils</artifactId>
+                        <version>4.0.3</version>
+                    </dependency>
+                </dependencies>
             </plugin>
             <!-- Declared before Surefire because Surefire consumes the agent argLine this
                  plugin publishes. The agent is published under the named property
@@ -154,6 +208,25 @@
                 <groupId>org.jacoco</groupId>
                 <artifactId>jacoco-maven-plugin</artifactId>
                 <version>0.8.13</version>
+                <dependencies>
+                    <!-- The version stays: no JaCoCo release, 0.8.13 or later, ships a fixed
+                         plexus-utils or commons-io, so a bump would move the plugin without
+                         closing anything. Pinned instead are plexus-utils 4.0.3 (CVE-2025-67030,
+                         Expand.extractFile path traversal - 0.8.13 resolves 3.0.24) and
+                         commons-io 2.22.0 (CVE-2024-47554, unbounded XmlStreamReader consumption
+                         - 0.8.13 resolves 2.11.0). Coverage instrumentation, the report and the
+                         check rule all exercise these, so the gate proves the pins. -->
+                    <dependency>
+                        <groupId>org.codehaus.plexus</groupId>
+                        <artifactId>plexus-utils</artifactId>
+                        <version>4.0.3</version>
+                    </dependency>
+                    <dependency>
+                        <groupId>commons-io</groupId>
+                        <artifactId>commons-io</artifactId>
+                        <version>2.22.0</version>
+                    </dependency>
+                </dependencies>
                 <executions>
                     <execution>
                         <id>prepare-agent</id>
@@ -226,7 +299,7 @@
             <plugin>
                 <groupId>io.openliberty.tools</groupId>
                 <artifactId>liberty-maven-plugin</artifactId>
-                <version>3.11.5</version>
+                <version>3.12.3</version>
                 <executions>
                     <execution>
                         <id>install-feature</id>
@@ -319,4 +392,57 @@
             </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <!-- Opt-in software-composition analysis over this module's own coordinates. Deliberately
+             outside the default build: the goal needs an NVD API key and a populated local
+             vulnerability database, so wiring it into `verify` would fail every build that has
+             neither for a reason unrelated to this module's code. Run it on purpose:
+
+                 NVD_API_KEY=<key> mvn -B -Pdependency-check dependency-check:check
+
+             It reports rather than gates (failBuildOnCVSS keeps the plugin default of 11, which
+             no score can exceed); pass -DfailBuildOnCVSS=7 to make it fail on a High finding.
+             The full procedure, and the substitute when no key is available, are in the README
+             under "Dependency and image scanning". -->
+        <profile>
+            <id>dependency-check</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.owasp</groupId>
+                        <artifactId>dependency-check-maven</artifactId>
+                        <version>13.0.0</version>
+                        <configuration>
+                            <!-- The key arrives from the environment, never as a POM value or a
+                                 -DnvdApiKey argument: Maven echoes plugin configuration in debug
+                                 output, which is the exposure GHSA-qqhq-8r2c-c3f5 describes. -->
+                            <nvdApiKeyEnvironmentVariable>NVD_API_KEY</nvdApiKeyEnvironmentVariable>
+                            <!-- The plugin skips test scope by default, which would leave out the
+                                 REST client and JSON parser this module's tests bring in - two of
+                                 the three coordinates its supply-chain review has moved so far. -->
+                            <skipTestScope>false</skipTestScope>
+                            <formats>HTML,JSON</formats>
+                            <!-- Analyzers for ecosystems this module has no files in. Off so a
+                                 scan neither reports on them nor depends on their toolchains or
+                                 on advisory feeds fetched from outside Maven Central. -->
+                            <nodeAnalyzerEnabled>false</nodeAnalyzerEnabled>
+                            <nodeAuditAnalyzerEnabled>false</nodeAuditAnalyzerEnabled>
+                            <retireJsAnalyzerEnabled>false</retireJsAnalyzerEnabled>
+                            <assemblyAnalyzerEnabled>false</assemblyAnalyzerEnabled>
+                        </configuration>
+                        <executions>
+                            <execution>
+                                <id>sca</id>
+                                <phase>verify</phase>
+                                <goals>
+                                    <goal>check</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>

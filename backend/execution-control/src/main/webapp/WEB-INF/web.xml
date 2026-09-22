@@ -64,7 +64,16 @@
 	<!-- The statuses the container and the Jakarta REST runtime decide on their own. 401 and 403 are
 	     deliberately absent: those are answered by the security collaborator together with the
 	     authentication challenge, and rewriting that response would change the authentication surface
-	     rather than the error surface. -->
+	     rather than the error surface.
+	     Two limits on the reach of these pages are worth knowing before changing anything here. The
+	     400 below is what a URI carrying an encoded path separator lands on, and it lands there on
+	     every request only because -DinvocationCacheSize=0 in src/main/liberty/config/jvm.options
+	     stops the web container from caching a servlet wrapper for a URI it has just refused;
+	     without it every second such request is answered by the container's own error page instead.
+	     And a URI the container cannot decode at all - an encoded null byte, a CR or LF, a malformed
+	     escape - is refused before a web application is selected, so no page here is consulted for
+	     it; that refusal is the one documented exception to this service's error envelope, described
+	     under "API endpoints" in the README. -->
 	<error-page>
 		<error-code>400</error-code>
 		<location>/container-error</location>

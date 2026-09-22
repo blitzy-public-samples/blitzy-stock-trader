@@ -163,7 +163,7 @@ bodies are JSON.
 
 | # | Endpoint | Method | Roles | Success | Returns |
 | --- | --- | --- | --- | --- | --- |
-| 1 | `/orders` | POST | `StockTrader` | 201 | the submitted order in its terminal state, with all four control results, and a `Location` header addressing it |
+| 1 | `/orders` | POST | `StockTrader` | 201 | the submitted order in its terminal state, with all four control results, and a `Location` header carrying the path that addresses it |
 | 2 | `/orders` | GET | `StockViewer`, `StockTrader` | 200 | one page of orders, seeded and live |
 | 3 | `/orders/{orderId}` | GET | `StockViewer`, `StockTrader` | 200 | one order |
 | 4 | `/orders/{orderId}/events` | GET | `StockViewer`, `StockTrader` | 200 | that order's `ORDER` and `POST_TRADE` audit events, in `sequence` order |
@@ -227,7 +227,11 @@ optional once the exception is assigned; `PUT …/settlement-ready` takes no bod
 order resource exists and is retrievable either way. Read `status`, `rejectionReason` and
 `controlResults` on the returned entity to see which happened. The `201` carries
 `Location: /execution-control/orders/{orderId}`, so a client learns where the record lives from the
-response itself rather than by reassembling the path around an id parsed out of the body.
+response itself rather than by reassembling the path around an id parsed out of the body. That
+header is a path and carries no scheme and no host by design: the scheme and authority of a request
+URI are supplied by the caller's own `Host` and `X-Forwarded-Proto` headers, so building the value
+from them would echo any address a caller chose back as this service's own. A client resolves it
+against the URL it sent the request to, which is the only address it has any reason to trust.
 
 Status codes on failure:
 
@@ -237,7 +241,7 @@ Status codes on failure:
 | Authenticated `StockViewer` on a mutating verb (POST/PUT) | `403` |
 | Validation failure — missing field, non-positive `quantity`/`limitPrice`, unknown `clientId`, blank `owner` or `resolutionNote` | `400` |
 | A `status` filter value on `GET /exceptions` that is not one of the four workflow states | `400` |
-| Request body that cannot be read as JSON — truncated or non-JSON text, an empty body, a field of the wrong JSON type, or an array where an object belongs | `400` |
+| Request body that is not one complete JSON object of single-valued fields — truncated or non-JSON text, an empty body, an array where an object belongs, content appended after the end of the document, an entity shorter than its declared `Content-Length`, or a declared field carrying a JSON array or object where one value belongs | `400` |
 | Unknown order or exception id | `404` |
 | Duplicate `clientOrderId`, or an unsupported lifecycle transition | `409` |
 | An in-memory ceiling is exhausted, so a request that would otherwise have been accepted cannot be recorded. The `message` names the `*_CAPACITY` variable to raise; raise it and restart, or restart to clear | `503` |
@@ -278,14 +282,35 @@ encoded path separator (`%2F`, `%5C`), which the web container refuses before an
 runs, is answered `400`
 `{"error":"Bad Request","message":"The request URI contains an encoded path separator, which this service does not accept","path":"/exceptions/EXC%2F000001","status":400}` —
 and headers the runtime computed are carried across, so a `405` still names the methods it will
-accept in `Allow`.
+accept in `Allow`. That answer holds however the encoded separator is arranged, including one that
+would climb out of the context root if it were decoded, such as `/orders/..%2f..%2fcontrols`, and
+holds on every request rather than on the first: `-DinvocationCacheSize=0` in
+`src/main/liberty/config/jvm.options` turns off the web container's invocation cache, which would
+otherwise keep a servlet wrapper for a URI the container had just refused and, on the next identical
+request, derive the path info by cutting an eighteen-character context root off a URI that
+canonicalizes to nine — answering with its own `500` page rather than this one. That file's comment
+carries the detail; the property is load-bearing and costs nothing measurable on a WAR with one
+servlet and no filters. `webContainer displayCustomizedExceptionText` in `server.xml` bounds the
+same class of page independently, so any exception the container still decides for itself renders
+one fixed sentence instead of the class, line and message that threw.
 
-One refusal sits below even that, and no error page of this WAR can reach it. A URI the HTTP
-dispatcher rejects before it has selected a web app — an encoded null byte, or a malformed escape
-such as `%zz` — is answered `400` with a one-line HTML notice repeating the URI the caller sent. No
-application is involved by then, so nothing of this service's is disclosed and nothing is written to
-the log: the notice carries a message id and the caller's own URI, and no class, stack or product
-version.
+One refusal sits below even that, and nothing inside this WAR can reach it — no error page, no
+filter, and no Liberty setting, because the web container writes the response itself before it has
+selected a web application to route it to. A URI it cannot decode is refused there: an encoded null
+byte (`%00`), an encoded CR or LF, a malformed escape such as `%zz`, or a `..%2F` sequence that
+climbs above the server root (`/orders/..%2F..%2F..%2F..%2Fetc%2Fpasswd`). The answer is `400` and
+the body is the runtime's, in one of two shapes — for a JSON client, the single key
+`{"error_message" : "CWWWC0005I: The request URI has invalid or improperly encoded characters: [/execution-control/orders/&#37;00]"}`
+as `application/json`; for `Accept: text/html`, the same text as `<H1>…</H1><BR>`. It is the one
+answer this service publishes that is not the envelope above, and the only place a Liberty message
+id is observable: the caller's own URI is echoed back with every character HTML-entity-escaped
+(`&#37;` for the `%` above, `&lt;` for a `<`), no class, stack, product version or service data
+appears, nothing is written to the log, and the endpoint's `X-Content-Type-Options: nosniff` and
+`Cache-Control: no-store` still apply. Because the refusal precedes the security constraints, an
+unauthenticated caller can reach it. A deployment that must not expose the message id should refuse
+malformed URIs at the gateway in front of the service — an ingress or mesh rule rejecting a request
+line containing `%00`, `%0D`, `%0A` or a malformed escape — since only a hop ahead of Liberty can
+answer in its place.
 
 `401` and `403` are the two failures deliberately left as the container renders them. They are
 answered by the security collaborator alongside the authentication challenge, before any of this
@@ -381,25 +406,47 @@ silently stopped working.
 | `JWT_AUDIENCE` | string | `stock-trader` (`server.xml`) | Expected JWT audience, unchanged from the estate |
 | `JWT_ISSUER` | string | `http://stock-trader.ibm.com` (`server.xml`) | Expected JWT issuer, unchanged from the estate |
 | `OIDC_JWKS_URL` | URL | none — required only when `AUTH_TYPE=oidc` | JWKS endpoint of the OIDC provider, referenced by `includes/oidc.xml`. Not sensitive; supply it as a plain `env` entry |
-| `LTPA_KEYS_PASSWORD` | password | `St0ckTr@der` (`server.xml`) | Password the server encrypts and reads its LTPA key file with. It exists as a variable because the attribute has no default in Liberty, and a server that invents one per boot cannot read the key file it wrote on the previous boot — see [Authentication across a restart](#authentication-across-a-restart). Demonstration material, like the keystore password it matches: set it in any real deployment, keep it identical across replicas, and delete the existing key file when you change it. A `securityUtility encode` value (`{xor}…`, `{aes}…`) is accepted here too |
+| `LTPA_KEYS_PASSWORD` | password | the inherited demonstration value, held `{xor}`-encoded in `server.xml` and not printed here — see [Inherited demonstration security material](#inherited-demonstration-security-material) | Password the server encrypts and reads its LTPA key file with. It exists as a variable because the attribute has no default in Liberty, and a server that invents one per boot cannot read the key file it wrote on the previous boot — see [Authentication across a restart](#authentication-across-a-restart). Demonstration material, and the same value the two keystores carry: set your own in any real deployment, keep it identical across replicas, and delete the existing key file when you change it. Plaintext, `{xor}` and `{aes}` are all accepted — the attribute decodes after the variable is substituted — so a `securityUtility encode` value works here as it does on the keystores |
 | `TRACE_SPEC` | string | `*=info` (`server.xml`) | Liberty trace specification |
 | `MAX_REQUEST_SIZE_BYTES` | integer | `8192` (`server.xml`) | Ceiling on one incoming message — request line, headers and body together. Raise it only for a deployment whose identity provider issues unusually large bearer tokens |
 | `DEFAULT_HTTP_PORT` (`default.http.port`) | integer | `9080` (`server.xml`) | HTTP listener port. Also overridable in the build with `-Dliberty.var.default.http.port` |
 | `DEFAULT_HTTPS_PORT` (`default.https.port`) | integer | `9443` (`server.xml`) | HTTPS listener port. Also overridable with `-Dliberty.var.default.https.port` |
 
-Two transport behaviours come with those last two rows, and neither is visible in the API
-contract because both are settled by the HTTP channel rather than by the application.
+Three transport behaviours come with those rows, and none of them is visible in the API contract
+because each is settled by the HTTP channel or by a request filter ahead of every resource method.
 
-**An oversize message is refused before the application sees it.** A request beyond
-`MAX_REQUEST_SIZE_BYTES` is answered `413 Request Entity Too Large` with an empty body and a closed
-connection, in about two milliseconds, and nothing is created: no order, no identifier reservation,
-no audit event. It is the one refusal this service makes that carries no `ErrorResponse` body,
-because no application code ran to produce one — which is the point of bounding the message here,
-where the alternative is the server allocating a megabyte of JSON to find one order in it. The
-ceiling covers the whole message, so the body allowance is what is left after the caller's headers:
-with an ordinary header block of a few hundred bytes the default leaves close to 8 KB for the body,
-against the 1,047 bytes the largest legitimate body needs (a 64-character owner and a
+**An oversize message is refused, and how it is answered depends on how it was framed.** A request
+beyond `MAX_REQUEST_SIZE_BYTES` is refused either way, nothing is created — no order, no identifier
+reservation, no audit event — and the status is `413 Request Entity Too Large` either way, but the
+body differs because the two framings are discovered at different moments:
+
+- A message declaring a `Content-Length` over the limit is refused as its headers are parsed, in
+  about two milliseconds, with an **empty body** and a closed connection. It is the one refusal this
+  service makes that carries no `ErrorResponse`, because no application code ran to produce one —
+  which is the point of bounding the message here, where the alternative is the server allocating a
+  megabyte of JSON to find one order in it.
+- A `Transfer-Encoding: chunked` message declares no length, so the limit can only be applied as the
+  body is read, after the application has asked for the entity. That refusal is answered `413` with
+  the ordinary `{status, error, message, path}` envelope and the message `request message exceeds the
+  configured size limit, so the body was not read`. Chunked bodies inside the limit are accepted
+  normally.
+
+The ceiling covers the whole message, so the body allowance is what is left after the caller's
+headers: with an ordinary header block of a few hundred bytes the default leaves close to 8 KB for
+the body, against the 1,047 bytes the largest legitimate body needs (a 64-character owner and a
 1024-character resolution note).
+
+**A compressed request body is refused, `415`.** No endpoint accepts a `Content-Encoding` other than
+`identity`: a coded body is answered `415 Unsupported Media Type` with the standard envelope, the
+message `request bodies must not be compressed; send the body uncompressed and omit
+Content-Encoding`, and an `Accept-Encoding: identity` header naming what to send instead. The reason
+is arithmetic rather than taste. The size ceiling counts the bytes that arrive, so a content coding
+would let a caller spend 7 KB of wire on 7 MB of heap — a thousand-fold amplification of the one
+bound this service places on an incoming request — while no legitimate caller needs it, the largest
+body any endpoint takes being about a kilobyte of JSON. The channel's own inbound decompression is
+therefore switched off as well (`AutoDecompression="false"`), so nothing inflates a request body
+even before the filter refuses it. Request and response compression are independent: the next
+paragraph still applies in full.
 
 **Responses are compressed when the caller offers an encoding.** Every endpoint serves
 `application/json`, and each record repeats the same constant disclaimer, so a collection page is
@@ -410,12 +457,63 @@ Responses carry `Vary: Accept-Encoding`, and a caller that offers no encoding re
 uncompressed body, so nothing about the payload's content changes — only how many bytes of it cross
 the wire.
 
+Four identity and perimeter decisions sit beside those variables and are deliberately *not*
+variables: they are fixed elements of `server.xml`, so no deployment can weaken them by setting an
+environment value, and they hold for all four `AUTH_TYPE` modes.
+
+- **This service mints no tokens, and cannot.** Liberty's own JWT builder endpoint is published
+  whatever this module does — `mpJwt-2.1` requires the `jwt-1.0` feature, both arrive inside the
+  mandated `microProfile-7.1` umbrella, and their bundles expose no setting that withdraws the
+  endpoint. Removing a builder element does not help either: the runtime auto-provides a
+  `defaultJWT` builder as soon as `jwt-1.0` is active, signing with the same estate key. So
+  `server.xml` claims that id and pins it to `keyAlias="execution-control-mints-no-tokens"`, an
+  alias neither keystore holds. `GET /jwt/ibm/api/defaultJWT/token` and
+  `…/defaultJWT/jwk` consequently answer `200` with an **empty body** to every identity, and the
+  first attempt files an FFDC incident naming `CWWKS6016E` and that alias — the intended record
+  that something asked this service to sign. Token **verification** is a different element and is
+  untouched: `includes/{basic,ldap,oidc}.xml`'s `mpJwt` still accepts estate-issued tokens against
+  `jwtSigner` in `trust.p12`.
+- **No single sign-on cookie is issued.** `singleSignonEnabled="false"` means an authenticated
+  response carries no `StockTraderSSO` cookie, nothing is replayed, and each request is
+  authenticated from the credential it presents — which is what makes the audit `actor` the
+  identity of that request rather than of a cookie acquired earlier. `ssoRequiresSSL="true"` and
+  `sameSiteCookie="Strict"` sit beside it as defence in depth for a deployment that re-enables SSO.
+- **A credential does not degrade the runtime endpoints.**
+  `useAuthenticationDataForUnprotectedResource="false"` stops the security collaborator
+  authenticating an unprotected resource merely because the request carries authentication data.
+  `/health/*` and `/openapi` therefore answer their own status whatever `Authorization` header
+  arrives; see
+  [The runtime endpoints beside the application](#the-runtime-endpoints-beside-the-application) for
+  the failure this prevents. Protected resources are unaffected — `web.xml`'s constraints still
+  demand authentication, so the perimeter is exactly as strict as before.
+- **A path no web app claims names nothing.** `enableWelcomePage="false"` and
+  `appOrContextRootMissingMessage="Not Found"` replace Liberty's welcome page and its
+  "Context Root Not Found" page — both of which named the product and its exact release — with a
+  `404` whose only text is `Not Found`.
+
 ### Telemetry
 
 | NAME | Type | Default (where it is held) | Meaning |
 | --- | --- | --- | --- |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | URL | `http://jaeger-collector.istio-system.svc.cluster.local:4317` (held as `otel.exporter.otlp.endpoint` in `microprofile-config.properties`) | OTLP target for `mpTelemetry-2.1`. Exporter failures are logged and never fatal, so an absent collector degrades to log noise only |
 | `OTEL_SDK_DISABLED` | boolean | `false` (held as `otel.sdk.disabled` in `microprofile-config.properties`) | Mirrors the broker. Set it to `true` for local runs to silence exporter retries |
+| `OTEL_PROPAGATORS` | comma-separated list | `tracecontext` (held as `otel.propagators` in `microprofile-config.properties`) | Which context propagators the SDK installs. Narrower than OpenTelemetry's own `tracecontext,baggage` default, for the reason below |
+
+**Why baggage propagation ships off.** The W3C baggage propagator in OpenTelemetry below 1.62.0
+allocates without bound while parsing an inbound `baggage` header — CVE-2026-45292 /
+GHSA-rcgg-9c38-7xpx, scored 5.3 by GitHub and 7.5 by the other assigning authority — and no Open
+Liberty release ships a fixed SDK: 26.0.0.9, the newest, carries OpenTelemetry 1.48.0 in both the
+API this module compiles against and the runtime bundle that executes it. The SDK is enabled here,
+so with the upstream propagator list that header would be parsed on every request, including
+unauthenticated ones. Naming only `tracecontext` leaves the baggage propagator uninstalled, so the
+header is never read. Nothing else about telemetry changes: `traceparent` and `tracestate` still
+propagate, every `@WithSpan` span is still recorded, and the SDK stays on. Restore the upstream
+default (`OTEL_PROPAGATORS=tracecontext,baggage`) once the runtime ships OpenTelemetry 1.62.0 or
+later — and treat it as a control to re-check rather than a setting to forget, because an image
+scanner cannot confirm it for you: Liberty repackages OpenTelemetry as the OSGi bundle
+`io.openliberty.io.opentelemetry.internal.2.1` with its Maven coordinates stripped, so a scan of
+the image reports nothing about it. See
+[Dependency and image scanning](#dependency-and-image-scanning).
 
 ### Admission capacity
 
@@ -490,7 +588,7 @@ mvn -B clean package -DskipTests
 ```
 
 `mvn verify` starts and stops a real Open Liberty server around the integration tests
-(`liberty-maven-plugin` 3.11.5, assembly `io.openliberty:openliberty-runtime:26.0.0.9`): the server
+(`liberty-maven-plugin` 3.12.3, assembly `io.openliberty:openliberty-runtime:26.0.0.9`): the server
 is created and its features installed at `prepare-package`, started and the WAR deployed at
 `pre-integration-test`, and stopped at `post-integration-test`. The test server runs with
 `AUTH_TYPE=none`, so `includes/none.xml` is active and the integration tests authenticate with HTTP
@@ -512,6 +610,75 @@ module's business logic — enforced by the JaCoCo `check` rule at `verify` and 
 the integration-test fork and the Liberty JVM are deliberately not instrumented, so client-side
 activity cannot inflate the figure.
 
+### Dependency and image scanning
+
+Software-composition analysis is opt-in rather than part of `verify`, because it needs what this
+repository cannot carry: an NVD API key, and a local vulnerability database built from it.
+
+```bash
+NVD_API_KEY=<your key> mvn -B -Pdependency-check dependency-check:check
+```
+
+The `dependency-check` profile pins `org.owasp:dependency-check-maven` 13.0.0 and configures it for
+this module. The key is read from the `NVD_API_KEY` **environment variable**
+(`nvdApiKeyEnvironmentVariable`) rather than from a POM value or `-DnvdApiKey`, because Maven echoes
+plugin configuration and command lines in its debug output. `skipTestScope` is `false`, so the test
+REST client and JSON parser are scanned as well as the runtime APIs, and the reports land in
+`target/dependency-check-report.html` and `.json`. It reports rather than gates: `failBuildOnCVSS`
+keeps the plugin default of 11, which no score can exceed. Turn it into a gate when you want one:
+
+```bash
+NVD_API_KEY=<your key> mvn -B -Pdependency-check dependency-check:check -DfailBuildOnCVSS=7
+```
+
+The profile is never active by default, so an ordinary `mvn clean verify` neither runs the goal nor
+resolves the plugin. Without a key the goal fails before it analyses anything:
+
+```
+UpdateException: Error updating the NVD Data
+  caused by NvdApiException: Invalid API Key, length of 0 too short to provided a masked partial key
+NoDataException: No documents exist
+```
+
+Request a key at <https://nvd.nist.gov/developers/request-an-api-key>; the first run with one
+populates the database, which takes minutes.
+
+**When no key and no scanner binary are available** — the state of a host whose egress proxy blocks
+GitHub release assets, so `trivy`, `grype`, `syft` and Dependency-Check's vulnerability cache cannot
+be fetched — these substitutes cover the same ground with `curl` and the Docker daemon:
+
+```bash
+# Every coordinate this module resolves, asked about in one OSV.dev request
+mvn -B -q dependency:list -DincludeScope=test -DoutputFile=/tmp/ec-deps.txt
+awk -F: 'NF>=5 {gsub(/^[ \t]+/,"",$1);
+    printf "{\"package\":{\"ecosystem\":\"Maven\",\"name\":\"%s:%s\"},\"version\":\"%s\"}\n", $1, $2, $(NF-1)}' \
+  /tmp/ec-deps.txt | sort -u | paste -sd, - | sed 's/^/{"queries":[/; s/$/]}/' > /tmp/ec-osv.json
+curl -s -X POST -d @/tmp/ec-osv.json https://api.osv.dev/v1/querybatch
+
+# The image, scanned by a containerised trivy instead of an installed one
+docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+  aquasec/trivy:latest image --scanners vuln execution-control:local
+```
+
+Build-plugin classpaths are the third surface, and `dependency:resolve-plugins` is the wrong tool
+for it here: it reports each plugin's own declared dependencies and ignores the plugin-level
+`<dependencies>` this POM pins, so it still shows the versions those pins replace. Read the realms
+Maven actually populates instead:
+
+```bash
+mvn -X -B clean verify | grep -A30 'Populating class realm'
+```
+
+Two things are worth knowing before reading any of these reports. **A clean image scan is not a
+clean bill of health.** Trivy reads 1,679 packages out of this image and reports zero findings, but
+it names Liberty's repackaged libraries by OSGi bundle — `dev:io.openliberty.io.opentelemetry.2.1`,
+never `io.opentelemetry:opentelemetry-api:1.48.0` — so the OpenTelemetry release inside the runtime,
+and the advisory behind [`OTEL_PROPAGATORS`](#telemetry), are invisible to it. Pair image scans with
+Open Liberty fix-pack tracking. **And the one advisory the dependency scan does report** is that
+same OpenTelemetry API: it arrives transitively with `microprofile-telemetry-api` and is `provided`
+by the runtime, so there is no version of it this module can choose — which is why its mitigation is
+configuration rather than an upgrade.
+
 ## Container
 
 Maven must run before `docker build` — the image compiles nothing and copies the WAR that Maven
@@ -532,6 +699,11 @@ stops the pipeline.
 Both published ports name `127.0.0.1` explicitly. A bare `-p 9080:9080` does not mean localhost: it
 binds the Docker daemon's default host address, which is `0.0.0.0` unless the daemon was configured
 otherwise, and that publishes the cleartext listener on every interface of the machine.
+
+That run is a smoke test and leaves the container's filesystem writable. The deployment does not:
+[the pod runs with a read-only root filesystem](#standalone-kubernetes-deployment), and the same
+posture is worth reproducing locally before a change to the image reaches a cluster — the `docker`
+equivalent of it is in that section.
 
 The base image is `icr.io/appcafe/open-liberty:26.0.0.9-full-java21-openj9-ubi-minimal`, pinned in
 the `Dockerfile` by digest alongside that tag:
@@ -555,6 +727,26 @@ so 384 MB leaves about three times the live set for collection headroom and sits
 `memory: 1Gi` limit the manifest below requests. Raise both together, never one alone: a heap larger
 than the pod's limit is an OOM kill waiting for load, and a pod larger than the heap is memory
 nothing will use.
+
+**Key material is owner-readable only inside the image.** `COPY` preserves the mode of what it
+copies, so the two PKCS12 stores under `resources/security/` would arrive at `0644` — readable by
+every identity in the image, and both of them hold a private key (`key.p12` the server's own,
+`trust.p12` the shared `jwtsigner` key). The `Dockerfile` therefore follows its `chown -R 1001:0`
+with a `chmod 600` over `resources/security/*.p12`. The tracked files keep the mode they carry in
+the broker, whose copies they are byte-for-byte; the tightening is a layer of the image, not a
+change to the repository. Re-check it on any image you build:
+
+```bash
+docker run --rm --entrypoint stat execution-control:local -c '%n %a %U' \
+  /opt/ol/wlp/usr/servers/defaultServer/resources/security/key.p12 \
+  /opt/ol/wlp/usr/servers/defaultServer/resources/security/trust.p12
+```
+
+Both lines must read `600 default` — `default` is the account name uid 1001 carries in the base
+image, and it is the only identity that ever runs this server, so owner-only access is the whole of
+what the runtime needs. That makes the material harder to read; it does not make it safe to use. It
+is still shared demonstration material, and what to replace it with is under
+[Inherited demonstration security material](#inherited-demonstration-security-material).
 
 **Runtime provenance.** The 26.0.0.9 release line is a security floor, not a cosmetic choice: the
 servlet request/response smuggling fixes land in 26.0.0.8, so every earlier release — including
@@ -710,6 +902,26 @@ spec:
           allowPrivilegeEscalation: false
           capabilities:
             drop: ["ALL"]
+          # Nothing in the image is written at runtime: the three paths Liberty does write
+          # are the volumes below. This is the setting that stops a compromised application
+          # process rewriting the runtime jars under /opt/ol/wlp/lib or the server.xml that
+          # selects AUTH_TYPE and the mpJwt consumer for the next restart - both of which
+          # the base image leaves writable by the runtime UID.
+          readOnlyRootFilesystem: true
+        volumeMounts:
+          # WLP_OUTPUT_DIR: the OSGi workarea and the LTPA key file the server generates on
+          # first boot. The image primes a workarea during its build and this volume masks
+          # it, so the server rebuilds it once per pod - measured at about 1.5s of extra
+          # startup, against a startupProbe that allows 60.
+          - name: liberty-output
+            mountPath: /opt/ol/wlp/output
+          # Where LOG_DIR resolves: /opt/ol/wlp/logs is a symlink to /logs in this image,
+          # and messages.log and the verbose-GC log are written through it.
+          - name: liberty-logs
+            mountPath: /logs
+          # java.io.tmpdir.
+          - name: tmp
+            mountPath: /tmp
         env:
           # Identity settings.
           - name: AUTH_TYPE
@@ -722,9 +934,8 @@ spec:
           # - name: OIDC_JWKS_URL
           #   value: "https://your-oidc-provider/.well-known/jwks.json"
           # The password the LTPA key file is encrypted with. server.xml carries a demonstration
-          # default; supply your own here, identical on every replica and stable over time, or
-          # replicas will not accept each other's SSO cookies and a restarted server will not
-          # read the key file it wrote. It is a credential, so it comes from a Secret rather
+          # default; supply your own here, and keep it stable over time, or a restarted server
+          # will not read the key file it wrote. It is a credential, so it comes from a Secret rather
           # than a literal - create it with:
           #   kubectl -n stocktrader create secret generic execution-control-ltpa \
           #     --from-literal=keysPassword='<your value>'
@@ -787,6 +998,21 @@ spec:
             cpu: 250m
             memory: 512Mi
             ephemeral-storage: 32Mi
+      # The only writable paths in the pod. Each carries a sizeLimit so a log or workarea
+      # that grows without bound evicts the pod instead of filling the node, and the three
+      # together come to the ephemeral-storage limit above - which they now account for in
+      # full, because a read-only root leaves nothing else to write to. A freshly started
+      # server holds about 1.5 MiB across all three, so the room is for log growth.
+      volumes:
+        - name: liberty-output
+          emptyDir:
+            sizeLimit: 128Mi
+        - name: liberty-logs
+          emptyDir:
+            sizeLimit: 64Mi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
 ---
 apiVersion: v1
 kind: Service
@@ -827,10 +1053,55 @@ the parent aggregation, not a seventeenth microservice repository.
 
 The pod runs with least privilege: no service-account token is mounted (the service calls no
 Kubernetes API), the container runs as the image's non-root UID 1001 under the `RuntimeDefault`
-seccomp profile, privilege escalation is refused and every Linux capability is dropped. One
-restricted-profile setting is deliberately absent: `readOnlyRootFilesystem` is not set, because
-Liberty writes its workarea, output and logs under `/opt/ol/wlp` at startup and would fail to
-start against a read-only root without `emptyDir` mounts for those paths.
+seccomp profile, privilege escalation is refused, every Linux capability is dropped, and the root
+filesystem is read-only.
+
+That last setting is the one that matters most here, and it is why the manifest carries three
+`emptyDir` volumes. The base image is built for platforms that run it under an arbitrary UID, so it
+ships `/opt/ol/wlp` and `/opt/ol/wlp/lib` group-writable (`775 default:root`) and the server
+directory at `770`; the image's `chown -R 1001:0` over the configuration it copies then leaves
+`server.xml` writable by its owner. Without `readOnlyRootFilesystem` the application identity can
+rewrite both the runtime jars it executes and the `server.xml` that selects `AUTH_TYPE` and the
+`mpJwt` consumer — which the next restart would load. No permission set inside the image can close
+that, because the runtime has to own the configuration it reads; the pod-level control can, and
+does. Every Liberty service in this estate inherits the same base image and the same writable
+install, so this is the module-side remedy rather than a fix to the image.
+
+Liberty needs exactly three writable paths, and each is one of those volumes:
+
+| Path | Why it must be writable |
+| --- | --- |
+| `/opt/ol/wlp/output` | `WLP_OUTPUT_DIR` — the OSGi workarea, and the LTPA key file generated on first boot |
+| `/logs` | Where `LOG_DIR` resolves: `/opt/ol/wlp/logs` is a symlink to it, and `messages.log` and the verbose-GC log are written through it |
+| `/tmp` | `java.io.tmpdir` |
+
+Verified rather than assumed: with those three writable and everything else read-only the server
+starts clean — all three health endpoints `UP`, an authenticated order submit answering `201`, not
+one warning or error in `messages.log` — while `/opt/ol/wlp/lib` and `server.xml` refuse writes. Two
+costs come with it, both small. Startup moves from about 3.0s to 4.6s, because the volume masks the
+workarea the image primed and the server rebuilds it once per pod. And the LTPA key file now lives
+in the output volume: it survives a container restart within the pod, but a replaced pod generates a
+new one — which is why `LTPA_KEYS_PASSWORD` comes from a Secret and has to stay stable.
+
+`docker` has the same two controls, so the pod's filesystem posture can be reproduced locally before
+it is trusted in a cluster:
+
+```bash
+docker run -d --name ec --read-only \
+  --tmpfs /opt/ol/wlp/output --tmpfs /logs --tmpfs /tmp \
+  -p 127.0.0.1:9080:9080 -p 127.0.0.1:9443:9443 \
+  -e AUTH_TYPE=none -e OTEL_SDK_DISABLED=true execution-control:local
+```
+
+One limit to know: the base image's certificate and serviceability helpers do write under the
+configuration directory, and those writes fail against a read-only root. Setting `SSL=true` or
+`TLS=true`, mounting certificates for the entrypoint to import (`TLS_DIR`),
+`SEC_IMPORT_K8S_CERTS=true`, or `SERVICEABILITY_NAMESPACE` makes it write a config dropin or re-link
+`/opt/ol/wlp/logs`, and the container then exits during startup. None of them is used here — the
+service ships its own keystore and truststore, and its own keystore dropin is what stops the
+entrypoint generating another — so leave them unset. A deployment that genuinely needs one has to
+relax `readOnlyRootFilesystem`, because an `emptyDir` over the configuration directory would mask
+the configuration itself.
 
 The `Service` is `ClusterIP` — the minimal exposure — because nothing in the estate routes to this
 service: no trader page, no broker adapter, no Istio route. Substituting `type: NodePort` with the
@@ -844,17 +1115,58 @@ belongs, either directly or through a TLS-terminating ingress.
 
 The two ports are separate `httpEndpoint` elements in `server.xml` for one reason: a response-header
 policy in Liberty is scoped to an endpoint, not to a scheme. Both listeners suppress the server
-signature and `X-Powered-By`, and both set `X-Content-Type-Options: nosniff` and
-`Cache-Control: no-store` — the latter because every application response here is authenticated
-JSON that no intermediary or browser should retain. Only the TLS listener adds
-`Strict-Transport-Security`, which a client that arrived over cleartext would be right to ignore. An
-ingress in front of this service may set the same headers; it must not weaken them.
+signature, `X-Powered-By` and `$WSEP`, both strip `io.openliberty.trace`, and both assert the same
+five response headers; only the TLS listener adds a sixth.
+
+| Header | Value | Where it applies |
+| --- | --- | --- |
+| `X-Content-Type-Options` | `nosniff` | every response, both listeners |
+| `Cache-Control` | `no-store` | every response, both listeners — every application response here is authenticated JSON that no intermediary or browser should retain |
+| `X-Frame-Options` | `DENY` | every response, both listeners |
+| `Referrer-Policy` | `no-referrer` | every response, both listeners |
+| `Content-Security-Policy` | `default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'` | every response that does not already carry a policy of its own, both listeners |
+| `Strict-Transport-Security` | `max-age=31536000` | the TLS listener only — a client that arrived over cleartext would be right to ignore it |
+
+The last three are there because this origin does answer with HTML a browser will render, even
+though every response the API contract above describes is JSON: the container's own `403` page, and
+the Swagger UI at `/openapi/ui/`. `X-Frame-Options` and `Referrer-Policy` are asserted
+unconditionally — nothing served here is meant to be framed, and no response on either listener
+declares a referrer policy of its own. The content-security policy is asserted only where the
+response carries none, and that condition is load-bearing rather than cautious: a browser enforces
+the *intersection* of two policies rather than the later one, and Liberty's Swagger UI ships a
+policy that its own inline bootstrap needs, so asserting `default-src 'none'` over it would blank
+that page while protecting nothing this service serves. Every response this service produces
+carries no policy of its own and so receives the restrictive one, which names `frame-ancestors`,
+`base-uri` and `form-action` explicitly because `default-src` does not cover them.
+
+`io.openliberty.trace` is removed for the reason `$WSEP` is, and one more. `mpTelemetry` puts the
+trace and span id of the request on every response the application produces, so besides naming the
+runtime the header hands any caller — including one whose request was refused — a correlation id
+into the server's own traces. Nothing diagnostic is lost by removing it: those ids stay in
+`trace.log` and reach the collector over OTLP, which is where a deployment correlates them, and an
+ingress that wants to hand a client a correlation id of its own can add one.
+
+Both halves of the policy are checkable from outside in one command each — the first prints the
+three document policies and nothing for the trace header, the second adds HSTS:
+
+```bash
+curl -sS -D - -o /dev/null -u stock:trader http://localhost:9080/execution-control/controls \
+  | grep -i -e '^x-frame-options' -e '^content-security-policy' -e '^referrer-policy' -e '^io.openliberty'
+curl -sSk -D - -o /dev/null -u stock:trader https://localhost:9443/execution-control/controls \
+  | grep -i -e '^strict-transport-security' -e '^content-security-policy'
+```
+
+An ingress in front of this service may set the same headers; it must not weaken them.
 
 Both ports also answer three web apps that belong to the runtime rather than to this service —
-`/health/`, `/openapi/` and `/jwt/`, all published by the feature set — and one of them,
-`/jwt/ibm/api`, answers `500` to an unauthenticated caller. None of them is part of the API above.
-The `NetworkPolicy` and the ingress path allow-list that keep them off a published route, and the
-reason each exists, are under
+`/health/`, `/openapi/` and `/jwt/`, all published by the feature set. None of them is part of the
+API above, and `/jwt/` is the one that has to be kept off every route: its builder here holds no
+signing key, so it issues nothing, but `GET /jwt/ibm/api` still answers `500` with the runtime's own
+exception text to an unauthenticated caller, and no setting available to this module changes that.
+A path this server serves no application for — `/`, or a miscased probe path — answers a bare `404`
+naming neither the product nor its version. The `NetworkPolicy` and the ingress path allow-list
+that keep the runtime apps off a published route, the reason each exists, and the residual
+behaviours that documentation rather than configuration has to carry are under
 [The runtime endpoints beside the application](#the-runtime-endpoints-beside-the-application).
 
 ## Reviewing the service
@@ -1039,9 +1351,11 @@ restriction of the mutating verbs that this service requires.
 ### `AUTH_TYPE` is trusted deployment input
 
 `AUTH_TYPE` does not name a mode this service interprets; it names a file. `server.xml` carries
-`<include location="${server.config.dir}/includes/${AUTH_TYPE}.xml"/>`, and that line together with
-all four `includes/*.xml` files is byte-identical to the broker's — which is precisely what lets
-this service accept the tokens the rest of the estate issues. The variable therefore selects the
+`<include location="${server.config.dir}/includes/${AUTH_TYPE}.xml"/>`, and that line and the four
+`includes/*.xml` files it reaches are the broker's, verbatim but for one deleted element (rows 15
+and 16 of [Deviations from the frozen implementation
+plan](#deviations-from-the-frozen-implementation-plan)) — which is precisely what lets this service
+accept the tokens the rest of the estate issues. The variable therefore selects the
 authentication mechanism itself, so **set it from the deployment, to one of `basic`, `ldap`, `oidc`
 or `none`, and never from anything a caller can influence.**
 
@@ -1067,10 +1381,12 @@ can quietly downgrade a JWT-verifying deployment to the bundled demonstration us
 failing. Pin the value in the `Deployment` (the manifest above sets it explicitly), and treat
 whoever can set it as trusted.
 
-Do **not** fork the include mechanism to validate the value locally. The byte-for-byte identity of
-`server.xml`'s include line and the four `includes/*.xml` files with the broker's is what the
-estate's JWT trust rests on, and a local variant would be a second copy of that mechanism to keep in
-step for a check the deployment already owns.
+Do **not** fork the include mechanism to validate the value locally. Those four files staying the
+broker's is what the estate's JWT trust rests on, and a local variant would be a second copy of that
+mechanism to keep in step for a check the deployment already owns. The one element removed from
+three of them is a token *issuer* and not part of that trust; anything this module needs to add to
+the security configuration belongs in its own `server.xml`, which is where the elements of row 16
+live for exactly this reason.
 
 ### The runtime endpoints beside the application
 
@@ -1083,26 +1399,72 @@ umbrella `server.xml` enables. None can be dropped without dropping the umbrella
 documented here rather than removed, and the perimeter is where they are restricted: see
 [Restricting the perimeter](#restricting-the-perimeter).
 
-**`/jwt/*` is not part of this service's contract.** It is Liberty's own JWT builder endpoint, this
-service never calls it, and nothing in the API above depends on it. Unauthenticated
-`GET /jwt/ibm/api` answers **`500`** with a Liberty HTML error page — a `NullPointerException`
-inside the runtime's `JwtRequestFilter`, reproduced identically under `AUTH_TYPE=none` and under
-the default `AUTH_TYPE=basic`, and recorded as an FFDC incident. Nothing of this service's data is
-reachable through it, and no request this service documents goes near it. Do not route it: a
-deployment that exposes this pod should publish `/execution-control` and the three probe paths and
-nothing else.
+**`/jwt/*` is not part of this service's contract, and it issues nothing.** It is Liberty's own JWT
+builder endpoint, this service never calls it, and nothing in the API above depends on it. Left at
+the runtime's defaults it was worse than useless: every identity the active registry authenticated
+could mint an RS256 token signed with the estate's shared `jwtSigner` key and carrying the estate
+issuer and audience — a role-less account included — which the sibling services, several of which
+bind `StockTrader` to `ALL_AUTHENTICATED_USERS`, would then honour. `server.xml` closes that by
+claiming the `defaultJWT` builder id and pinning it to a key alias no keystore holds, which is the
+only lever that works: the endpoint cannot be unpublished, and a deleted builder is auto-provided
+again by the runtime with the same estate key. Measured on this runtime with the fix in place:
 
-**Only four paths exist under `/health`**, and everything else there is a 404 the runtime reports at
-some length:
+| Request | Answer |
+| --- | --- |
+| `GET /jwt/ibm/api/defaultJWT/token` over TLS as `stock:trader`, and as `read:only` | `200` with a **zero-byte** body — no token. Identity cannot change it: there is no key to sign with |
+| `GET /jwt/ibm/api/defaultJWT/jwk` over TLS | `200` with a **zero-byte** body — no key, no `kid` |
+| `GET /jwt/ibm/api/defaultJWT/token` over the cleartext listener | `404` with the body `Error 404: CWWKS6052E: HTTP scheme is used at the specified endpoint: …, HTTPS is required.` — the endpoint is TLS-only, and that notice carries a message id and the caller's own URI, no class, stack or product version |
+
+The first attempt writes four de-duplicated FFDC incidents naming
+`CWWKS6016E: … The alias [execution-control-mints-no-tokens] is not present in the KeyStore as a
+key entry`, and repeat attempts add none. That is the intended record that something asked this
+service to sign; startup itself is clean. Verification is unaffected — the `mpJwt` element of
+`includes/{basic,ldap,oidc}.xml` still accepts the estate's tokens against `jwtSigner` in
+`trust.p12` — and so is every application endpoint.
+
+Do not route `/jwt/*` even so: a deployment that exposes this pod should publish
+`/execution-control` and the three probe paths and nothing else. Two answers there are the
+runtime's own and no module-level setting reaches them, so they are documented rather than fixed:
+
+- `GET /jwt/ibm/api`, with or without credentials, answers **`500`** with a 111-byte
+  `java.lang.NullPointerException` message from the runtime's `JwtRequestFilter`. The body carries
+  the message text only — **no stack frames**; the frames appear in the FFDC incident, not in the
+  response — and it names no application type of this service. Identical on the untouched runtime.
+- In the MP-JWT modes (`AUTH_TYPE=basic`, `ldap`), the TLS token endpoint itself answers **`500`**
+  with `java.lang.NullPointerException: Cannot invoke
+  "com.ibm.ws.security.registry.UserRegistry.getRealm()"`, anonymously and with credentials alike,
+  because `/jwt` is a *protected* resource and those includes configure no user registry. It is
+  pre-existing runtime behaviour, present identically on a baseline image, and the remedy is **not**
+  to add a registry to `includes/basic.xml`: that would create development users in the production
+  authentication mode. The endpoint mints nothing in that mode either.
+
+**The probes answer whatever credential arrives.** `/health/live`, `/health/ready`,
+`/health/started` and `/health` are unprotected resources, and Liberty's security collaborator
+would otherwise authenticate them opportunistically whenever a request merely carries
+authentication data — which in a registry-less MP-JWT deployment dereferenced a null `UserRegistry`
+and turned every probe carrying an `Authorization` header into a `500` with that exception text.
+Any ingress or service mesh that forwards the caller's credential to all paths produces exactly
+that request, and a `500` there is a failed liveness or readiness check, so
+`server.xml` sets `useAuthenticationDataForUnprotectedResource="false"`. All twelve cells of
+{`live`, `ready`, `started`} × {no header, a syntactically valid but forged `Bearer`, a valid
+`Basic` credential, an unknown scheme} now answer `200 UP`, and the module's integration tests
+assert them. Stripping `Authorization` for the probe paths at the perimeter remains worth doing;
+it is no longer what keeps the probes answering.
+
+**Only four paths exist under `/health`.** Everything else there, and every path no application
+claims, answers a `404` — but not the same `404`, and the difference is the whole of what a
+perimeter has to know:
 
 | Path | Answer |
 | --- | --- |
 | `/health/live`, `/health/ready`, `/health/started` | `200` (or `503`) with this service's `ExecutionControl` check |
 | `/health`, with or without a trailing slash | `200` (or `503`) with all three checks |
-| any other sub-path — `/health/ready/extra`, `/health/xyz` | `404`, logged by the runtime and filed as an FFDC incident |
-| `/HEALTH/ready`, `/Health/Ready` | `404` — path matching is case-sensitive |
+| any other sub-path — `/health/ready/extra`, `/health/xyz` | `404`, logged by the runtime and filed as an FFDC incident. **Its body names `jakarta.servlet.ServletException`, `java.io.FileNotFoundException` and `SRVE0190E`** — the runtime's own web app answering, before any `<error-page>` or filter of this module, and no module-level setting changes it (`webContainer displayCustomizedExceptionText` has no effect on it; measured). Documented, not fixed: keep the sub-path off the perimeter with `pathType: Exact` below |
+| `/HEALTH/ready`, `/Health/Ready` | `404` — path matching is case-sensitive. No web app claims that context root, so the answer is the HTTP dispatcher's: a minimal page whose only text is `Not Found`, naming neither the product, nor its version, nor any type. Until `server.xml` set `appOrContextRootMissingMessage`, this was the product's "Context Root Not Found" page |
+| `/`, and any other path no application claims | `404` with that same `Not Found` page. Until `server.xml` set `enableWelcomePage="false"`, this was Liberty's welcome page, titled with the product and its exact release |
 
-That 404 is answered by Liberty's file-serving extension, which logs `SRVE0190E: File not found`
+The first of those 404s is answered by Liberty's file-serving extension, which logs
+`SRVE0190E: File not found`
 with a stack trace and files an FFDC incident for it — behaviour of the runtime's web app, not of
 anything this module can intercept, and reachable by a caller with no credentials. Two settings in
 `server.xml` bound what an anonymous caller can do with it: `hideMessage` keeps `SRVE0190E` out of
@@ -1132,6 +1494,16 @@ else, and keep `/jwt/*` off every route: at an ingress, by listing only those pa
 cluster, by admitting only the node the pod runs on to the cleartext port and only in-cluster
 callers to the TLS port. The kubelet's own probes are unaffected either way, because it connects to
 the pod directly rather than through a route.
+
+The allow-list is what the two residual runtime answers rest on, so it is not optional decoration.
+`/jwt/*` issues nothing here, but `GET /jwt/ibm/api` still returns the runtime's `500` and its
+exception message to anyone who can reach the port, and the module's own configuration cannot
+change that; an unknown sub-path under `/health` still returns a `404` naming
+`jakarta.servlet.ServletException` and `SRVE0190E` for the same reason. Both are the runtime's
+web apps rather than this WAR, both are reachable without credentials, and the perimeter is the
+only place either can be refused. Enforce it in the cluster and not only at an ingress: an ingress
+protects a published route, while a `NetworkPolicy` also covers anything that can already route to
+the pod.
 
 Save this beside the manifest and apply it into the same namespace to close 9080 to everything but
 in-cluster callers and the node the pod runs on:
@@ -1191,9 +1563,9 @@ and no wildcard host rule:
             backend: { service: { name: execution-control-service, port: { number: 9080 } } }
 ```
 
-`pathType: Exact` on the three probe paths is what keeps the stray-sub-path 404s above off the
-perimeter, and leaving `/jwt`, `/openapi` and `/openapi/ui` out of the list is what keeps them
-unreachable from outside the cluster. Add `/openapi` deliberately if the generated contract is meant
+`pathType: Exact` on the three probe paths is what keeps the stray-sub-path 404s above — and the
+exception class names one of them discloses — off the perimeter, and leaving `/jwt`, `/openapi` and
+`/openapi/ui` out of the list is what keeps them unreachable from outside the cluster. Add `/openapi` deliberately if the generated contract is meant
 to be published; it carries no data, only the schema. Restricting the verbs on the probe paths is the
 same ingress's job — the controller-specific form varies, so it is not reproduced here.
 
@@ -1205,6 +1577,22 @@ would admit it: confirm that behaviour in whatever terminates HTTP rather than a
 `/execution-control` prefix confines the request. Inside the WAR the same normalization is harmless,
 because it happens before the `web.xml` constraints are matched — a mutating verb sent through a
 normalized path is still `401` without credentials and `403` for a `StockViewer`, both measured.
+
+**Where a forged `Host` still reaches, and where it does not.** This service's own responses never
+repeat the address a caller claimed: both `Location` and every `Link` relation are paths, so a
+`Host` or `X-Forwarded-Proto` of the caller's choosing changes nothing in them — measured, with
+`Host: evil.example` on `POST /orders` answering `201` and `Location: /execution-control/orders/…`,
+and the same `Host` on every paged read answering targets that begin `/execution-control/`. Liberty's
+own `/openapi/ui` web app is a different matter: it sits outside the WAR, so no code here can
+intercept it, and it answers `GET /openapi/ui` with a `302` that does follow the claimed host —
+measured as `Host: evil.example` → `302 Location: http://evil.example/openapi/ui/`. The path
+allow-list above already keeps it off a published perimeter, which is the remedy for a deployment
+that does not publish it; a deployment that does publish it has to pin the accepted `Host` at
+whatever terminates HTTP, because the runtime, not this module, decides that redirect. Two further
+measurements on the same runtime: `X-Forwarded-Proto` is honoured, so a claimed scheme still reaches
+anything the *runtime* builds from the request URI — that same redirect flips to `https://` while
+its host and port stay the ones the request arrived on — while `X-Forwarded-Host` is not honoured at
+all. Nothing this module builds reads either header.
 
 ### A failed start and the empty check list
 
@@ -1279,21 +1667,102 @@ pod whose application failed to install.
 ### Inherited demonstration security material
 
 The module carries copies of the estate's sample security material so that cross-service JWT
-acceptance works out of the box:
+acceptance works out of the box. Every credential named below is inherited — copied from
+`backend/broker`, byte for byte where the artefact is a file — and none of it is generated here.
+This section inventories all of it, because a reader deciding what to replace, or whether to enable
+`AUTH_TYPE=none`, needs to know exactly what works if they do not.
 
-- `src/main/liberty/config/resources/security/key.p12` — the shared sample private key.
-- `src/main/liberty/config/resources/security/trust.p12` — byte-identical to the broker's, holding
-  the `jwtSigner` key. That byte-for-byte identity is precisely what lets this service accept the
-  tokens the rest of the estate issues.
-- The hard-coded sample keystore password configured in `server.xml`, which both stores share. The
-  value is in that file and is deliberately not repeated here.
-- The plaintext development users in `includes/none.xml` (`stock:trader` in `StockTrader`,
-  `read:only` in `StockViewer`).
+**The two keystores.** Both are PKCS12, both are byte-identical to the broker's copies
+(`key.p12` md5 `e48b3a7ae6c468a8efe3c1dac1737573`, `trust.p12` md5
+`f9877a2a20184663ccdff97be85b1ac1`), and that identity is the point: it is what lets this service
+verify the tokens the rest of the estate issues. `trust.p12` holds eight entries, of which this
+service uses one:
+
+| Store | Entry | Type | Subject | Expires | Used here |
+| --- | --- | --- | --- | --- | --- |
+| `key.p12` | `default` | private key | `CN=Stock Trader, OU=Cloud Engagement Hub, O=IBM, C=US` | 2030-06-06 | yes — the TLS identity the HTTPS listener presents |
+| `trust.p12` | `jwtsigner` | private key (2048-bit RSA, SHA256withRSA) | `CN=Stock Trader, OU=Cloud Engagement Hub, O=IBM, L=Durham, ST=NC, C=US` | 2030-08-15 | yes — `mpJwt` verifies every bearer token against it under `AUTH_TYPE=basic`/`ldap`, where the includes name it `jwtSigner` (keystore aliases are case-insensitive) |
+| `trust.p12` | `stock-trader` | trusted certificate | `CN=Stock Trader, OU=Cloud Engagement Hub, O=IBM, C=US` | 2030-06-06 | no |
+| `trust.p12` | `apiconnect` | trusted certificate | `CN=*.apiconnect.ibmcloud.com` | **2021-04-08 — expired** | no |
+| `trust.p12` | `ibm-id` | trusted certificate | `CN=idaas.iam.ibm.com` | **2021-01-19 — expired** | no |
+| `trust.p12` | `iex` | trusted certificate | `CN=*.iexapis.com` | **2020-11-29 — expired** | no |
+| `trust.p12` | `openwhisk` | trusted certificate | `CN=us-south.functions.cloud.ibm.com` | **2020-09-30 — expired** | no |
+| `trust.p12` | `twitter` | trusted certificate | `CN=api.twitter.com` | **2021-04-10 — expired** | no |
+| `trust.p12` | `watson` | trusted certificate | `CN=*.watsonplatform.net` | **2020-12-30 — expired** | no |
+
+Six of those eight entries are long-expired anchors for third-party endpoints — IBM API Connect,
+IBM Id, IEX Cloud, IBM Cloud Functions, Twitter and Watson — that this service has no way to reach:
+it opens no outbound connection of any kind, prices every order from the order's own `limitPrice`,
+and holds all of its data in memory. They are inert rather than dangerous, and they are not a
+substitute for real trust: an expired anchor validates nothing, so no peer becomes trusted by
+sitting in this file. What they are is dead weight that cannot be cleaned up from here — pruning
+them means editing a store that `broker`, `portfolio` and `trader` carry byte for byte, and a
+store edited in this module alone would no longer be the file those services hold, which is the
+one property that makes cross-service JWT acceptance work. The fix therefore belongs at estate
+level: prune the shared `trust.p12` for all four services in one change, and re-verify each
+service's JWT path against the pruned store. Re-derive this table at any time with
+
+```bash
+# Prompts for the store password, which is the value server.xml holds in its {xor} form.
+keytool -list -v -storetype PKCS12 \
+  -keystore src/main/liberty/config/resources/security/trust.p12
+```
+
+**The keystore password.** One value opens both stores, and `LTPA_KEYS_PASSWORD` defaults to that
+same value. `server.xml` carries it in `securityUtility`'s `{xor}` form rather than as a literal,
+which keeps the plaintext out of the source tree, out of the image layer and out of any log or
+review that echoes the file. It goes no further than that, and should not be read as protection:
+Liberty decodes `{xor}` with no key and no configuration — that is exactly what lets the inherited
+stores open with nothing supplied — so anyone holding this file recovers the value, and the value
+should be treated as known. The literal appears nowhere in this module, in this README included.
+`{aes}` is accepted in the same places, but its encryption key must then be supplied to the server
+(`securityUtility encode --encoding=aes --key=…` alongside `wlp.password.encryption.key`), which
+replaces one piece of demonstration material with a real secret to store and rotate; use it when
+you have somewhere to keep that key.
+
+**The development registry.** `includes/none.xml` is in force only when `AUTH_TYPE=none`, and it
+defines six plaintext users. All six work against this service the moment that mode is enabled:
+
+| User | Password | Group | What it can do here |
+| --- | --- | --- | --- |
+| `stock` | `trader` | `StockTrader` | everything: every `GET`, `POST /orders`, and the three exception `PUT`s |
+| `debug` | `debug` | `StockTrader` | the same as `stock` |
+| `john.alcorn@kyndryl.com` | `traderPwd` | `StockTrader` | the same as `stock` |
+| `read` | `only` | `StockViewer` | every `GET`; every mutating verb answers `403` |
+| `other` | `other` | none | authenticates, then `403` everywhere — `GET` included |
+| `admin` | `admin` | none, but named in `<administrator-role>` | Liberty's administrative role, which is not an application role: `403` on every path under `/execution-control`. It is still a credential on the server |
+
+Re-derive that list with
+
+```bash
+grep -E '<user name=|<member name=|<group name=|<user>' src/main/liberty/config/includes/none.xml
+```
+
+One deliberate divergence from those inherited copies is recorded rather than silent: the
+`jwtBuilder` element is deleted from `includes/{none,basic,ldap}.xml`, so those three files are no
+longer byte-identical to the broker's — rows 15 and 16 of
+[Deviations from the frozen implementation plan](#deviations-from-the-frozen-implementation-plan).
 
 **This is sample material, not usable credentials.** It is shipped for demonstration and testing
 only. Replace the keystores and the password for any deployment you care about, and treat
 `AUTH_TYPE=none` as a development and test mode only — it disables JWT verification entirely and
-accepts the hard-coded users above.
+accepts all six hard-coded users above.
+
+Four replacements make a deployment stand on its own material, and none of them is optional for
+anything beyond a demonstration:
+
+- **Fresh keystores, per environment.** Generate your own pair (`keytool -genkeypair` for the TLS
+  identity, plus the signing key your token issuer uses) and mount them over
+  `resources/security/`. Until you do, the consequence of the inherited pair is estate-wide: the
+  same `jwtSigner` private key sits in `broker`, `portfolio`, `trader` and this module, so anyone
+  who obtains any one of those images can mint tokens that all four accept.
+- **Your own keystore password**, on both `keyStore` elements in `server.xml` — plaintext or
+  `securityUtility`-encoded, since the form only decides who can read it over your shoulder.
+- **`LTPA_KEYS_PASSWORD` from a `Secret`.** The manifest above already wires it that way
+  (`valueFrom.secretKeyRef`); supply the same value on every replica, and keep it stable, for the
+  reasons under [Authentication across a restart](#authentication-across-a-restart).
+- **`AUTH_TYPE` anything but `none`.** `basic` (or `ldap`/`oidc`) verifies a signed token;
+  `none` accepts the six passwords printed above.
 
 Which of the two mechanisms is in force is decided by one variable, and that makes the variable
 itself part of the perimeter: see
@@ -1325,6 +1794,21 @@ What a restart loses is the data, and nothing else: the service keeps authentica
 every path, and the two are worth separating because the one thing it does keep across a restart is
 its LTPA key file.
 
+**No session or cookie spans a restart, because none is issued.** `server.xml` sets
+`singleSignonEnabled="false"`, so an authenticated response carries no `Set-Cookie` at all — the
+`StockTraderSSO` cookie the copied includes name is never handed out, and no `JSESSIONID` is either.
+A caller therefore presents its credential, `Bearer` token or HTTP Basic, on **every** request, and
+gets the same answer before and after a restart with nothing to re-establish. That is also what
+makes the audit `actor` the identity of the request that caused the transition: with no cookie in
+play there is nothing that could be evaluated ahead of the `Authorization` header, and nothing that
+remains a usable credential after the header stops being sent. A deployment that re-enables SSO
+takes on the opposite: a bearer cookie whose holder is whoever obtained it.
+
+The key file is a separate matter and still exists. Liberty creates and reads it whether or not SSO
+is enabled — the test server logs `CWWKS4103I`/`CWWKS4104A`/`CWWKS4105I` and writes
+`resources/security/ltpa.keys` on a boot with single sign-on off — so the password below governs it
+exactly as before.
+
 That file is written on the first boot and read on every later one, and it is encrypted with
 `LTPA_KEYS_PASSWORD`. Liberty gives the underlying attribute no default of its own, so a server
 with nothing supplying one invents a password per boot and then cannot read the file it wrote
@@ -1336,9 +1820,10 @@ every credential — while `/health/started`, `/health/ready` and `/health/live`
 `200 UP`, because the token service is not something a health check of this application can see. A
 kubelet keeps such a pod in service indefinitely.
 
-The shipped default password is what prevents that, and it is also what a multi-replica deployment
-needs: replicas that do not share the value cannot accept each other's SSO cookies. Two
-consequences follow for an operator:
+The shipped default password is what prevents that. Since no SSO cookie is issued, a shared value
+is no longer what lets replicas accept each other's callers — every replica authenticates every
+request on its own — but the value must still be stable over time, because a key file written under
+one password cannot be read under another. Two consequences follow for an operator:
 
 - **Set your own value, and set it once.** It is demonstration material, identical to the keystore
   password, and every deployment should override it — but with a value that is the same on every
@@ -1494,6 +1979,33 @@ accepted as present, and surrounding padding never reaches a stored record, an a
 `clientOrderId` idempotency key. `U+00A0` NO-BREAK SPACE is not whitespace by that definition and
 is deliberately left in place.
 
+**The shape of the entity is settled before any field is read.** A request body must be exactly one
+JSON object, each of whose declared fields carries one value, and the object must be the whole
+entity. Three refusals enforce that, all `400`:
+
+| Body | Answer |
+| --- | --- |
+| A declared field carrying a JSON array or object — `"limitPrice": [1,2,3]`, `"quantity": [1,2]`, `"owner": ["a1","a2"]` | `400` naming the field: `limitPrice must be a single value, not a JSON array` |
+| Anything after the end of the document — `{…}xyz`, a second appended document, a stray byte | `400 request body is not valid JSON` |
+| Fewer bytes delivered than the request's own `Content-Length` declared | `400 request body is not valid JSON` |
+
+The first exists because a JSON-B implementation binds an array to a single-valued field by taking
+its **last** element: left alone, `"limitPrice": [1,2,3]` fills at `3` while any gateway, inline
+control or audit reader that takes the first element believes the price was `1`, and
+`"symbol": ["RSTRA"]` is unwrapped before the restricted-symbol control ever sees a symbol. The
+second and third exist because a deserializer stops reading at the closing brace: without them a
+body carrying a second order, or a message the caller never finished sending, is indistinguishable
+from a clean submission to the caller and yet carries an instruction this service never ran. Padding
+the document with the whitespace RFC 8259 allows between tokens is not trailing content, so an
+indented or newline-padded body is still accepted.
+
+What this does **not** refuse is a property the request model does not declare. Unknown members are
+ignored, structures included, so a caller that posts a response entity back — `execution` object,
+`controlResults` array and all — is answered with the engine's own values rather than a `400`; only
+the fields that bind are held to one value. A field of the wrong *scalar* type is refused where it
+always was: a `"quantity": true` cannot be read at all and answers the fixed
+`request body is not valid JSON`, while a numeric string is read and then validated.
+
 #### Paging the collection endpoints
 
 Every collection that grows takes `offset` and `limit` query parameters and serializes at most one
@@ -1531,15 +2043,17 @@ change — and the metadata travels in headers beside it:
 | `X-Total-Count` | Records in the whole collection this page was cut from, after any `status`, `owner`, `entityType` or `entityId` filter. Compare it with the page size to know whether you are holding all of it |
 | `X-Page-Offset` | The offset this page starts at, after clamping |
 | `X-Page-Limit` | The page size **actually applied**, after clamping. This is the number a traversal steps by — a `limit` of 1000 is served as 500, and a walk stepping by what it asked for would skip half the collection |
-| `Link` | RFC 8288 relations `first`, `prev`, `next` and `last`, each a complete URL carrying every other query parameter this request sent. `next` is present only when records remain, so its absence is the end of the collection |
+| `Link` | RFC 8288 relations `first`, `prev`, `next` and `last`, each a path-and-query reference — `</execution-control/orders?offset=1&limit=1>` — carrying every other query parameter this request sent. No scheme and no host, for the reason the `Location` header carries none either, so a target is resolved against the URL the page was read from. `next` is present only when records remain, so its absence is the end of the collection |
 
 `GET /audit` is where this matters most: it returns at most 500 of a timeline that can hold 150,000
 events, so reading the timeline in full is a traversal rather than one call — and `X-Total-Count`
 is what tells a consumer that, rather than leaving a full page to look like a complete record.
 
 **Traversal by `Link` is the intended access pattern.** Follow `rel="next"` until it is absent; the
-service computes each offset, so no caller has to. Traversing by hand instead works on the same
-terms — step `offset` by `X-Page-Limit`, never by the limit you asked for — and either way
+service computes each offset, so no caller has to. Each target is a path and query rather than a
+full URL, so a walk joins it to the base URL it started from — one line in a client, and the reason
+nothing a caller puts in `Host` can send a walk somewhere else. Traversing by hand instead works on
+the same terms — step `offset` by `X-Page-Limit`, never by the limit you asked for — and either way
 `X-Total-Count` is the number of records a complete walk will have read.
 
 Over a collection nothing is writing to, the walk is exact: the ordering is established over the
@@ -1559,17 +2073,20 @@ a consistent picture of any single instant, and a caller that needs one has to r
 
 ```bash
 # Read the whole timeline by following the next link. The first response says how many events
-# there are; the walk ends when the service stops offering a next page.
-URL="https://localhost:9443/execution-control/audit?limit=500"
-while [ -n "$URL" ]; do
-  HEADERS=$(curl -k -s -u stock:trader -D - -o /tmp/ec-page.json "$URL")
+# there are; the walk ends when the service stops offering a next page. Each link is a path, so
+# the walk resolves it against the base URL it chose - which is what a client does with a relative
+# reference, and what keeps the traversal on the host it started on.
+BASE="https://localhost:9443"
+NEXT="/execution-control/audit?limit=500"
+while [ -n "$NEXT" ]; do
+  HEADERS=$(curl -k -s -u stock:trader -D - -o /tmp/ec-page.json "$BASE$NEXT")
   printf 'total=%s applied-limit=%s\n' \
     "$(printf '%s' "$HEADERS" | awk 'tolower($1)=="x-total-count:"{print $2}' | tr -d '\r')" \
     "$(printf '%s' "$HEADERS" | awk 'tolower($1)=="x-page-limit:"{print $2}' | tr -d '\r')"
   cat /tmp/ec-page.json          # …or hand the page to whatever consumes it
 
-  # The next page's URL, taken from the Link header; empty on the last page, which ends the loop.
-  URL=$(printf '%s' "$HEADERS" | tr ',' '\n' | sed -n 's/.*<\(.*\)>; rel="next".*/\1/p' | tr -d '\r')
+  # The next page's path, taken from the Link header; empty on the last page, which ends the loop.
+  NEXT=$(printf '%s' "$HEADERS" | tr ',' '\n' | sed -n 's/.*<\(.*\)>; rel="next".*/\1/p' | tr -d '\r')
 done
 ```
 
@@ -1625,38 +2142,47 @@ rather than this service's request path, which is in-memory end to end and makes
 ## Deviations from the frozen implementation plan
 
 The plan this module was built to is frozen, and it pins the Liberty release, two test dependencies,
-the HTTP perimeter, an exhaustive 71-file inventory and an exhaustive endpoint-and-status matrix.
-Ten delivered facts sit outside those pins. Every one of them came out of the module's security
-review, each is deliberate, and each is recorded here with what reverting it would cost.
+four build-plugin versions, the HTTP perimeter, an exhaustive 71-file inventory and an exhaustive
+endpoint-and-status matrix. Each numbered row below is a delivered fact outside those pins. Every
+one of them came out of the module's security review, each is deliberate, and each is recorded here
+with what reverting it would cost.
 
-Two of them — **rows 1 and 4** — have since been re-examined against the running service and carry a
-recorded decision to keep them as delivered. The other eight carry no decision yet and remain
-**ratification pending**. Every row's current status, the evidence behind it and what is still
-outstanding are in [Decisions recorded against these rows](#decisions-recorded-against-these-rows)
-immediately below the table. This register is the evidence a decision rests on rather than the
-decision itself: ratifying a row into the plan is a human act, the plan is frozen and is not edited
-to accommodate any of this, and until an owner acts a row's status is the one stated here.
+**Rows 1, 2, 3 and 4** have since been re-examined against the running service and carry a recorded
+decision to keep them as delivered. The rest carry no decision yet and remain **ratification
+pending**. Every row's current status, the evidence behind it and what is still outstanding are in
+[Decisions recorded against these rows](#decisions-recorded-against-these-rows) immediately below
+the table. This register is the evidence a decision rests on rather than the decision itself:
+ratifying a row into the plan is a human act, the plan is frozen and is not edited to accommodate
+any of this, and until an owner acts a row's status is the one stated here.
 
 | # | What the plan pins | What is delivered instead | Where it lives | Why it diverges |
 | --- | --- | --- | --- | --- |
 | 1 | Liberty **25.0.0.9** as both the container base image and the integration-test assembly, the latter as `com.ibm.websphere.appserver.runtime:wlp-webProfile10` (§0.1.3, §0.3.1, §0.6.1, §0.8.1) | Liberty **26.0.0.9** in both: the digest-pinned base image `icr.io/appcafe/open-liberty:26.0.0.9-full-java21-openj9-ubi-minimal`, and the test assembly `io.openliberty:openliberty-runtime:26.0.0.9` | `Dockerfile` `FROM`; the `liberty-maven-plugin` `<assemblyArtifact>` in `pom.xml`; quoted in [Container](#container) and [Build and test](#build-and-test) | Liberty 17.0.0.3 through 26.0.0.7 sit inside the servlet request/response smuggling advisories **CVE-2026-15064** (CWE-444, inconsistent interpretation of HTTP requests, CVSS 3.1 **8.7 High**) and **CVE-2026-15325**; the fixes first ship in 26.0.0.8. The Web Profile assembly publishes no release past 26.0.0.4 — itself inside that range — so the full runtime assembly is the only way to hold the test server at the release the image runs |
-| 2 | `org.apache.cxf:cxf-rt-rs-client` **4.1.1** (§0.3.1) | **4.1.8**, test scope | `pom.xml` test dependencies | 4.1.1 brings `cxf-core` 4.1.1, affected by **CVE-2026-49875** / GHSA-gw93-jmqp-6572 (XXE, CWE-611) and fixed in 4.1.6 |
-| 3 | `org.eclipse.parsson:parsson` **1.1.7** (§0.3.1) | **1.1.9**, test scope | `pom.xml` test dependencies | **CVE-2026-9563**: 1.1.5 through 1.1.7 impose no JSON input-size limit (CWE-400) |
-| 4 | A single `httpEndpoint`, mirroring the broker's (§0.6.1) | Two endpoints, one per scheme, each with its own `<headers>` policy, plus `httpOptions removeServerHeader="true"` and `webContainer disableXPoweredBy="true"` | `src/main/liberty/config/server.xml`; described under [Standalone Kubernetes deployment](#standalone-kubernetes-deployment) | The mirrored endpoint advertised the server signature, `X-Powered-By` and `$WSEP` and set no `X-Content-Type-Options`, cache policy or HSTS (CWE-200, CWE-693). Liberty scopes a header policy to an endpoint and not to a scheme, so one endpoint serving both ports cannot assert HSTS to TLS clients alone — and RFC 6797 has a cleartext client ignore it |
+| 2 | `org.apache.cxf:cxf-rt-rs-client` **4.1.1** (§0.3.1) | **4.1.8**, test scope | `pom.xml` test dependencies | 4.1.1 brings `cxf-core` 4.1.1, affected by **CVE-2026-49875** / GHSA-gw93-jmqp-6572 (XXE, CWE-611) and fixed in 4.1.6. The supply-chain review then found a second advisory on the same artefact — **CVE-2026-50645** / GHSA-ghvc-7hp8-2g2v, no per-message limit on attachment headers (CWE-770, availability High), fixed in 4.1.7 — which is why the delivered version is 4.1.8 rather than 4.1.6 |
+| 3 | `org.eclipse.parsson:parsson` **1.1.7** (§0.3.1) | **1.1.9**, test scope | `pom.xml` test dependencies | **CVE-2026-9563**: 1.1.5 through 1.1.7 impose no JSON input-size limit (CWE-400). The fix is 1.1.8; the NVD record scores it 7.5 and names "published Maven Central artifacts before version 1.1.8" |
+| 4 | A single `httpEndpoint`, mirroring the broker's (§0.6.1) | Two endpoints, one per scheme, each with its own `<headers>` policy — `X-Content-Type-Options`, `Cache-Control`, `X-Frame-Options`, `Referrer-Policy` and a conditional `Content-Security-Policy` on both, `Strict-Transport-Security` on the TLS one, with `$WSEP` and `io.openliberty.trace` removed from both — plus `httpOptions removeServerHeader="true"` and `webContainer disableXPoweredBy="true"` | `src/main/liberty/config/server.xml`; described under [Standalone Kubernetes deployment](#standalone-kubernetes-deployment) | The mirrored endpoint advertised the server signature, `X-Powered-By` and `$WSEP` and set no `X-Content-Type-Options`, cache policy or HSTS (CWE-200, CWE-693). Liberty scopes a header policy to an endpoint and not to a scheme, so one endpoint serving both ports cannot assert HSTS to TLS clients alone — and RFC 6797 has a cleartext client ignore it. The three document policies close the same class of gap on the HTML this origin still serves — Liberty's `403` page and the Swagger UI — where framing and referrer leakage were unrestricted (CWE-1021, CWE-200); and `io.openliberty.trace`, which `mpTelemetry` adds to every application response, named the runtime and handed every caller a per-request trace id, which is exactly what the other three suppressions exist to prevent |
 | 5 | An exhaustive 71-file inventory, with three typed lifecycle failures and three `ExceptionMapper`s (§0.2.3, §0.6.1) | 78 files: a fourth typed failure, a fourth mapper, one package-private paging helper, and the four capacity classes that make the ceilings configurable and publish their headroom | `lifecycle/CapacityExceededException.java`, `rest/CapacityExceededExceptionMapper.java`, `rest/PageBounds.java`, `dao/CapacityLimits.java`, `dao/CapacityLimitsProducer.java`, `dao/AdmissionCounter.java`, `health/AdmissionCapacityReport.java` | The ceilings under [Admission capacity](#admission-capacity) need a refusal no existing mapper expresses, and one clamped page-bounds helper keeps the 500-record policy in a single place. Both answer CWE-770 / CWE-400 — unbounded growth in a process that evicts nothing. The four capacity classes make each ceiling one environment variable read through the same MicroProfile Config mechanism as the control limits, and surface its remaining headroom in the health data, so an exhausted ceiling is an operator-sizeable and observable condition rather than a permanent refusal cleared only by a restart |
 | 6 | The status matrix 201 and 200 on success, 400, 401, 403, 404 and 409 on failure (§0.7.1, §0.8.4) | The same, plus **`503 Service Unavailable`** for an exhausted ceiling, whose `message` names the `*_CAPACITY` variable to raise | `rest/CapacityExceededExceptionMapper.java`; documented beside the failure-code table under [API endpoints](#api-endpoints) and in full under [Admission capacity](#admission-capacity) | The same root cause as row 5. `503` rather than `429` because the exhausted ceiling belongs to the service and not to the caller, and it is decided after identity and legality, so no caller loses the `400`, `404` or `409` it earned. The ceilings are configurable, so the body carries the remedy — the variable to raise — rather than only the diagnosis, and `admission` in the health data reports whether the service is still accepting before any caller sees this code |
 | 7 | Fourteen handlers whose only query parameters are `status`, `owner`, `entityType` and `entityId` (§0.7.1) | The same fourteen handlers, five of them additionally accepting optional `offset` and `limit` and answering with `X-Total-Count`, `X-Page-Offset`, `X-Page-Limit` and an RFC 8288 `Link`; `POST /orders` additionally answers with `Location` | `rest/{OrderResource,SettlementExceptionResource,AuditResource,ReferenceDataResource}.java`, `rest/PageBounds.java`; documented under [Paging the collection endpoints](#paging-the-collection-endpoints) | A full read serialized the whole estate. The parameters are optional and clamped rather than validated, so a caller that sends neither sees exactly the body it saw before for any collection under 500 records. The metadata is what keeps the bound honest against §0.1.1's audit timeline "readable in full": a page that reports the size of the collection it was cut from is traversable, where a silently truncated one reads as complete. Headers and not a body envelope, so every collection response stays the bare JSON array §0.7.2's labelling contract and every example here describe |
 | 8 | The same 71-file inventory and its three `ExceptionMapper`s (§0.2.3, §0.6.1) | 80 files: two further mappers, `JsonbExceptionMapper` and `ProcessingExceptionMapper`, so a request body JSON-B cannot read answers `400` with the fixed text `request body is not valid JSON` instead of the runtime's default `500` carrying the deserializer's own message | `rest/JsonbExceptionMapper.java`, `rest/ProcessingExceptionMapper.java` | The plan's `400` for a bad request (§0.7.1) had no mapper behind it for a body that never reached validation, and the default answer named internal types and fields — CWE-209. `400` is already in the plan's status matrix, so this adds files, not a status |
-| 9 | `web.xml` carrying the roles and the three constraint elements of §0.7.1 and nothing else, with the plan's whole error surface being those `ExceptionMapper`s (§0.6.1, §0.7.1) | The same constraints, plus six `<error-page>` mappings, the servlet they resolve to, and one further mapper, so a refusal decided before or after a resource method runs carries the same `{status, error, message, path}` envelope as one the application decides | `src/main/webapp/WEB-INF/web.xml`, `rest/ContainerErrorServlet.java`, `rest/WebApplicationExceptionMapper.java`; described under [API endpoints](#api-endpoints) | A URI the web container refuses to decode was answered with the container's HTML page naming the runtime class and line that threw (CWE-209), and a path, method, media type or `Accept` header the Jakarta REST runtime refused was answered with a status and no body at all. Every one of those statuses is already in the plan's matrix, so this adds files, not a status |
+| 9 | `web.xml` carrying the roles and the three constraint elements of §0.7.1 and nothing else, with the plan's whole error surface being those `ExceptionMapper`s (§0.6.1, §0.7.1) | The same constraints, plus six `<error-page>` mappings, the servlet they resolve to, and one further mapper, so a refusal decided before or after a resource method runs carries the same `{status, error, message, path}` envelope as one the application decides — held there on every request by two runtime settings the plan does not mention, `-DinvocationCacheSize=0` in `jvm.options` and `webContainer displayCustomizedExceptionText` in `server.xml`, and carved out in exactly one place: a URI the web container will not decode is refused before a web application is selected and answers the runtime's own `400`, which no error page, filter or Liberty setting can replace | `src/main/webapp/WEB-INF/web.xml`, `rest/ContainerErrorServlet.java`, `rest/WebApplicationExceptionMapper.java`, `src/main/liberty/config/jvm.options`, `src/main/liberty/config/server.xml`; described under [API endpoints](#api-endpoints) | A URI the web container refuses to decode was answered with the container's HTML page naming the runtime class and line that threw (CWE-209), and a path, method, media type or `Accept` header the Jakarta REST runtime refused was answered with a status and no body at all. Every one of those statuses is already in the plan's matrix, so this adds files, not a status. The two runtime settings close the same disclosure where the mappings alone could not reach it: the invocation cache kept a servlet wrapper for a URI the container had refused and answered every second encoded-separator traversal with a `500` naming the class and line that threw, and the customized exception text bounds any container-decided page that remains. The carve-out is published rather than papered over, with the gateway rule that closes it, so the envelope this service promises is the envelope it delivers |
 | 10 | The three stores and `AuditTimeline` have "no dependencies and a single public no-arg constructor" (§0.6.2) | Each also has a public `@Inject` constructor taking `CapacityLimits`; the public no-arg constructor is retained and delegates to `CapacityLimits.defaults()` | `dao/{OrderStore,SettlementExceptionStore,ReferenceDataStore}.java`, `audit/AuditTimeline.java` | A ceiling that is configuration has to reach the structure it bounds, and the constructor is the only place it can arrive once and be final. The no-arg constructor stays, so CDI can still generate the `@ApplicationScoped` proxy and the unit tests still build the whole graph with `new` and no mocking library; a graph built that way carries exactly the shipped defaults, so nothing the plan specifies changes for a deployment that configures nothing. The alternative — threading a ceiling through `append(...)`, `evaluateAndFill(...)` and `putPosition(...)` — would scatter the invariant across every caller and let two callers of one store disagree on it |
+| 11 | Two telemetry keys in `microprofile-config.properties`, `otel.sdk.disabled=false` and `otel.exporter.otlp.endpoint`, mirroring the broker (§0.3.2.2, §0.6.1) | The same two, and a third: `otel.propagators=tracecontext` | `src/main/resources/META-INF/microprofile-config.properties`; documented under [Telemetry](#telemetry) | The SDK is enabled, and OpenTelemetry's own propagator default installs the W3C baggage propagator, which below 1.62.0 allocates without bound while parsing an inbound `baggage` header — **CVE-2026-45292** / GHSA-rcgg-9c38-7xpx (CWE-770), on unauthenticated request paths as much as authenticated ones. No Open Liberty release ships a fixed SDK: 26.0.0.9, the newest, carries OpenTelemetry 1.48.0. Naming only `tracecontext` leaves that propagator uninstalled while trace-context propagation and every `@WithSpan` span survive, so the control costs nothing the plan asked for |
+| 12 | `maven-war-plugin` **3.4.0**, `maven-compiler-plugin` **3.14.0**, `maven-resources-plugin` **3.3.1** and `liberty-maven-plugin` **3.11.5**, with no plugin-level dependency overrides (§0.3.1) | **3.5.1**, **3.16.0**, **3.5.0** and **3.12.3**, plus four pinned plugin dependencies: `plexus-utils` 4.0.3 on the war, resources and JaCoCo plugins, `commons-io` 2.22.0 on JaCoCo, and `plexus-archiver` 4.14.0 on the war plugin | `pom.xml` `<build><plugins>` | The plan's pins put eight advisory groups on the build classpath: `plexus-utils` CVE-2025-67030, `commons-io` CVE-2024-47554, `plexus-archiver` CVE-2023-37460, three `commons-compress` advisories, `commons-lang3` CVE-2025-48924, `snappy` CVE-2024-36124 and two `jackson-core` advisories. The version bumps close every one except `plexus-utils` and JaCoCo's `commons-io`, for which no release of the owning plugin ships a fixed artefact — hence the overrides. `plexus-archiver` 4.14.0 is pinned because the 4.10.4 that war 3.5.1 resolves brings `io.airlift:aircompressor` 0.27 (CVE-2025-67721), and 4.14.0 drops that dependency rather than upgrading it. JaCoCo itself stays at the pinned 0.8.13: no later release fixes anything here. None of these artefacts ships in the WAR or the image, so the exposure is the build host — which is where the estate's release engineering runs |
+| 13 | The war plugin configured with `failOnMissingWebXml=false` (§0.6.1) | The same, plus `<archive><addMavenDescriptor>false</addMavenDescriptor></archive>` | `pom.xml` war-plugin configuration | The plugin otherwise writes `META-INF/maven/com.stocktrader/execution-control/pom.xml` and `pom.properties` into the deployed WAR, handing anyone who obtains that artefact a version-precise inventory of every dependency it was built against (CWE-200). Liberty never reads `META-INF/maven`, so nothing at runtime notices the absence |
+| 14 | The seven build plugins of §0.3.1, and no others | The same seven, plus `org.owasp:dependency-check-maven` 13.0.0 inside an opt-in `dependency-check` profile that no default build activates | `pom.xml` `<profiles>`; documented under [Dependency and image scanning](#dependency-and-image-scanning) | The estate carries no software-composition analysis, and the review that asked for one could not run it: Dependency-Check 9 and later require an NVD API key, which no build host here provides. Carrying the profile makes the scan a pinned, configured, ready-to-run procedure the moment a key exists, instead of a command someone reconstructs under pressure. It is inactive by default, so a build without a key behaves exactly as the plan's build does |
+| 15 | `includes/{basic,none,oidc,ldap}.xml` as verbatim copies of the broker's, whose byte-for-byte identity is what the estate's JWT trust rests on (§0.2.3, §0.4.2) | The same four files with exactly one element deleted from three of them: `<jwtBuilder id="defaultJWT" keyStoreRef="defaultTrustStore" keyAlias="jwtSigner" issuer="${JWT_ISSUER}" audiences="${JWT_AUDIENCE}"/>` is gone from `none.xml`, `basic.xml` and `ldap.xml` (`oidc.xml` never carried it). Nothing else in any of the four differs, and the `mpJwt` consumer, `trust.p12` and the `${JWT_ISSUER}`/`${JWT_AUDIENCE}` values are untouched | `src/main/liberty/config/includes/{none,basic,ldap}.xml`; described under [Server and identity](#server-and-identity) and [The runtime endpoints beside the application](#the-runtime-endpoints-beside-the-application) | That element made Liberty's token endpoint sign with the estate's shared `jwtSigner` key, so every identity the active registry authenticated — including accounts holding neither role — could mint an RS256 token carrying the estate issuer and audience, which the sibling services that bind `StockTrader` to `ALL_AUTHENTICATED_USERS` would honour as a write privilege (CWE-269, CWE-522). The estate trust the plan protects is carried by the `mpJwt` consumer and `trust.p12`, both unchanged, so nothing about accepting the estate's tokens moves; what the deletion removes is this module's ability to *issue* them. Deletion alone would not close it — the runtime auto-provides a builder (row 12) — but leaving the estate alias declared in a file whose only purpose here is verification would re-arm the endpoint the moment row 12 were reverted |
+| 16 | `server.xml` carrying the feature set, the port variables, the keystores, the `AUTH_TYPE`/JWT variables, the include, `ltpa` and the `webApplication`, with the two documented omissions and nothing else (§0.6.1, §0.4.2) | The same, plus three elements between `ltpa` and `webApplication`: `<webAppSecurity useAuthenticationDataForUnprotectedResource="false" singleSignonEnabled="false" ssoRequiresSSL="true" sameSiteCookie="Strict"/>`, `<httpDispatcher enableWelcomePage="false" appOrContextRootMissingMessage="Not Found"/>` and `<jwtBuilder id="defaultJWT" keyStoreRef="defaultKeyStore" keyAlias="execution-control-mints-no-tokens"/>` | `src/main/liberty/config/server.xml`; described under [Server and identity](#server-and-identity), [The runtime endpoints beside the application](#the-runtime-endpoints-beside-the-application) and [Authentication across a restart](#authentication-across-a-restart) | Each closes one measured defect that no application code can reach. `useAuthenticationDataForUnprotectedResource="false"`: Liberty authenticated the unprotected runtime endpoints opportunistically, and in the registry-less MP-JWT modes the basic-auth authenticator then dereferenced a null `UserRegistry`, so any `Authorization` header turned `/health/*` and `/openapi` into `500` with an internal `NullPointerException` — the platform probe contract of §0.4.5 and §0.7.1 failing for any ingress that forwards a credential (CWE-248, CWE-209). `singleSignonEnabled="false"`: the `StockTraderSSO` cookie was a complete credential, was accepted over the cleartext listener and was evaluated ahead of the `Authorization` header, so the audit `actor` followed the cookie rather than the presented credential, which §0.4.2 and §0.7.2 require (CWE-287, CWE-614); `ssoRequiresSSL` and `sameSiteCookie` remain as defence in depth for a deployment that re-enables SSO. `httpDispatcher`: the server root served Liberty's welcome page naming the product and its exact release, and a miscased probe path served its "Context Root Not Found" page (CWE-200). `jwtBuilder`: the fix for row 11 — the endpoint cannot be unpublished, because `jwt-1.0` arrives with the mandated `microProfile-7.1` umbrella and its bundles expose no setting, and a deleted builder is auto-provided again with the same estate key, so pinning the id to an alias no keystore holds is what stops it signing; it lives in `server.xml` rather than an include so it covers all four `AUTH_TYPE` modes. No port, context root, status, endpoint, role or feature changes, and the module's own gate is green on all of it |
 
 ### Decisions recorded against these rows
 
 | Row(s) | Decision of record | Recorded | Still outstanding |
 | --- | --- | --- | --- |
-| 1 | **Keep as delivered.** Do not revert the Liberty runtime to 25.0.0.9 — neither the base image nor the test assembly | 2026-09-22, by the module's infrastructure and configuration review (its finding F02), which re-verified the delivered runtime against a running container built from this tree | An owner's ratification of the plan amendment, and a separate estate-level decision for the sibling services still running 25.0.0.9 |
+| 1 | **Keep as delivered.** Do not revert the Liberty runtime to 25.0.0.9 — neither the base image nor the test assembly | 2026-09-22, by the module's infrastructure and configuration review (its finding F02), which re-verified the delivered runtime against a running container built from this tree; re-affirmed the same day by its supply-chain review (finding G4-10), which confirmed 26.0.0.9 is the current Open Liberty fix pack and that no later release exists | An owner's ratification of the plan amendment, **and the estate-level action this row implies**: `broker`, `portfolio` and `trader` still run the tag-only `icr.io/appcafe/open-liberty:25.0.0.9-full-java21-openj9-ubi-minimal`, inside the affected range of CVE-2026-15064, CVE-2026-15325, CVE-2026-15328 and CVE-2026-14981. Each should be moved to `26.0.0.9` and digest-pinned. Those modules are outside this module's write scope, so the change belongs to whoever owns them |
+| 2, 3 | **Keep as delivered.** Do not revert the test REST client to `cxf-rt-rs-client` 4.1.1 or the test JSON parser to `parsson` 1.1.7 | 2026-09-22, by the module's supply-chain security review (findings G4-10 and G4-02), which re-verified both advisories against the NVD and OSV records and both delivered versions against the resolved dependency tree | An owner's ratification of the plan amendment |
 | 4 | **Keep as delivered.** Keep the two scheme-specific `httpEndpoint` elements and the header policy | 2026-09-22, by the same review (its finding F03), which re-verified both listeners and their response headers against that container | An owner's ratification of the plan amendment |
-| 2, 3, 5, 6, 7, 8, 9, 10 | None recorded — ratification pending | — | An owner's decision on each |
+| 11, 12, 13, 14 | None recorded — ratification pending. Each was delivered in answer to a specific supply-chain finding — G4-01, G4-02, G4-04 and G4-03 respectively — and each is verified in this tree rather than argued; the evidence is below | — | An owner's decision on each |
+| 5, 6, 7, 8, 9, 10, 15, 16 | None recorded — ratification pending | — | An owner's decision on each |
 
 What that review observed, so either decision can be audited without re-running it.
 
@@ -1679,23 +2205,66 @@ header, both carry `X-Content-Type-Options: nosniff` and `Cache-Control: no-stor
 response carries `Strict-Transport-Security: max-age=31536000` — the per-endpoint scoping that one
 shared endpoint cannot express.
 
+The three document policies and the removal of `io.openliberty.trace` were added to both blocks
+afterwards, on the module's runtime security review, which measured the policy over thirteen
+response classes across both listeners — `200`, `401`, `403` (Liberty's own page, the one HTML
+error document left), `404`, `405`, the pre-dispatch `400`, an `OPTIONS` refusal, `/health/ready`,
+`/openapi` and `/openapi/ui/` — and found `X-Frame-Options`, `Content-Security-Policy` and
+`Referrer-Policy` absent from every one of them, and `io.openliberty.trace` present on every
+response the application produced, carrying that request's own trace and span id. All thirteen now
+answer with `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer` and no trace header, and twelve
+of them with `default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`. The
+thirteenth is `/openapi/ui/`, which keeps the runtime's own `default-src 'self'; script-src 'self'
+'unsafe-inline'; …` and still renders every operation — the reason that one header is conditional,
+measured rather than assumed: a browser enforces the intersection of two policies, so overriding
+this one blanks the page. Framing was then attempted from a cross-origin page: both the JSON API
+and the Swagger UI were refused, the first by `frame-ancestors 'none'` and the second by
+`X-Frame-Options: DENY` alone, each frame ending as an empty document.
+
+**Rows 2 and 3.** `mvn dependency:list` on the delivered tree resolves `org.apache.cxf:cxf-core`
+4.1.8 and `org.eclipse.parsson:parsson` 1.1.9, and an OSV.dev query over all 60 resolved coordinates
+returns no advisory against either. The same query returns GHSA-ghvc-7hp8-2g2v against `cxf-core`
+4.1.1, with 4.1.7 as its first fixed release; parsson's advisory is published through the NVD rather
+than OSV, and that record gives CVE-2026-9563 a base score of 7.5 with the fix in 1.1.8. Both
+artefacts are test scope and absent from the WAR and the image, so the revert cost is a build-time
+exposure rather than a runtime one — and there is nothing on the other side of it to gain.
+
+**Rows 11 to 14.** Each is verified in the tree rather than argued. Row 11: an invalid
+`otel.propagators` value placed in the shipped properties file makes the running container log
+`io.opentelemetry.sdk.autoconfigure.spi.ConfigurationException: Unrecognized value for
+otel.propagators`, which is what proves the file's value — not a default — is what the SDK
+autoconfiguration reads, and the shipped `tracecontext` produces no such error while the same
+container answers `200` to a request carrying a `baggage` header. Row 12: the plugin realms Maven
+populates carry `plexus-utils` 4.0.3, `commons-io` 2.20.0 or later, `plexus-archiver` 4.14.0,
+`commons-compress` 1.28.0, `commons-lang3` 3.18.0 or later and `jackson-core` 2.21.4, and an OSV
+query over all 79 coordinates on the seven declared plugins' realms returns nothing. Row 13: the
+packaged WAR has no `META-INF/maven` entry, and its manifest still carries only `Created-By` and
+`Build-Jdk-Spec`. Row 14: `mvn -Pdependency-check dependency-check:check` reaches the pinned plugin
+and stops only at the absent NVD key, while a default `mvn clean verify` never mentions it.
+
 A recorded decision is narrower than a ratification. It settles the code — this is what ships, and
 this is why a revert was refused — and it leaves the plan amendment, the act that makes a delivered
-fact the pinned one, to the owner. Until that happens, read rows 1 and 4 as settled for the code and
-open for the plan, and the remaining eight as open for both.
+fact the pinned one, to the owner. Until that happens, read rows 1 to 4 as settled for the code and
+open for the plan, and the remaining rows as open for both.
 
 ### What ratification does and does not decide
 
-Functionally these ten change nothing the plan specifies. The same three Liberty features are
-enabled, the ports, context root, WAR name and probe paths are unchanged, the fourteen handlers and
-their success codes are unchanged, and the module's own gate — unit tests, integration tests against
-a started Liberty server, and both line-coverage gates — is green on the delivered tree. Rows 1 to 4
-are a runtime and a perimeter the plan could not have named, because the advisories post-date it;
-rows 5 to 7 are the smallest surface that bounds a service holding all of its state in memory,
-and rows 8 and 9 close the two answers the plan's status matrix lists but left to a default — a
+Functionally none of these rows changes anything the plan specifies. The same three Liberty features
+are enabled, the ports, context root, WAR name and probe paths are unchanged, the fourteen handlers
+and their success codes are unchanged, and the module's own gate — unit tests, integration tests
+against a started Liberty server, and both line-coverage gates — is green on the delivered tree.
+Rows 1 to 4 are a runtime and a perimeter the plan could not have named, because the advisories
+post-date it; rows 5 to 7 are the smallest surface that bounds a service holding all of its state in
+memory; rows 8 and 9 close the two answers the plan's status matrix lists but left to a default — a
 client-triggerable `500` carrying the deserializer's own message, and a refusal rendered by the
-container or the Jakarta REST runtime rather than by this service — while row 10 is what lets those
-bounds be sized by the operator who has to live with them.
+container or the Jakarta REST runtime rather than by this service — row 10 is what lets those bounds
+be sized by the operator who has to live with them, and rows 11 to 14 are the build descriptor and
+one configuration key: an advisory in the runtime's own telemetry library that only configuration
+can reach, advisory-bearing artefacts on the build classpath, a dependency inventory the deployed
+artefact need not carry, and a scan procedure the estate did not have. Rows 15 and 16 are the identity and
+runtime-perimeter elements the module's security review measured on the running service: they move
+no endpoint, status, role or feature, and one of them is what stops this service issuing
+estate-signed tokens.
 
 **No row may be reverted to bring the code back to the plan.** Reverting row 1 returns the service
 to a Liberty release inside the smuggling-advisory range; rows 2 and 3 to a test client and parser
@@ -1703,28 +2272,40 @@ with known CVEs; row 4 to advertising its product and version and asserting no c
 policy over authenticated JSON; rows 5 to 7 to stores that grow until the heap is gone and
 collection reads that serialize everything they hold; row 8 to a malformed body answered `500`
 with the deserializer's text; row 9 to an HTML error page naming the runtime class that threw and to
-bodyless statuses no client can parse; and row 10 to ceilings no deployment can size, where the only
-remedy for an exhausted one is a restart that discards every record.
+bodyless statuses no client can parse; row 10 to ceilings no deployment can size, where the only
+remedy for an exhausted one is a restart that discards every record; row 11 to parsing an inbound
+`baggage` header with an OpenTelemetry release that puts no bound on it, on unauthenticated requests
+included; row 12 to eight advisory groups on the build classpath, one of them a path traversal in
+the archive extractor the build runs; row 13 to shipping a version-precise dependency inventory
+inside the deployed WAR; and row 14 to having no scan procedure at all, which is how the estate
+arrived at a module-by-module reconstruction of one. Reverting rows 15 and 16
+returns the service to issuing estate-signed tokens to every identity its registry authenticates, to
+probes that answer `500` to any credential presented, to an SSO cookie that outranks the credential
+on the request carrying it, and to a welcome page naming the product and its exact release.
 
 What an owner has to settle is narrower than the list looks, because some rows are one decision:
 row 1 is a single runtime choice spanning the image and the test assembly, which must stay in step
-on every upgrade, and rows 5 and 6 are a single refusal design — the status is what the mapper
-exists to return. Declining a row is only sound if its replacement carries the same protection: for
-row 1 that means Liberty 26.0.0.8 or later whatever assembly it arrives in, for rows 5 to 7 an
-eviction policy or a datastore, never the removal of the ceilings, for row 8 any mapper that
-answers the same fixed `400`, for row 9 any arrangement that keeps container internals out of an
-error body and puts this service's envelope on the statuses it does not decide, and for row 10 any
-other route by which a configured ceiling reaches the structure it bounds — eviction is not one,
-because the timeline has no delete path and discarding orders would break the `clientOrderId`
-idempotency contract.
+on every upgrade, rows 5 and 6 are a single refusal design — the status is what the mapper exists to
+return — and rows 12 to 14 are one build descriptor, none of which reaches the deployed service.
+Declining a row is only sound if its replacement carries the same protection: for row 1 that means
+Liberty 26.0.0.8 or later whatever assembly it arrives in, for rows 5 to 7 an eviction policy or a
+datastore, never the removal of the ceilings, for row 8 any mapper that answers the same fixed
+`400`, for row 9 any arrangement that keeps container internals out of an error body and puts this
+service's envelope on the statuses it does not decide, for row 10 any other route by which a
+configured ceiling reaches the structure it bounds — eviction is not one, because the timeline has
+no delete path and discarding orders would break the `clientOrderId` idempotency contract — for row
+11 a runtime carrying OpenTelemetry 1.62.0 or later, after which the upstream propagator list is
+safe again, and for rows 12 to 14 any other way of keeping the build classpath clear of known-
+vulnerable artefacts, the dependency inventory out of the shipped artefact, and a runnable scan
+within reach.
 
 **Ratifying a row** means recording a decision against its number — accepted as a deviation from
-the plan, or accepted as an addition to the plan's file and API inventories for rows 5 to 10 — with
-the owner's name and the date, in whatever register governs the plan; the plan itself is frozen and
-is not edited to accommodate any of this. The rows are numbered so a decision can cite one without
-restating it, and a ratified row's status belongs in
+the plan, or accepted as an addition to the plan's file, API, configuration and build inventories
+for rows 5 to 14 — with the owner's name and the date, in whatever register governs the plan; the
+plan itself is frozen and is not edited to accommodate any of this. The rows are numbered so a
+decision can cite one without restating it, and a ratified row's status belongs in
 [Decisions recorded against these rows](#decisions-recorded-against-these-rows) beside its number,
 so this document and that decision cannot drift apart — the same table that already carries the
-keep-as-delivered decisions on rows 1 and 4. Two facts an owner should have in hand when deciding:
-nothing in rows 1 to 10 changes an interface a caller or another service depends on, and every one
-of them is exercised by the module's own gate, which is green on the delivered tree.
+keep-as-delivered decisions on rows 1 to 4. Two facts an owner should have in hand when deciding:
+no row changes an interface a caller or another service depends on, and every one of them is
+exercised by the module's own gate, which is green on the delivered tree.

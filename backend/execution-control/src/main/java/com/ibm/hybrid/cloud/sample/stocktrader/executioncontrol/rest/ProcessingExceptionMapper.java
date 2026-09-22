@@ -66,6 +66,17 @@ public class ProcessingExceptionMapper implements ExceptionMapper<ProcessingExce
 		   mistake, logged at FINE, while anything else is unusual enough that an operator should see
 		   it at the default level. Neither relays the cause text, which is what keeps the
 		   deserializer's internals off the wire (CWE-209). */
+		/* Except for the one condition that is not a malformed body at all: a message the HTTP
+		   channel refused for exceeding MessageSizeLimit, which reaches a provider as an
+		   IOException and can be wrapped into this exception by whichever layer was holding the
+		   stream. Answering that 400 would tell a caller its JSON was at fault when the body was
+		   well-formed and merely too large, so the verdict is deferred to IOExceptionMapper, which
+		   gives it the same 413 the Content-Length path already answers. One condition, one
+		   status, whatever wrapped it. */
+		if (IOExceptionMapper.isSizeLimitFailure(exception)) {
+			return IOExceptionMapper.refusalFor(exception, uriInfo.getPath());
+		}
+
 		if (hasJsonFailureCause(exception)) {
 			logger.log(Level.FINE, "Rejecting an unreadable request body on " + uriInfo.getPath(), exception);
 		} else {

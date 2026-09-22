@@ -12,8 +12,6 @@
    limitations under the License.
 -->
 <server>
-    <jwtBuilder id="defaultJWT" keyStoreRef="defaultTrustStore" keyAlias="jwtSigner" issuer="${JWT_ISSUER}" audiences="${JWT_AUDIENCE}" />
-
 <!-- When global.auth=none in the CR yaml (meaning the AUTH_TYPE env var to this container is set to "none"), the server
      is NOT instructed to check for a JWT in the request header.  This can simplify setup and early dev/test (such as for
      a new client UI), but is not intended to be used in a production deployment.  The only differences between "none" and

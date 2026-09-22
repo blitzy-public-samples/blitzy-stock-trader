@@ -36,7 +36,6 @@
     </administrator-role>
 -->
 
-    <jwtBuilder id="defaultJWT" keyStoreRef="defaultTrustStore" keyAlias="jwtSigner" issuer="${JWT_ISSUER}" audiences="${JWT_AUDIENCE}" />
     <mpJwt id="stockTraderJWT" audiences="${JWT_AUDIENCE}" issuer="${JWT_ISSUER}" keyName="jwtSigner" ignoreApplicationAuthMethod="false" expiry="12h" sslRef="defaultSSLConfig"/>
 
     <webAppSecurity displayAuthenticationRealm="true" logoutOnHttpSessionExpire="true" preserveFullyQualifiedReferrerUrl="true"

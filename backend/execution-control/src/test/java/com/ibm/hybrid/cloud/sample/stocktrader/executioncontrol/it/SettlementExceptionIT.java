@@ -112,6 +112,29 @@ class SettlementExceptionIT {
     //Well-formed - identifiers are zero-padded to six digits - but names nothing.
     private static final String UNKNOWN_EXCEPTION_ID = "EXC-999999";
 
+    //Six is the smallest count that distinguishes a refusal held on every request from one that
+    //alternates: the failure this guards against answered correctly on odd requests only.
+    private static final int ENCODED_URI_ATTEMPTS = 6;
+
+    //The URI shapes the web container refuses while decoding, before it has selected a web
+    //application: an encoded null byte, an encoded CR/LF, and a traversal that climbs above the
+    //server root. None of them reaches a resource method or an error page. The fourth documented
+    //shape - a malformed escape such as %zz - is absent because java.net.URI refuses to hold it,
+    //so it cannot be sent through a URI-based client at all.
+    private static final String[] UNDECODABLE_PATHS = {
+        "/orders/%00",
+        "/orders/%0D%0AX-Injected%3A%201",
+        "/orders/..%2F..%2F..%2F..%2Fetc%2Fpasswd"
+    };
+
+    //What no refusal of this service may ever put in a response body, whichever layer composed it:
+    //a runtime package or class name, a stack frame, an HTML error page, a Liberty message
+    //identifier of the SRVE family, or the name of the exception the container caught.
+    private static final String[] DISCLOSURE_MARKERS = {
+        "com.ibm.ws", "com.ibm.wsspi", "com.ibm.hybrid", "RequestUtils", "at com.",
+        "<html", "<H1", "SRVE", "StringIndexOutOfBounds", "java.lang", "openliberty", "wlp/"
+    };
+
     private static final long EXCEPTION_SLA_HOURS = 24L;
     private static final String RESTRICTED_SYMBOL_ONE = "RSTRA";
     private static final String RESTRICTED_SYMBOL_TWO = "RSTRB";
@@ -389,6 +412,63 @@ class SettlementExceptionIT {
                 "The 409 did not name the refused transition: " + duplicate.body);
     }
 
+    /* The size ceiling is enforced on the HTTP channel, so it covers this endpoint exactly as it
+       covers an order submission - but a chunked message declares no length, so the refusal
+       arrives while the application is reading the entity rather than at header-parse time. It is
+       asserted here as well as on POST /orders because the exception endpoints are the other half
+       of the surface that takes a body, and because what must be proved is that a refused
+       assignment changes nothing: unmapped, this answered 500, and a 500 on a workflow verb leaves
+       a caller unable to tell a refused assignment from one that may have taken effect. */
+    @Test
+    void testChunkedOversizeAssignRequestIsRefusedWithTheStandardEnvelope() {
+        JsonObject opened = openOwnException();
+        String exceptionId = opened.getString("exceptionId");
+
+        RawFramingClient.Result refused = RawFramingClient.sendChunked(
+                EXCEPTIONS_URL + "/" + exceptionId + "/assign", "PUT",
+                oversizeAssignBody(), TRADER_AUTHORIZATION);
+
+        Assertions.assertEquals(413, refused.status(),
+                "A chunked assignment body over the size ceiling must be refused 413, not "
+                        + "answered 500: " + refused.body());
+
+        JsonObject error = Json.createReader(new StringReader(refused.body())).readObject();
+        Assertions.assertEquals(413, error.getInt("status", -1),
+                "ErrorResponse status did not repeat the HTTP status: " + refused.body());
+        Assertions.assertTrue(
+                error.getString("message", "").contains("exceeds the configured size limit"),
+                "The 413 did not describe the refusal: " + refused.body());
+        assertNonBlank(error, "error", "The refused assignment");
+        assertNonBlank(error, "path", "The refused assignment");
+        Assertions.assertFalse(refused.body().contains("Chunk size"),
+                "The refusal relayed the channel's own text: " + refused.body());
+
+        //The exception must be exactly as it was: still OPEN, still unowned, and with no event for
+        //an assignment that never happened.
+        RestResult unchanged = get(EXCEPTIONS_URL + "/" + exceptionId);
+        Assertions.assertEquals(200, unchanged.status,
+                "Unexpected status reading " + exceptionId + ": " + unchanged.body);
+
+        JsonObject exception = readObject(unchanged);
+        Assertions.assertEquals(STATUS_OPEN, exception.getString("status", ""),
+                "A refused assignment must leave the exception OPEN: " + unchanged.body);
+        Assertions.assertFalse(exception.containsKey("owner"),
+                "A refused assignment must leave the exception unowned: " + unchanged.body);
+
+        RestResult events = get(EXCEPTIONS_URL + "/" + exceptionId + "/events");
+        Assertions.assertEquals(200, events.status,
+                "Unexpected status reading the events of " + exceptionId + ": " + events.body);
+        Assertions.assertEquals(1, readArray(events).size(),
+                "A refused assignment must write no audit event beyond the opening one: "
+                        + events.body);
+    }
+
+    //An owner far beyond the 64 characters the field accepts, so the message is refused on its
+    //size before its content is ever examined - the validation limit is a different test.
+    private static String oversizeAssignBody() {
+        return Json.createObjectBuilder().add("owner", "A".repeat(20_000)).build().toString();
+    }
+
     /* The status filter and the owner filter have to agree on what an empty value means, and an
        unreadable one has to answer in this service's own error envelope. Bound as the enum, all
        three of these returned a bodyless 404 from the JAX-RS runtime - a status claiming the
@@ -474,6 +554,19 @@ class SettlementExceptionIT {
         Assertions.assertFalse(events.header("Link").contains("rel=\"next\""),
                 "A complete page must not advertise a next page: " + events.header("Link"));
 
+        //On all three of these collections every relation is a path-and-query reference and never
+        //a complete URL: the authority in a request URI is the caller's own Host header, so a
+        //traversal that followed it would walk off this service one page in.
+        for (String header : List.of(firstPage.header("Link"), open.header("Link"),
+                events.header("Link"))) {
+            for (String relation : header.split(",")) {
+                String target = relation.substring(relation.indexOf('<') + 1, relation.indexOf('>'));
+                Assertions.assertTrue(target.startsWith("/" + WAR_CONTEXT + "/exceptions")
+                                && !target.contains("://"),
+                        "A page link carried a scheme or an authority: " + header);
+            }
+        }
+
         //Resolved through assign and resolve, the history is three events, and the paged read
         //reports that growth rather than the page it served.
         Assertions.assertEquals(200, put(EXCEPTIONS_URL + "/" + exceptionId + "/assign",
@@ -527,10 +620,87 @@ class SettlementExceptionIT {
         Assertions.assertTrue(error.getString("path", "").startsWith("/exceptions/"),
                 "The 400 did not report the path, relative to the context root: " + result.body);
 
-        for (String internal : new String[] {"com.ibm.ws", "com.ibm.wsspi", "RequestUtils", "<html"}) {
-            Assertions.assertFalse(result.body.contains(internal),
-                    "The error body disclosed a container internal (" + internal + "): " + result.body);
+        assertDisclosesNoInternals("The encoded-separator refusal", result);
+    }
+
+    /* The same refusal, arranged so that decoding the separators would climb out of the context
+       root - and repeated, because that is the shape that used to alternate. The web container
+       kept a servlet wrapper for the URI it had just refused, and the next identical request took
+       the cached path, which derives the path info by cutting the context root off the
+       canonicalized URI: nine characters against eighteen, an exception inside the container, and
+       the caller reading a 500 page naming the class and line that threw. The server disables
+       that cache (-DinvocationCacheSize=0), so this asserts the envelope on every request rather
+       than on the first. */
+    @Test
+    void testEncodedSeparatorTraversalIsRefusedOnEveryRequest() {
+        String url = ORDERS_URL + "/..%2f..%2fcontrols";
+
+        for (int attempt = 1; attempt <= ENCODED_URI_ATTEMPTS; attempt++) {
+            RestResult result = getEncoded(url);
+
+            Assertions.assertEquals(400, result.status,
+                    "Attempt " + attempt + " did not answer 400: " + result.body);
+
+            JsonObject error = readObject(result);
+            Assertions.assertEquals(400, error.getInt("status"),
+                    "Attempt " + attempt + " did not repeat the HTTP status: " + result.body);
+            Assertions.assertEquals("Bad Request", error.getString("error", ""),
+                    "Attempt " + attempt + " did not carry the reason phrase: " + result.body);
+            Assertions.assertTrue(error.getString("message", "").contains("encoded path separator"),
+                    "Attempt " + attempt + " did not explain the refusal: " + result.body);
+            assertDisclosesNoInternals("Attempt " + attempt, result);
         }
+    }
+
+    /* The one request to this service that answers with a body the application never composes: a
+       URI the web container cannot decode is refused before it selects a web application, so no
+       error page, filter or Liberty setting can put the service envelope there. What this pins is
+       the bound the README publishes - the refusal is a 400, it is reachable without credentials,
+       and it carries no class, stack, product version or service data, with the endpoint's own
+       nosniff and no-store headers still on it. A body that ever grows past that is a regression
+       whether or not the envelope arrives. */
+    @Test
+    void testUndecodableUriIsRefusedWithoutDisclosingInternals() {
+        for (String undecodable : UNDECODABLE_PATHS) {
+            String url = APP_ROOT + undecodable;
+
+            RestResult authenticated = getEncoded(url);
+            Assertions.assertEquals(400, authenticated.status,
+                    "An undecodable URI (" + undecodable + ") did not answer 400: "
+                        + authenticated.body);
+            assertDisclosesNoInternals(undecodable, authenticated);
+            assertCarriesPerimeterHeaders(undecodable, authenticated);
+
+            //Built here rather than through the shared helpers, which all authenticate: the
+            //refusal precedes the security constraints, and an anonymous caller reaching it must
+            //be held to the same bound as an authenticated one.
+            Client client = ClientBuilder.newClient();
+            try {
+                RestResult anonymous = capture(client.target(URI.create(url))
+                        .request(MediaType.APPLICATION_JSON).get());
+                Assertions.assertEquals(400, anonymous.status,
+                        "An unauthenticated caller saw a different status for " + undecodable
+                            + ": " + anonymous.body);
+                assertDisclosesNoInternals(undecodable + " (unauthenticated)", anonymous);
+                assertCarriesPerimeterHeaders(undecodable + " (unauthenticated)", anonymous);
+            } finally {
+                client.close();
+            }
+        }
+    }
+
+    private static void assertDisclosesNoInternals(String context, RestResult result) {
+        for (String internal : DISCLOSURE_MARKERS) {
+            Assertions.assertFalse(result.body.contains(internal),
+                    context + " disclosed a runtime internal (" + internal + "): " + result.body);
+        }
+    }
+
+    private static void assertCarriesPerimeterHeaders(String context, RestResult result) {
+        Assertions.assertEquals("nosniff", result.header("X-Content-Type-Options"),
+                context + " lost the nosniff header: " + result.headers);
+        Assertions.assertEquals("no-store", result.header("Cache-Control"),
+                context + " lost the no-store header: " + result.headers);
     }
 
     /* The two reference-data reads live inside the workflow test rather than in @Test methods of
@@ -950,5 +1120,81 @@ class SettlementExceptionIT {
             Assertions.assertFalse(result.body.contains(marker),
                     posted + " leaked internal text (" + marker + "): " + result.body);
         }
+    }
+
+    @Test
+    void testArrayValuedFieldIsRefusedByAssignAndResolve() {
+        JsonObject opened = openOwnException();
+        String exceptionId = opened.getString("exceptionId");
+        String exceptionUrl = EXCEPTIONS_URL + "/" + exceptionId;
+        int eventsWhenOpened = eventCount(exceptionId);
+
+        /* owner and resolutionNote each carry one value, and a JSON-B implementation binds an array
+           to such a field by taking its LAST element - so ["a1","a2"] would assign a2 while anything
+           reading the body's first element believes a1 owns the break. The body is readable JSON and
+           the fault is one named field of it, so this refusal names the field rather than answering
+           the fixed text an unreadable body gets. */
+        assertFieldShapeRefused(put(exceptionUrl + "/assign", "{\"owner\":[\"a1\",\"a2\"]}"), "owner");
+        assertFieldShapeRefused(put(exceptionUrl + "/assign", "{\"owner\":{\"name\":\"ops\"}}"), "owner");
+        assertFieldShapeRefused(put(exceptionUrl + "/resolve",
+                "{\"owner\":\"" + OWNER + "\",\"resolutionNote\":[\"note\"]}"), "resolutionNote");
+
+        assertNothingMoved(exceptionId, eventsWhenOpened);
+    }
+
+    @Test
+    void testTrailingContentIsRefusedByAssign() {
+        JsonObject opened = openOwnException();
+        String exceptionId = opened.getString("exceptionId");
+        String exceptionUrl = EXCEPTIONS_URL + "/" + exceptionId;
+        int eventsWhenOpened = eventCount(exceptionId);
+
+        /* The document must be the whole entity. A deserializer stops at the closing brace, so a
+           second appended assignment is discarded unseen: the caller reads a 200 naming one owner
+           while anything reading the appended document believes another owns the break. */
+        assertMalformedBodyRefused(put(exceptionUrl + "/assign",
+                assignBody(OWNER) + assignBody("second.owner")), "an assignment with a second document appended");
+        assertMalformedBodyRefused(put(exceptionUrl + "/assign", assignBody(OWNER) + "xyz"),
+                "an assignment with trailing text");
+
+        assertNothingMoved(exceptionId, eventsWhenOpened);
+    }
+
+    /* One assertion set for a body the service could read but whose named field carried the wrong
+       JSON shape - the opposite of assertMalformedBodyRefused, which pins the one fixed message a
+       body with no readable field gets. */
+    private static void assertFieldShapeRefused(RestResult result, String field) {
+        String posted = "a structured " + field;
+
+        Assertions.assertEquals(400, result.status, posted + " must answer 400: " + result.body);
+
+        JsonObject error = readObject(result);
+        Assertions.assertEquals(400, error.getInt("status"),
+                "ErrorResponse status did not repeat the HTTP status for " + posted + ": " + result.body);
+
+        String message = error.getString("message", "");
+        Assertions.assertTrue(message.startsWith(field + " must be a single value"),
+                posted + " did not name the offending field: " + result.body);
+        Assertions.assertNotEquals("request body is not valid JSON", message,
+                posted + " was answered as an unreadable body rather than as a field fault: " + result.body);
+        assertNonBlank(error, "path", "The 400 for " + posted);
+    }
+
+    /* The half of a refusal a client cannot infer from the status: a body refused before binding
+       leaves the workflow where it was and leaves no trace of having been asked for. */
+    private static void assertNothingMoved(String exceptionId, int eventsWhenOpened) {
+        RestResult reread = get(EXCEPTIONS_URL + "/" + exceptionId);
+        Assertions.assertEquals(200, reread.status,
+                "Unexpected status re-reading " + exceptionId + ": " + reread.body);
+
+        JsonObject exception = readObject(reread);
+        Assertions.assertEquals(STATUS_OPEN, exception.getString("status"),
+                "A refused body must leave the exception OPEN: " + reread.body);
+        Assertions.assertFalse(exception.containsKey("owner"),
+                "A refused assignment must not record an owner: " + reread.body);
+        Assertions.assertFalse(exception.containsKey("resolutionNote"),
+                "A refused resolution must not record a note: " + reread.body);
+        Assertions.assertEquals(eventsWhenOpened, eventCount(exceptionId),
+                "A refused body must not append an audit event to " + exceptionId);
     }
 }

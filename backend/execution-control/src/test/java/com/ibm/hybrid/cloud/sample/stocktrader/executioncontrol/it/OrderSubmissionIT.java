@@ -28,12 +28,20 @@ import jakarta.json.Json;
 import jakarta.json.JsonArray;
 import jakarta.json.JsonObject;
 
+import java.io.IOException;
+import java.io.OutputStream;
 import java.io.StringReader;
 import java.math.BigDecimal;
+import java.net.InetAddress;
+import java.net.Socket;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
 
@@ -68,6 +76,11 @@ class OrderSubmissionIT {
 
     private static final int MAX_RETRY_COUNT = 5;
     private static final int SLEEP_TIMEOUT = 3000;
+
+    //The authority a caller must never see reflected back at it. Reserved by RFC 6761 for exactly
+    //this kind of use, so no test of this suite can ever resolve or reach it.
+    private static final String FORGED_HOST = "evil.example";
+    private static final int SOCKET_READ_TIMEOUT = 15000;
 
     //AUTH_TYPE=none activates includes/none.xml, whose basicRegistry puts "stock" in the
     //StockTrader group web.xml requires for POST. The header is assembled by hand rather than
@@ -332,16 +345,55 @@ class OrderSubmissionIT {
         String orderId = readObject(result).getString("orderId");
         String location = result.header(LOCATION_HEADER);
         Assertions.assertNotNull(location, "A 201 must name the created order in a Location header");
-        Assertions.assertTrue(location.endsWith("/orders/" + orderId),
-                "Location did not address the created order: " + location);
+        //An absolute-path reference and nothing more. The scheme and authority of a request URI
+        //come from the caller's own Host and X-Forwarded-Proto headers, so a Location built from
+        //them would hand back an address the caller chose as this service's own.
+        Assertions.assertEquals("/" + WAR_CONTEXT + "/orders/" + orderId, location,
+                "Location was not the path of the created order: " + location);
+        Assertions.assertTrue(location.startsWith("/") && !location.contains("://"),
+                "Location carried a scheme or an authority: " + location);
 
-        //The header is only worth carrying if it resolves, so it is followed rather than parsed:
-        //the order that comes back has to be the one the submission reported.
-        RestResult followed = get(location);
+        //The header is only worth carrying if it resolves, so it is followed rather than parsed -
+        //resolved against the URL the request was sent to, which is what a client does with a
+        //relative reference. The order that comes back has to be the one the submission reported.
+        RestResult followed = get(URI.create(APP_ROOT).resolve(location).toString());
         Assertions.assertEquals(200, followed.status,
                 "The Location header did not resolve: " + location + " -> " + followed.body);
         Assertions.assertEquals(orderId, readObject(followed).getString("orderId"),
                 "Following Location returned a different order: " + followed.body);
+    }
+
+    /* The other half of that contract, exercised the way it can actually go wrong: a caller sends
+       a Host and an X-Forwarded-Proto of its own choosing, and neither the Location header nor the
+       page links may repeat them. Repeating them would publish an address this service does not
+       answer on and send whoever follows it off this service, with nothing in the response saying
+       so. Both response headers are covered here because both are built from the request URI. */
+    @Test
+    void testForgedHostAndSchemeReachNeitherLocationNorPageLinks() throws IOException {
+        RestResult created = forgedOriginRequest("POST", "/" + WAR_CONTEXT + "/orders",
+                orderBody(uniqueClientOrderId(), 1L, LIMIT_PRICE));
+
+        Assertions.assertEquals(201, created.status,
+                "A forged Host must not change the submission's outcome: " + created.body);
+
+        String orderId = readObject(created).getString("orderId");
+        String location = created.header(LOCATION_HEADER);
+        Assertions.assertEquals("/" + WAR_CONTEXT + "/orders/" + orderId, location,
+                "Location followed the forged Host or scheme: " + location);
+        Assertions.assertFalse(location.contains(FORGED_HOST) || location.contains("://"),
+                "Location carried an authority the caller supplied: " + location);
+
+        RestResult page = forgedOriginRequest("GET", "/" + WAR_CONTEXT + "/orders?limit=1", null);
+
+        Assertions.assertEquals(200, page.status,
+                "A forged Host must not change a paged read: " + page.body);
+
+        String links = page.header(LINK_HEADER);
+        Assertions.assertNotNull(links, "A paged response must carry RFC 8288 page links");
+        Assertions.assertFalse(links.contains(FORGED_HOST) || links.contains("://"),
+                "Page links carried an authority the caller supplied: " + links);
+        Assertions.assertTrue(links.contains("</" + WAR_CONTEXT + "/orders?offset=0&limit=1>; rel=\"first\""),
+                "The first link was not the path-and-query reference of this page: " + links);
     }
 
     /* Malformed page parameters are clamped rather than refused, so the documented clamp holds for
@@ -402,6 +454,15 @@ class OrderSubmissionIT {
                 && links.contains("rel=\"last\""), "Page links were incomplete: " + links);
         Assertions.assertTrue(links.contains("offset=1&limit=1"),
                 "The next link did not step by the applied page size: " + links);
+
+        //Each relation is a path-and-query reference, never a complete URL: the authority in a
+        //request URI is the caller's own Host header, and a traversal that followed it would walk
+        //off this service one page in.
+        for (String relation : links.split(",")) {
+            String target = relation.substring(relation.indexOf('<') + 1, relation.indexOf('>'));
+            Assertions.assertTrue(target.startsWith("/" + WAR_CONTEXT + "/") && !target.contains("://"),
+                    "A page link carried a scheme or an authority: " + links);
+        }
 
         //The limit a caller cannot exceed is reported as applied, so a traversal steps by the size
         //it was actually served rather than the one it asked for.
@@ -567,24 +628,263 @@ class OrderSubmissionIT {
     }
 
     @Test
-    void testOversizeRequestBodyIsRefusedByTheContainer() {
+    void testArrayOrObjectForASingleValuedFieldIsRejected() {
+        /* Every field of a submission carries one value, and a JSON-B implementation binds an array
+           to such a field by taking its LAST element: limitPrice [1,2,3] would fill at 3 while any
+           gateway, control or audit reader taking the first element sees 1, and symbol ["RSTRA"]
+           would be unwrapped before the restricted-symbol control ever saw it. The body is readable
+           JSON and the fault is one named field of it, so - unlike a body that cannot be read at
+           all - the refusal names that field. */
+        String clientOrderId = uniqueClientOrderId();
+
+        assertFieldShapeRejected(orderBodyWith(clientOrderId, "limitPrice", "[1,2,3]"), "limitPrice");
+        assertFieldShapeRejected(orderBodyWith(clientOrderId, "quantity", "[1,2]"), "quantity");
+        assertFieldShapeRejected(orderBodyWith(clientOrderId, "symbol", "[\"RSTRA\"]"), "symbol");
+        assertFieldShapeRejected(orderBodyWith(clientOrderId, "clientId", "[\"" + CLIENT_ID + "\"]"),
+                "clientId");
+        assertFieldShapeRejected(orderBodyWith(clientOrderId, "side", "[\"" + BUY + "\"]"), "side");
+        assertFieldShapeRejected(orderBodyWith(clientOrderId, "clientOrderId",
+                "[\"" + clientOrderId + "\"]"), "clientOrderId");
+        //An object where one value belongs is the same fault, reported the same way.
+        assertFieldShapeRejected(orderBodyWith(clientOrderId, "limitPrice", "{\"amount\":100.00}"),
+                "limitPrice");
+
+        /* A structure under a property the model does not declare stays harmless: unknown members
+           are ignored by the deserializer, so a caller posting a response entity back - execution
+           object, controlResults array and all - is answered by the engine's own values rather than
+           refused. Only the fields that bind are held to one value.
+
+           This submission also carries the clientOrderId all seven refusals above carried, so its
+           201 is the proof they reserved nothing: had any of them got as far as claiming the key,
+           this would answer 409. */
+        RestResult withUnknownStructures = post(ORDERS_URL, orderBodyWith(clientOrderId,
+                "execution", "{\"fillPrice\":1,\"venue\":\"REAL-NYSE\"}", "controlResults", "[]"));
+
+        Assertions.assertEquals(201, withUnknownStructures.status,
+                "A structure under an unknown property must not be refused: " + withUnknownStructures.body);
+
+        JsonObject accepted = readObject(withUnknownStructures);
+        Assertions.assertEquals("EXECUTED", accepted.getString("status", ""),
+                "The order carrying unknown structures did not execute: " + withUnknownStructures.body);
+        Assertions.assertEquals("SIMULATED", accepted.getJsonObject("execution").getString("venue", ""),
+                "A forged execution venue reached the stored order: " + withUnknownStructures.body);
+        Assertions.assertEquals(4, accepted.getJsonArray("controlResults").size(),
+                "A forged controlResults array replaced the engine's own: " + withUnknownStructures.body);
+    }
+
+    @Test
+    void testTrailingContentAfterTheJsonDocumentIsRejected() {
+        /* The document must be the whole entity. A deserializer stops reading at the closing brace,
+           so anything appended is discarded unseen: {…}xyz and a body carrying a second order are
+           indistinguishable from the clean submission to the caller, while an intermediary reading
+           the appended document sees an order this service never ran. */
+        String clientOrderId = uniqueClientOrderId();
+        String document = orderBody(clientOrderId, 100L, LIMIT_PRICE);
+        String appendedClientOrderId = uniqueClientOrderId();
+
+        assertMalformedBodyRejected(document + "xyz");
+        assertMalformedBodyRejected(document + "]}]}");
+        assertMalformedBodyRejected(document + "' OR 1=1 --");
+        assertMalformedBodyRejected(document + "\n\n<script>alert(1)</script>");
+        assertMalformedBodyRejected(document + orderBody(appendedClientOrderId, 9L, LIMIT_PRICE));
+
+        //Neither document was acted on: both client order ids are still unclaimed, which they could
+        //not be if either had been bound.
+        Assertions.assertEquals(201, post(ORDERS_URL, document).status,
+                "The refused bodies must have reserved nothing, so " + clientOrderId
+                        + " must still be submittable");
+        Assertions.assertEquals(201,
+                post(ORDERS_URL, orderBody(appendedClientOrderId, 9L, LIMIT_PRICE)).status,
+                "The appended document must never have been processed, so " + appendedClientOrderId
+                        + " must still be submittable");
+    }
+
+    @Test
+    void testEntityShorterThanItsDeclaredLengthIsRejected() throws IOException {
+        /* A complete JSON object hides a truncated HTTP message perfectly: the object ends before
+           the declared bytes were due to, so a deserializer reading only as far as the closing
+           brace binds it and never learns that the rest never arrived. Written over a raw socket
+           because a Jakarta REST client computes Content-Length from the entity it sends and so
+           cannot express the mismatch. */
+        String clientOrderId = uniqueClientOrderId();
+        String document = orderBody(clientOrderId, 100L, LIMIT_PRICE);
+        //Twice the bytes the caller then sends, so the container is promised an entity it never gets.
+        String response = postOverSocket(document, document.getBytes(StandardCharsets.UTF_8).length * 2);
+
+        Assertions.assertTrue(response.startsWith("HTTP/1.1 400"),
+                "A truncated request entity must answer 400: " + response);
+        Assertions.assertTrue(response.contains("request body is not valid JSON"),
+                "A truncated request entity did not answer the fixed malformed-body message: " + response);
+
+        Assertions.assertEquals(201, post(ORDERS_URL, document).status,
+                "The truncated entity must have reserved nothing, so " + clientOrderId
+                        + " must still be submittable");
+    }
+
+    @Test
+    void testOversizeRequestBodyIsRefusedByTheContainer() throws IOException {
         /* A body one megabyte long, made so by a field the request model does not declare: unknown
            JSON properties are ignored, so without a size ceiling the payload can be arbitrary and
            the server allocates all of it before discovering there was nothing in it to read. The
            ceiling is configured on the HTTP channel, which answers 413 and carries no ErrorResponse
            body, because the refusal happens before the application is reached - and that is the
            assertion below: the same clientOrderId then submits successfully, which it could not do
-           if the oversize attempt had got as far as reserving it. */
-        String clientOrderId = uniqueClientOrderId();
-        RestResult oversize = post(ORDERS_URL, oversizeOrderBody(clientOrderId));
+           if the oversize attempt had got as far as reserving it.
 
-        Assertions.assertEquals(413, oversize.status,
-                "An oversize request body must be refused by the container: " + oversize.body);
+           Written over a socket for the reason postOverSocket gives: the channel sends its refusal
+           while the caller is still writing the megabyte, and the client used everywhere else here
+           abandons that write instead of reading the answer. */
+        String clientOrderId = uniqueClientOrderId();
+        String oversizeBody = oversizeOrderBody(clientOrderId);
+        String refusal = postOverSocket(oversizeBody,
+                oversizeBody.getBytes(StandardCharsets.UTF_8).length);
+
+        Assertions.assertTrue(refusal.startsWith("HTTP/1.1 413"),
+                "An oversize request body must be refused by the container: " + refusal);
 
         RestResult accepted = post(ORDERS_URL, orderBody(clientOrderId, 100L, LIMIT_PRICE));
         Assertions.assertEquals(201, accepted.status,
                 "The refused body must have reserved nothing, so " + clientOrderId
                         + " must still be submittable: " + accepted.body);
+    }
+
+    /* The other framing of the same oversize body, and the reason it needs its own test: a chunked
+       message declares no length, so the ceiling cannot be applied when the headers are parsed and
+       is applied as the body is read instead - inside the application, where the channel's refusal
+       arrives as an IOException. Left unmapped that answered 500 with the channel's own sentence as
+       a plain-text body under a Content-Type of application/json, which is a status the service
+       does not mean and a body no JSON client can parse. What is asserted here is that the two
+       framings now agree on the status and that this one carries the service's envelope. */
+    @Test
+    void testChunkedOversizeRequestBodyIsRefusedWithTheStandardEnvelope() {
+        String clientOrderId = uniqueClientOrderId();
+        RawFramingClient.Result refused = RawFramingClient.sendChunked(ORDERS_URL, "POST",
+                chunkedOversizeOrderBody(clientOrderId), TRADER_AUTHORIZATION);
+
+        Assertions.assertEquals(413, refused.status(),
+                "A chunked body over the size ceiling must be refused 413, not answered 500: "
+                        + refused.body());
+        Assertions.assertTrue(MediaType.APPLICATION_JSON.equals(mediaTypeOf(refused)),
+                "The refusal declared " + refused.header("Content-Type")
+                        + " instead of application/json: " + refused.body());
+
+        assertErrorEnvelope(refused, 413, "request message exceeds the configured size limit");
+
+        //Nothing ran, so nothing was reserved: the same key must still submit.
+        RestResult accepted = post(ORDERS_URL, orderBody(clientOrderId, 100L, LIMIT_PRICE));
+        Assertions.assertEquals(201, accepted.status,
+                "The refused chunked body must have reserved nothing, so " + clientOrderId
+                        + " must still be submittable: " + accepted.body);
+    }
+
+    //The other half of the ceiling rule: chunked framing itself is not what is refused, so a
+    //caller that streams a legitimate body must still be served. Without this, refusing the
+    //oversize case by refusing chunked encoding outright would pass the test above.
+    @Test
+    void testChunkedRequestBodyInsideTheCeilingIsAccepted() {
+        RawFramingClient.Result accepted = RawFramingClient.sendChunked(ORDERS_URL, "POST",
+                orderBody(uniqueClientOrderId(), 100L, LIMIT_PRICE), TRADER_AUTHORIZATION);
+
+        Assertions.assertEquals(201, accepted.status(),
+                "A chunked body inside the size ceiling must be accepted: " + accepted.body());
+        Assertions.assertEquals("EXECUTED",
+                Json.createReader(new StringReader(accepted.body())).readObject()
+                        .getString("status", ""),
+                "A chunked in-limit order must execute like any other: " + accepted.body());
+    }
+
+    /* The ceiling counts the bytes that arrive, so a content coding would let a caller buy heap
+       with wire: the body below is 7 MB of padding that gzips to a few kilobytes, which fits
+       inside the ceiling and inflated to the full 7 MB once the channel decompressed it - a
+       thousand-fold amplification of the one bound this service places on a request, repeatable
+       per request. Refused at the filter now, before anything decompresses it, which is asserted
+       on the wire size as well as the status so the test cannot pass by the body being refused for
+       being large. */
+    @Test
+    void testCompressedRequestBodyIsRefused() {
+        String clientOrderId = uniqueClientOrderId();
+        byte[] compressed = RawFramingClient.gzip(compressionBombOrderBody(clientOrderId));
+
+        Assertions.assertTrue(compressed.length < 8192,
+                "The compressed body must fit inside the size ceiling for this test to mean "
+                        + "anything; it was " + compressed.length + " bytes");
+
+        RawFramingClient.Result refused = RawFramingClient.sendContentCoded(ORDERS_URL, "POST",
+                compressed, "gzip", TRADER_AUTHORIZATION);
+
+        Assertions.assertEquals(415, refused.status(),
+                "A gzipped request body must be refused 415: " + refused.body());
+        assertErrorEnvelope(refused, 415, "must not be compressed");
+        Assertions.assertEquals("identity", refused.header("Accept-Encoding"),
+                "The refusal must name the coding the caller may use instead: " + refused.headers());
+
+        //Refused before binding, so no order exists and the key is still free.
+        RestResult accepted = post(ORDERS_URL, orderBody(clientOrderId, 100L, LIMIT_PRICE));
+        Assertions.assertEquals(201, accepted.status,
+                "The refused compressed body must have created nothing, so " + clientOrderId
+                        + " must still be submittable: " + accepted.body);
+    }
+
+    //Shared by the two framing refusals: both must answer with the service's uniform error body
+    //and neither may relay the channel's own text, which names internal classes and paths.
+    private static void assertErrorEnvelope(RawFramingClient.Result result, int expectedStatus,
+            String expectedMessageFragment) {
+        JsonObject error = Json.createReader(new StringReader(result.body())).readObject();
+
+        Assertions.assertEquals(expectedStatus, error.getInt("status", -1),
+                "ErrorResponse status did not repeat the HTTP status: " + result.body());
+        assertNonBlank(error, "error", "The refusal");
+        assertNonBlank(error, "path", "The refusal");
+        Assertions.assertTrue(error.getString("message", "").contains(expectedMessageFragment),
+                "The refusal message did not describe the refusal: " + result.body());
+
+        String[] internalTextMarkers = {"Chunk size", "com.ibm.ws", "com.ibm.wsspi", "Exception",
+                "at com.ibm.hybrid", "org.jboss"};
+        for (String marker : internalTextMarkers) {
+            Assertions.assertFalse(result.body().contains(marker),
+                    "The refusal leaked internal text (" + marker + "): " + result.body());
+        }
+    }
+
+    //The declared type without its parameters: the container appends a charset on some refusals,
+    //and what is being asserted is the type, not how the container spelled it.
+    private static String mediaTypeOf(RawFramingClient.Result result) {
+        String contentType = result.header("Content-Type");
+
+        return (contentType == null) ? null : contentType.split(";")[0].trim();
+    }
+
+    /* Sized just over the 8 KB ceiling rather than at the megabyte the Content-Length case uses:
+       the refusal happens on the first chunk that crosses the limit, so a body of this size
+       exercises it while staying small enough to have reached the server's socket buffer before
+       the answer arrives - which is what lets the client read the response instead of failing on
+       the write when the connection closes under it. */
+    private static String chunkedOversizeOrderBody(String clientOrderId) {
+        return Json.createObjectBuilder()
+                .add("clientOrderId", clientOrderId)
+                .add("clientId", CLIENT_ID)
+                .add("symbol", SYMBOL)
+                .add("side", BUY)
+                .add("quantity", 100L)
+                .add("limitPrice", new BigDecimal(LIMIT_PRICE))
+                .add("junk", "A".repeat(20_000))
+                .build()
+                .toString();
+    }
+
+    //Padding a compressor turns into almost nothing: one repeated character is the most
+    //compressible payload there is, which is what makes the amplification measurable.
+    private static String compressionBombOrderBody(String clientOrderId) {
+        return Json.createObjectBuilder()
+                .add("clientOrderId", clientOrderId)
+                .add("clientId", CLIENT_ID)
+                .add("symbol", SYMBOL)
+                .add("side", BUY)
+                .add("quantity", 100L)
+                .add("limitPrice", new BigDecimal(LIMIT_PRICE))
+                .add("junk", "A".repeat(7 * 1024 * 1024))
+                .build()
+                .toString();
     }
 
     //One POST, one set of assertions: the four invalid bodies differ only in the field they spoil,
@@ -683,6 +983,95 @@ class OrderSubmissionIT {
                 .toString();
     }
 
+    /* An order body written as raw text so a member can carry a JSON value the builder cannot
+       express - an array or an object where the model declares one value, or a structure under a
+       property it does not declare at all. Each name/value pair replaces the member of that name
+       when the body already has one and is appended when it does not, so the caller states only
+       what differs from a valid submission. */
+    private static String orderBodyWith(String clientOrderId, String... membersAndRawValues) {
+        Map<String, String> members = new LinkedHashMap<>();
+        members.put("clientOrderId", "\"" + clientOrderId + "\"");
+        members.put("clientId", "\"" + CLIENT_ID + "\"");
+        members.put("symbol", "\"" + SYMBOL + "\"");
+        members.put("side", "\"" + BUY + "\"");
+        members.put("quantity", "100");
+        members.put("limitPrice", LIMIT_PRICE);
+
+        for (int i = 0; i < membersAndRawValues.length; i += 2) {
+            members.put(membersAndRawValues[i], membersAndRawValues[i + 1]);
+        }
+
+        StringBuilder body = new StringBuilder("{");
+        for (Map.Entry<String, String> member : members.entrySet()) {
+            if (body.length() > 1) {
+                body.append(',');
+            }
+            body.append('"').append(member.getKey()).append("\":").append(member.getValue());
+        }
+
+        return body.append('}').toString();
+    }
+
+    /* One submission written straight onto a socket, returning the whole response text. Two of the
+       bodies here need that rather than the client above. One declares a Content-Length the caller
+       then falls short of, which no client library can express because each computes the header
+       from the entity it sends. The other is far over the size ceiling, and its refusal is sent
+       while the caller is still writing: the CXF conduit writes such an entity through a pipe whose
+       reader ends with the connection, so the writer fails with "Read end dead" instead of reading
+       the answer the server already sent. A socket reads it, which is also how the ceiling is
+       verified by hand in the README. */
+    private static String postOverSocket(String entity, long declaredLength) throws IOException {
+        byte[] body = entity.getBytes(StandardCharsets.UTF_8);
+        String request = "POST /" + WAR_CONTEXT + "/orders HTTP/1.1\r\n"
+                + "Host: localhost:" + PORT + "\r\n"
+                + AUTHORIZATION_HEADER + ": " + TRADER_AUTHORIZATION + "\r\n"
+                + "Content-Type: " + MediaType.APPLICATION_JSON + "\r\n"
+                + "Content-Length: " + declaredLength + "\r\n"
+                //No pooling: this connection carries one request and the answer to it, so nothing
+                //it leaves behind can reach another test.
+                + "Connection: close\r\n\r\n";
+
+        try (Socket socket = new Socket("localhost", Integer.parseInt(PORT))) {
+            //Bounded so a server that answers nothing fails the test rather than hanging the build.
+            socket.setSoTimeout(SLEEP_TIMEOUT);
+
+            OutputStream out = socket.getOutputStream();
+            out.write(request.getBytes(StandardCharsets.UTF_8));
+            try {
+                out.write(body);
+                out.flush();
+                socket.shutdownOutput();
+            } catch (IOException refusedMidWrite) {
+                //The server answered and closed before the body was fully written, which is a
+                //refusal already on its way back: it is read below rather than reported here.
+            }
+
+            return new String(socket.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        }
+    }
+
+    /* One assertion set for a body the service could read but whose named field carried the wrong
+       JSON shape. Deliberately the opposite of assertMalformedBodyRejected: that refusal has no
+       field to name and answers one fixed string, while this one must name the field and must not
+       borrow the malformed-body text, since the body parsed perfectly well. */
+    private static void assertFieldShapeRejected(String jsonBody, String field) {
+        String posted = "a structured " + field + " [" + jsonBody + "]";
+        RestResult result = post(ORDERS_URL, jsonBody);
+
+        Assertions.assertEquals(400, result.status, posted + " must answer 400: " + result.body);
+
+        JsonObject error = readObject(result);
+        Assertions.assertEquals(400, error.getInt("status"),
+                "ErrorResponse status did not repeat the HTTP status for " + posted + ": " + result.body);
+
+        String message = error.getString("message", "");
+        Assertions.assertTrue(message.startsWith(field + " must be a single value"),
+                posted + " did not name the offending field: " + result.body);
+        Assertions.assertNotEquals("request body is not valid JSON", message,
+                posted + " was answered as an unreadable body rather than as a field fault: " + result.body);
+        assertNonBlank(error, "path", "The 400 for " + posted);
+    }
+
     //A well-formed order body padded past the configured request-size ceiling by a property the
     //request model does not declare, so the only thing making it oversize is padding a caller
     //controls freely.
@@ -769,6 +1158,93 @@ class OrderSubmissionIT {
     private static Invocation.Builder authorized(Client client, String url) {
         return client.target(url).request(MediaType.APPLICATION_JSON)
                 .header(AUTHORIZATION_HEADER, TRADER_AUTHORIZATION);
+    }
+
+    /* The one request in this class written onto the wire by hand, and deliberately so: Host is a
+       restricted header that HttpURLConnection and the JDK's HttpClient both drop silently, and
+       lifting that restriction takes a JVM system property on the test runner rather than anything
+       a Jakarta REST client can express - so a forged Host can only be sent by writing the request
+       line and the fields ourselves. Do not simplify this back into the REST client; the forgery
+       is the entire point of the test it serves. X-Forwarded-Proto travels with it because the two
+       headers reach the response through the same request URI, one supplying its authority and the
+       other its scheme.
+
+       The response framing is read by hand for the same reason. Connection: close makes the
+       server's own EOF the end of a close-delimited entity, and a chunked entity is de-chunked
+       here so the assertions see the JSON the service sent and not its transfer framing. */
+    private static RestResult forgedOriginRequest(String method, String requestTarget, String jsonBody)
+            throws IOException {
+        byte[] entityBytes = (jsonBody == null)
+                ? new byte[0] : jsonBody.getBytes(StandardCharsets.UTF_8);
+
+        StringBuilder request = new StringBuilder()
+                .append(method).append(' ').append(requestTarget).append(" HTTP/1.1\r\n")
+                .append("Host: ").append(FORGED_HOST).append("\r\n")
+                .append("X-Forwarded-Proto: https\r\n")
+                .append(AUTHORIZATION_HEADER).append(": ").append(TRADER_AUTHORIZATION).append("\r\n")
+                .append("Accept: ").append(MediaType.APPLICATION_JSON).append("\r\n");
+        if (jsonBody != null) {
+            request.append("Content-Type: ").append(MediaType.APPLICATION_JSON).append("\r\n")
+                    .append("Content-Length: ").append(entityBytes.length).append("\r\n");
+        }
+        request.append("Connection: close\r\n\r\n");
+
+        try (Socket socket = new Socket(InetAddress.getLoopbackAddress(), Integer.parseInt(PORT))) {
+            //A read that cannot hang: a socket left open by a server that answered nothing would
+            //otherwise stall the suite instead of failing it.
+            socket.setSoTimeout(SOCKET_READ_TIMEOUT);
+            socket.getOutputStream().write(request.toString().getBytes(StandardCharsets.US_ASCII));
+            socket.getOutputStream().write(entityBytes);
+            socket.getOutputStream().flush();
+
+            //Decoded ISO-8859-1 so that one character is exactly one byte: the chunk sizes below
+            //are byte counts, and the entity is re-decoded as UTF-8 once its bytes are delimited.
+            String message = new String(socket.getInputStream().readAllBytes(),
+                    StandardCharsets.ISO_8859_1);
+            int endOfFields = message.indexOf("\r\n\r\n");
+            Assertions.assertTrue(endOfFields > 0,
+                    method + " " + requestTarget + " answered no HTTP message: [" + message + "]");
+
+            String[] fieldLines = message.substring(0, endOfFields).split("\r\n");
+            int status = Integer.parseInt(fieldLines[0].split(" ")[1]);
+
+            Map<String, List<String>> headers = new HashMap<>();
+            boolean chunked = false;
+            for (int i = 1; i < fieldLines.length; i++) {
+                int colon = fieldLines[i].indexOf(':');
+                Assertions.assertTrue(colon > 0,
+                        "Unreadable header field in the response: [" + fieldLines[i] + "]");
+                String field = fieldLines[i].substring(0, colon).trim();
+                String value = fieldLines[i].substring(colon + 1).trim();
+                headers.computeIfAbsent(field, name -> new ArrayList<>()).add(value);
+                //HTTP field names are case-insensitive and the container chooses their casing.
+                chunked |= "Transfer-Encoding".equalsIgnoreCase(field)
+                        && value.toLowerCase(Locale.ROOT).contains("chunked");
+            }
+
+            String entity = message.substring(endOfFields + 4);
+            if (chunked) {
+                //Every chunk is a hexadecimal byte count, optional extensions after a ';', the
+                //bytes themselves and a CRLF; a zero count ends the entity, and no trailer field
+                //after it is asserted on here.
+                StringBuilder decoded = new StringBuilder();
+                for (int cursor = 0; cursor < entity.length(); ) {
+                    int endOfSize = entity.indexOf("\r\n", cursor);
+                    int size = (endOfSize < 0) ? 0 : Integer.parseInt(
+                            entity.substring(cursor, endOfSize).trim().split(";")[0], 16);
+                    if (size == 0) {
+                        break;
+                    }
+                    decoded.append(entity, endOfSize + 2, endOfSize + 2 + size);
+                    cursor = endOfSize + 2 + size + 2;
+                }
+                entity = decoded.toString();
+            }
+
+            return new RestResult(status,
+                    new String(entity.getBytes(StandardCharsets.ISO_8859_1), StandardCharsets.UTF_8),
+                    headers);
+        }
     }
 
     //The Response-returning forms of get() and post() are used throughout, deliberately: they hand

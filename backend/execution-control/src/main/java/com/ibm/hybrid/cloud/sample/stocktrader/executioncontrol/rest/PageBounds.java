@@ -20,12 +20,14 @@ package com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.rest;
 //Arbitrary-precision arithmetic
 import java.math.BigInteger;
 
+//URI components - the link targets are assembled from the path and query alone
+import java.net.URI;
+
 //Collections
 import java.util.List;
 
 //Jakarta REST 3.1
 import jakarta.ws.rs.core.Response;
-import jakarta.ws.rs.core.UriBuilder;
 import jakarta.ws.rs.core.UriInfo;
 
 /** One clamped offset and limit, and the paged response that says how much it left behind. */
@@ -150,14 +152,26 @@ final class PageBounds {
 		return links.toString();
 	}
 
+	/* The link target is an absolute-path reference - path and query, no scheme and no authority.
+	   The request URI's authority is read from the caller's own Host header (and its scheme from
+	   X-Forwarded-Proto), so an absolute target would publish whatever address a caller chose as
+	   this service's own and walk a traversal that follows it off this service. A path resolves
+	   against the URL the caller already sent the request to, which is the same page either way. */
 	private void append(StringBuilder links, UriInfo uriInfo, int linkOffset, String relation) {
-		UriBuilder target = uriInfo.getRequestUriBuilder()
+		URI target = uriInfo.getRequestUriBuilder()
 				.replaceQueryParam(OFFSET_PARAMETER, linkOffset)
-				.replaceQueryParam(LIMIT_PARAMETER, limit);
+				.replaceQueryParam(LIMIT_PARAMETER, limit)
+				.build();
 
 		if (links.length() > 0) {
 			links.append(", ");
 		}
-		links.append('<').append(target.build()).append(">; rel=\"").append(relation).append('"');
+		links.append('<').append(target.getRawPath());
+		//Both page parameters are always replaced, so a query is always present - guarded anyway,
+		//because a target ending in a bare '?' is not the same reference as one without it.
+		if (target.getRawQuery() != null && !target.getRawQuery().isEmpty()) {
+			links.append('?').append(target.getRawQuery());
+		}
+		links.append(">; rel=\"").append(relation).append('"');
 	}
 }

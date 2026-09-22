@@ -38,15 +38,31 @@ COPY target/ExecutionControl.war /opt/ol/wlp/usr/servers/defaultServer/apps/Exec
 
 # Grant the non-root runtime user (1001, root group) ownership of everything just
 # copied. The absolute server path is used rather than the equivalent /config symlink
-# so the instruction does not depend on the image's working directory.
+# so the instruction does not depend on the image's working directory. Ownership is the
+# whole of what this settles: the base image ships /opt/ol/wlp and /opt/ol/wlp/lib
+# group-writable (775 default:root) for platforms that run it under an arbitrary UID, so
+# 1001 can still write the runtime it executes and the server.xml it re-reads on restart.
+# Those two are closed at the pod rather than here, because no image-layer permission can
+# take write access away from the identity that must own the configuration - see
+# readOnlyRootFilesystem in the README's deployment manifest.
 RUN chown -R 1001:0 /opt/ol/wlp/usr/servers/defaultServer
+
+# Both PKCS12 stores hold a private key and COPY preserved the source mode (0644), which
+# would leave them readable by every identity in the image. The tightening belongs to the
+# image and not to git, because the tracked copies must stay identical to the broker's down
+# to their file mode, and it follows the chown because it is the new owner that keeps the
+# access: 1001 is the only identity that ever runs this server - including the build-time
+# start configure.sh performs below, which reads key.p12 to prime the class cache - so
+# owner-only is the whole of the access the runtime needs.
+RUN chmod 600 /opt/ol/wlp/usr/servers/defaultServer/resources/security/*.p12
 
 EXPOSE 9080 9443
 
 USER 1001
 
-# Last, and as 1001: configure.sh primes the shared class cache and applies file
-# permissions over the configuration and application copied above.
+# Last, and as 1001: configure.sh primes the shared class cache by starting the server
+# once, and writes whichever configuration dropins the base image's helpers ask for. It
+# touches nothing under resources/, so the modes set above are the modes that ship.
 RUN configure.sh
 
 # Priming the class cache starts the server, which creates an LTPA key file under the

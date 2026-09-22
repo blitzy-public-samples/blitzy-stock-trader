@@ -39,6 +39,7 @@ import jakarta.ws.rs.PathParam;
 import jakarta.ws.rs.Produces;
 import jakarta.ws.rs.QueryParam;
 import jakarta.ws.rs.core.Context;
+import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.core.SecurityContext;
@@ -75,7 +76,7 @@ public class OrderResource {
 	@Consumes(MediaType.APPLICATION_JSON)
 	@APIResponse(responseCode = "201", description = "The order was recorded in its terminal state, EXECUTED or REJECTED, with all four control results",
 			content = @Content(mediaType = MediaType.APPLICATION_JSON, schema = @Schema(implementation = Order.class)),
-			headers = @Header(name = "Location", description = "URI of the created order", schema = @Schema(type = SchemaType.STRING)))
+			headers = @Header(name = "Location", description = "Absolute path of the created order - /execution-control/orders/{orderId}, carrying no scheme and no host, so a client resolves it against the URL it sent the request to", schema = @Schema(type = SchemaType.STRING)))
 	@APIResponse(responseCode = "400", description = "A field is missing or outside its bounds, the clientId is unknown, or the body could not be read as JSON",
 			content = @Content(mediaType = MediaType.APPLICATION_JSON, schema = @Schema(implementation = ErrorResponse.class)))
 	@APIResponse(responseCode = "409", description = "The clientOrderId has already been submitted",
@@ -92,9 +93,21 @@ public class OrderResource {
 		//is recorded on an order that now exists, is retrievable at its own URL and carries its own
 		//audit timeline, so the creation succeeded. Reporting a control rejection as a 4xx would
 		//tell the caller its request was at fault and would disown the auditable record it made.
-		//Location names that URL, so a caller learns where the record lives from the response
-		//itself rather than by reassembling the path around an id parsed out of the body.
-		return Response.created(uriInfo.getAbsolutePathBuilder().path(order.getOrderId()).build())
+		//Location carries that resource's path, so a caller learns where the record lives from the
+		//response itself rather than by reassembling the path around an id parsed out of the body.
+
+		/* The path alone, never the scheme and authority the request arrived with: those are read
+		   from the caller's own Host and X-Forwarded-Proto headers, so an absolute Location would
+		   echo whatever address a caller chose back as this service's own and take a client that
+		   follows it somewhere else entirely. The path still comes from the builder rather than
+		   being assembled here, so it survives a change of context root, and the header is set
+		   directly because Response.created and ResponseBuilder.location resolve a relative URI
+		   against the application base URI - rebuilding the authority this removes. */
+		String createdOrderPath = uriInfo.getAbsolutePathBuilder()
+				.path(order.getOrderId()).build().getRawPath();
+
+		return Response.status(Response.Status.CREATED)
+				.header(HttpHeaders.LOCATION, createdOrderPath)
 				.entity(order).build();
 	}
 

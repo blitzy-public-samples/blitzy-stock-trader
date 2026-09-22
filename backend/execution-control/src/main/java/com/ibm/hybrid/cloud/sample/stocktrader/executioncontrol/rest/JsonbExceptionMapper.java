@@ -41,11 +41,15 @@ public class JsonbExceptionMapper implements ExceptionMapper<JsonbException> {
 	private static Logger logger = Logger.getLogger(JsonbExceptionMapper.class.getName());
 
 	/* The one place the client-facing text for an unreadable body is written, and every route into
-	   that condition reuses this literal rather than wording its own: ProcessingExceptionMapper
-	   answers it when the entity provider wraps the deserializer's failure instead of letting it
-	   propagate, and JsonObjectRootInterceptor raises it before binding for a body whose JSON root
-	   is not an object - the one shape the deserializer would otherwise accept. Three routes, one
-	   answer, which is why they cannot drift apart. The integration tests assert this exact string. */
+	   that condition reuses this literal rather than wording its own: the deserializer raises it
+	   directly, ProcessingExceptionMapper answers it when the entity provider wraps that failure
+	   instead of letting it propagate, and JsonObjectRootInterceptor raises it before binding for a
+	   body that is not one whole JSON document - a root that is not an object, content after the
+	   document's end, or an entity shorter than the length its own request declared, each of which
+	   the deserializer would otherwise accept or never see. One answer for all of them, which is
+	   why they cannot drift apart, and it says only that the body could not be read: a fault in one
+	   named field of a readable body is a ValidationException instead, so the two are never
+	   confused. The integration tests assert this exact string. */
 	static final String MALFORMED_BODY_MESSAGE = "request body is not valid JSON";
 
 	@Context private UriInfo uriInfo;
