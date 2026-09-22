@@ -1,0 +1,755 @@
+# Cash Account (Modernized)
+
+A standalone Spring Boot 3.3.13 / Java 21 cash **ledger** service that replaces the CICS/COBOL program in
+[`backend/cash-account-cobol`](../cash-account-cobol/README.md) behind the seam `backend/broker` already calls — the
+MicroProfile REST Client interface
+`com.ibm.hybrid.cloud.sample.stocktrader.broker.client.CashAccountClient`. The retail contract, its verbs, its
+`?amount=` query parameter and its `{"owner","balance","currency"}` wire shape are reproduced exactly, so moving
+traffic off the mainframe is a **deployment-values change and nothing else**: no caller code changes, and no Helm
+chart template changes.
+
+Beyond parity the service adds what the legacy single-balance model had no analogue for: an **available/reserved**
+balance split, an explicit reservation state machine (hold → settle/release/expire) for a future institutional order
+service, and an append-only, immutable `ledger_entry` audit trail that is queryable the instant a transaction commits.
+
+## Module placement
+
+This module is a **plain tracked directory in the umbrella checkout — not a git submodule.** Every other module under
+`backend/`, `frontend/`, `infra/` and `tools/` is a submodule registered in the repository-root `.gitmodules`
+(16 entries, `backend/cash-account-cobol` among them). **No `.gitmodules` entry is added for this module**, and none is
+edited: the umbrella repository carries these files directly so the new service can be built and reviewed in the same
+checkout as the seam it has to satisfy and the chart it has to conform to.
+
+The module carries its own `.gitignore` (`target/`) because the umbrella repository has none of its own.
+
+## What is in here
+
+Four separable concerns share one Maven module and one datastore:
+
+| Concern | Package | What it is |
+| --- | --- | --- |
+| Retail contract surface | `…cashaccount.retail` | The six endpoints `CashAccountClient` issues, wire-identical to the legacy request codes `Q/A/U/X/C/D` |
+| Institutional reservation surface | `…cashaccount.institutional` | Additive hold / settle / release / read endpoints with idempotent writes, under a separate path space |
+| Migration and reconciliation tooling | `…cashaccount.migration.{export,load,reconcile}` | Export-format readers (delimited and IBM037 binary), loader, and a reconciler that records variances as rows |
+| Dual-run comparator | `…cashaccount.migration.shadow` | Replays a captured transaction stream through the service layer and compares it with captured legacy responses |
+
+Supporting packages: `domain` (the `Money` type, entities and the reservation state machine), `persistence` (Spring
+Data JPA repositories — the only path to the database), `fx` (the outbound exchange-rate client), `audit` (the ledger
+append and its query DTO), `error` (the closed error taxonomy and its three renderers) and `config` (datasource guard,
+security, JWT decoding, Jackson, the FX client and the `/metrics` shim).
+
+## Scope
+
+**No existing file in any module, chart or document is modified by this deliverable.** Everything new lives under
+`backend/cash-account-modernized/`. In particular:
+
+- `backend/broker` is untouched — `CashAccountClient`, `CashAccount`, the `web.xml` role split and the
+  `CASH_ACCOUNT_ENABLED` / `CASH_ACCOUNT_URL` handling all stay as they are. The new service satisfies them as-is.
+- `backend/cash-account-cobol` (COBOL, DB2 DDL/BIND, VSAM definition JCL) is read and cited for characterization, never
+  edited.
+- `infra/stocktrader-operator` is referenced, never edited: no chart template, `values.yaml` or `values-metadata.yaml`
+  is created or changed here.
+- Wiring an institutional caller to the reservation endpoints is deliberately **out of scope**. There is no
+  `backend/execution-control` (or any other institutional order service) in this repository; the reservation surface is
+  exercised only by this module's own tests until such a caller is specified separately.
+
+What this deliverable **builds** is the replacement service plus its migration mechanism, proven against synthetic
+fixtures. What it **hands off** — bulk migration against the real DB2 for z/OS and VSAM history, a live shadow-mode
+dual-run, the controlled cutover and decommission — is written up in
+[`docs/operational-runbook.md`](docs/operational-runbook.md) and is **documented, never executed** here. See
+[Prohibitions](#prohibitions).
+
+## Build and run
+
+### Prerequisites
+
+| Requirement | Why |
+| --- | --- |
+| JDK 21 | `maven.compiler.release` is 21, the highest level the estate documents |
+| Maven | None to install: `./mvnw` is the entry point. The wrapper is `only-script` at wrapper version 3.3.2 and pins Apache Maven 3.9.11, copied verbatim from `backend/portfolio-assistant` — the highest Maven the estate documents |
+| Docker | Required by the `*IT` classes only. They start a `postgres:12.22-alpine` container through Testcontainers; PostgreSQL 12 is the major version the estate's Azure module provisions, so every DDL feature is proven at the compatibility floor |
+| A PostgreSQL 12+ instance | Required for any non-test run (`java -jar`, container run, the migration tooling). Nothing else in the module needs a network |
+
+### Build
+
+```bash
+cd backend/cash-account-modernized
+./mvnw -B clean verify
+```
+
+`verify`, not the siblings' `package`: Surefire runs the `*Test` classes and Failsafe runs the `*IT` classes, and
+Failsafe's `integration-test` and `verify` goals only execute in the `verify` phase. `package` would build the jar and
+silently skip the entire integration suite, which is where the contract, security, audit, actuator and reconciliation
+evidence is produced. `./mvnw -B clean verify` is therefore the module's whole gate — there is no coverage threshold,
+enforcer or lint plugin bound to it, matching the rest of the estate.
+
+Targeted invocations used by the acceptance criteria:
+
+```bash
+# The characterization document must exist, with its citations, before any reconciliation code is trusted.
+./mvnw -B test -Dtest=CharacterizationDocPresentTest
+
+# The legacy arithmetic: truncate2(stored ± rates × amount), absolute value on a negative result, overflow modulus.
+./mvnw -B test -Dtest=LegacyBalanceCalculatorTest
+
+# The retail contract, driven through a verbatim copy of broker's own client interface.
+./mvnw -B verify -Dit.test=RetailContractIT
+```
+
+`-Dtest=…` selects Surefire (unit) classes and `-Dit.test=…` selects Failsafe (integration) classes; the two
+properties are not interchangeable.
+
+### The drift guard is a failure, not a skip
+
+`CashAccountClientDriftTest` compares this module's two test-tree copies of broker's `CashAccountClient` and
+`CashAccount` — kept under broker's original packages so the contract tests exercise the *real* interface — against
+broker's sources, from the first line beginning with `package` to end of file. It resolves broker's root from
+`-Dcashaccount.broker.source` when set, and otherwise as `../broker` relative to the module directory, which is
+exactly where the umbrella checkout places it (both plugins pass `cashaccount.module.basedir=${project.basedir}` so
+the resolution never depends on a forked JVM's working directory).
+
+If that path is absent the test **fails** rather than skipping, because a silent skip is how a copy drifts from the
+interface it is supposed to prove. The single escape is an explicit `-Dcashaccount.standalone=true`, which asserts a
+genuinely standalone checkout with no broker sources to compare against — never a convenience flag for a red build.
+
+### Run locally
+
+```bash
+java -jar target/cash-account-modernized-1.0.0-SNAPSHOT.jar
+```
+
+with, at minimum, `JDBC_KIND=postgres`, `JDBC_HOST`, `JDBC_PORT`, `JDBC_DB`, `JDBC_ID`, `JDBC_PASSWORD` and
+`AUTH_TYPE` from the [configuration map](#configuration) — for example:
+
+```bash
+JDBC_KIND=postgres JDBC_HOST=localhost JDBC_PORT=5432 JDBC_DB=trader \
+JDBC_ID=<local-db-user> JDBC_PASSWORD=<local-db-password> AUTH_TYPE=basic \
+java -jar target/cash-account-modernized-1.0.0-SNAPSHOT.jar
+```
+
+The schema is applied at start-up (see [Schema application](#schema-application)), so an empty database is enough.
+Once the log reports the port, these all answer `200`:
+
+```bash
+curl -s http://localhost:8080/actuator/startup            # buffered start-up steps (the chart's startupProbe)
+curl -s http://localhost:8080/actuator/health/readiness    # {"status":"UP"} — readinessState + db
+curl -s http://localhost:8080/actuator/health/liveness     # {"status":"UP"} — livenessState only
+curl -s http://localhost:8080/actuator/prometheus          # Micrometer scrape, canonical path
+curl -s http://localhost:8080/metrics                      # same scrape, for the chart's path-less annotation
+```
+
+Everything under `/cash-account/**` requires a token in every mode except `AUTH_TYPE=none`; see [Security](#security).
+
+### There is no servlet context path
+
+`server.servlet.context-path` is deliberately unset. The chart probes `/actuator/startup`,
+`/actuator/health/readiness` and `/actuator/health/liveness` at the **root** of port 8080 while publishing the retail
+base URL to broker as `http://<release>-cash-account-service:8080/cash-account`. Both can hold at once only if the
+`/cash-account` prefix lives on the controllers (`@RequestMapping("/cash-account")` on `RetailCashAccountController`,
+`"/cash-account/institutional"` on `ReservationController`) and actuator stays at the root. A context path would break
+every probe at once, and the chart template cannot be edited to accommodate one.
+
+## Configuration
+
+Every value the deployment supplies is already injected by the existing chart template; the service binds those
+variables and adds none. `src/main/resources/application.yml` is the declared source of truth for all of it.
+
+| Environment variable (chart source) | Spring property | Default |
+| --- | --- | --- |
+| `CURRENCY_API_URL` ← `cashAccount.exchangeRateUrl` | `cashaccount.fx.url` | `https://api.frankfurter.app/latest` |
+| `JDBC_KIND` ← `database.kind` | `cashaccount.jdbc.kind` | `postgres` — **and nothing else starts** (below) |
+| `JDBC_HOST` ← `database.host` | `cashaccount.jdbc.host` | `localhost` |
+| `JDBC_PORT` ← `database.port` | `cashaccount.jdbc.port` | `5432` |
+| `JDBC_DB` ← `database.db` | `cashaccount.jdbc.database` | `trader` |
+| `JDBC_SSL` ← `database.ssl` | `cashaccount.jdbc.ssl` | `false` |
+| `cert_defaultTrustStore` ← configMap key `ssl.certs`, injected only when `global.specifyCerts` is on | `cashaccount.jdbc.trust-store-pem` | empty |
+| `JDBC_ID` ← `database.id` (chart secret) | `spring.datasource.username` | empty |
+| `JDBC_PASSWORD` ← `database.password` (chart secret) | `spring.datasource.password` | empty |
+| `AUTH_TYPE` ← `global.auth` | `cashaccount.security.auth-type` | `basic`; accepted values `none`, `basic`, `ldap`, `oidc` |
+| `JWT_ISSUER` ← `jwt.issuer` | `cashaccount.security.jwt.issuer` | `http://stock-trader.ibm.com` |
+| `JWT_AUDIENCE` ← `jwt.audience` | `cashaccount.security.jwt.audience` | `stock-trader` |
+| `OIDC_JWKS_URL` ← `oidc.jwksUrl` | `cashaccount.security.jwt.jwks-url` | empty; read only when `AUTH_TYPE=oidc` |
+
+### `JDBC_KIND` is guarded, not defaulted
+
+`config/DataSourceGuardConfig` accepts only `postgres` (trimmed, case-insensitively) and fails start-up with an
+explicit message naming the property, the chart variable and the offending value for anything else. Half-starting
+against a store this schema was never written for is worse than not starting: the DDL, the `ledger_entry_immutable`
+trigger and every `NUMERIC(9,2)` column assume PostgreSQL.
+
+`database.kind` is a **chart-global** value (still `db2` in the repository) shared with `backend/portfolio`, which
+already reaches PostgreSQL through the same `JDBC_*` variables. Moving the release to PostgreSQL is therefore a
+**separately completed and signed-off prerequisite** — `docs/operational-runbook.md` Step 0, owned by the platform
+owner — and never part of a cash-account cutover.
+
+### How the JDBC URL is assembled
+
+`spring.datasource.url` is not a static property. `DataSourceGuardConfig` assembles
+`jdbc:postgresql://<host>:<port>/<database>` and, when `JDBC_SSL=true`, appends `?ssl=true&sslmode=verify-ca` plus
+**exactly one** trust source:
+
+- `&sslrootcert=<file>` when `cert_defaultTrustStore` carries PEM text. The PEM is written to a private temporary
+  file and pgJDBC's default `LibPQFactory` verifies the server chain against it.
+- `&sslfactory=org.postgresql.ssl.DefaultJavaSSLFactory` when that variable is absent, so trust rides on the JVM's
+  `cacerts`.
+
+These are the same properties `backend/portfolio/src/main/liberty/config/includes/postgres.xml` uses
+(`ssl`, `sslMode=verify-ca`, `sslfactory=org.postgresql.ssl.DefaultJavaSSLFactory`), with Liberty's `cert_*` keystore
+import convention replaced by pgJDBC's `sslrootcert` file — the chart delivers the certificate as PEM text, not as a
+keystore, and only one of the two mechanisms may appear in a URL. `DataSourceGuardConfigTest` covers both shapes and
+the guard.
+
+### Properties with no environment binding
+
+These have internal defaults; nothing in the chart supplies them, and nothing needs to:
+
+| Property | Default | Why it is a property at all |
+| --- | --- | --- |
+| `cashaccount.security.jwt.public-key-location` | `classpath:security/jwtsigner.pem` | Tests repoint it at an ephemeral per-JVM key instead of shipping key material |
+| `cashaccount.security.all-authenticated-hold-stocktrader` | `true` | Parity with the siblings' `ALL_AUTHENTICATED_USERS → StockTrader` binding; `false` is the strict mode (see [Security](#security)) |
+| `cashaccount.fx.base-currency` | `USD` | Broker's default account currency, so a same-currency account short-circuits to a rate of exactly `1` with no network call |
+| `cashaccount.fx.timeout` | `PT2S` | Connect and read budget; a slow rate provider must surface as `503`, not as a request that outlives its caller |
+| `cashaccount.fx.accepted-currencies` | The 31 ISO codes `AUD BGN BRL CAD CHF CNY CZK DKK EUR GBP HKD HUF IDR ILS INR ISK JPY KRW MXN MYR NOK NZD PHP PLN RON SEK SGD THB TRY USD ZAR` | Adopted verbatim from the `allowed_currencies` CHECK the estate's PostgreSQL init template already enforces, which is also the set the exchange-rate API serves |
+| `cashaccount.reservation.default-ttl` | `PT24H` | A hold nobody settles or releases must not strand funds indefinitely |
+| `cashaccount.reservation.expiry-sweep-interval` | `PT60S` | Bounds how long an overdue hold keeps money out of the available balance |
+
+All of them are overridable through Spring's relaxed binding — `CASHACCOUNT_FX_TIMEOUT`,
+`CASHACCOUNT_SECURITY_ALL_AUTHENTICATED_HOLD_STOCKTRADER`, and so on — as plain container environment, **without any
+chart change**. That is the point of leaving them unbound rather than inventing chart keys for them.
+
+### Tool-profile properties
+
+Active only under `--spring.profiles.active=tool` (`src/main/resources/application-tool.yml`), which also disables the
+web server. See [Migration and reconciliation tooling](#migration-and-reconciliation-tooling).
+
+| Property | Meaning |
+| --- | --- |
+| `tool.command` | `load`, `reconcile` or `shadow-compare` |
+| `tool.input` | Directory holding the export or shadow files |
+| `tool.batch-id` | UUID shared by the `load` and the `reconcile`/`shadow-compare` of one runbook step; each invocation is still its own `migration_run` row |
+| `tool.rate-source` | `legacy-table` (default) or `live` |
+| `tool.legacy-charset` | `IBM037` — the assumed region code page for binary history |
+| `tool.legacy-timezone` | `UTC` — the assumed region zone for `YYYYMMDD`/`HHMMSS` stamps |
+| `tool.history-record-length` | `57` or `100`; **mandatory for binary history input**, because a record length is declared from the CICS FILE definition, never inferred from a file |
+
+`tool.legacy-charset` and `tool.legacy-timezone` are properties rather than constants precisely because the region's
+CCSID and time zone are not in this repository — see [Open items](#open-items).
+
+### Injected but deliberately not consumed
+
+The chart template also injects the following, and this service **ignores every one of them**. They address Open
+Liberty and a Java cash-account service that was never built; binding any of them would declare a Redis, Kafka or CQRS
+path this module excludes and carries no dependency for.
+
+- `TRACE_SPEC`
+- `REDIS_URL`
+- `KAFKA_USER`, `KAFKA_API_KEY`, `KAFKA_ADDRESS`, `KAFKA_CASH_ACCOUNT_TOPIC`, `KAFKA_BROKER_TOPIC`
+- `CQRS_ENABLED`
+- `WLP_LOGGING_CONSOLE_*` and `WLP_LOGGING_MESSAGE_*`
+
+Do not wire them later by accident: an unconsumed variable is harmless, whereas a half-wired Kafka or CQRS path would
+be a second write channel past the ledger.
+
+## Chart values consumed — referenced, never edited
+
+The service is deployed by the chart that already exists at
+`infra/stocktrader-operator/helm-charts/stocktrader`. These are the keys it consumes. **No chart template,
+`values.yaml` or `values-metadata.yaml` is created or edited by this deliverable.**
+
+| Chart key | Repository default | What it reaches in this service |
+| --- | --- | --- |
+| `cashAccount.enabled` | `false` | Gates the whole Deployment, and reaches broker and portfolio as `CASH_ACCOUNT_ENABLED` |
+| `cashAccount.url` | `http://{{ .Release.Name }}-cash-account-service:8080/cash-account` | Broker's `CASH_ACCOUNT_URL`; matches the controllers' `/cash-account` mapping |
+| `cashAccount.exchangeRateUrl` | `https://api.frankfurter.app/latest` | `CURRENCY_API_URL` → `cashaccount.fx.url` |
+| `cashAccount.image.repository` / `.tag` | `ghcr.io/ibmstocktrader/cash-account` / `1.0.0` | The image the pod runs; set to the digest-pinned image the [build path](#image-build-scan-and-push) produces |
+| `database.kind` / `.host` / `.port` / `.db` / `.ssl` / `.id` / `.password` | `db2` and DB2 host values | `JDBC_KIND` / `JDBC_HOST` / `JDBC_PORT` / `JDBC_DB` / `JDBC_SSL` / `JDBC_ID` / `JDBC_PASSWORD` |
+| `jwt.issuer` / `jwt.audience` | `http://stock-trader.ibm.com` / `stock-trader` | `JWT_ISSUER` / `JWT_AUDIENCE` |
+| `oidc.jwksUrl` | placeholder | `OIDC_JWKS_URL`, read only when `AUTH_TYPE=oidc` |
+| `global.auth` | `basic` | `AUTH_TYPE` |
+| `global.healthCheck` | `true` | Gates the three probes; with it off nothing probes the actuator endpoints |
+| `global.monitoring` | `true` | Gates the `prometheus.io/*` annotations |
+| `global.specifyCerts` | `false` | Gates the `cert_defaultTrustStore` injection |
+| `vault.enabled` | `false` | **Must remain `false`** (below) |
+
+### Deployment-shape conformance
+
+A reviewer can see by inspection that the existing template already reaches this service:
+
+| Template attribute | What the chart expects | What the service exposes |
+| --- | --- | --- |
+| Workload annotation | `prism.subkind: Spring` | A Spring Boot jar |
+| Container ports | `8080` and `8443` | An HTTP listener on 8080. 8443 is declared for template conformance only: the chart provisions no TLS material for this service, and Kubernetes never requires a declared port to be bound |
+| Startup probe | `httpGet /actuator/startup` on 8080, `initialDelaySeconds: 60`, `periodSeconds: 30`, `failureThreshold: 3` | The actuator `startup` endpoint, which exists only because the application installs a `BufferingApplicationStartup(2048)` and `startup` is in `management.endpoints.web.exposure.include` |
+| Readiness probe | `httpGet /actuator/health/readiness` on 8080, `periodSeconds: 15` | Health group `readiness` = `readinessState,db`. A pod that cannot reach its ledger leaves the Service endpoints |
+| Liveness probe | `httpGet /actuator/health/liveness` on 8080, `periodSeconds: 15` | Health group `liveness` = `livenessState` only. `db` is deliberately excluded: a failing liveness probe restarts the container, so including it would turn one database outage into a rolling crash loop |
+| Metrics scrape | `prometheus.io/scrape: 'true'` and `prometheus.io/port: "8080"` — **no path** | `GET /metrics` returns the Micrometer Prometheus scrape beside the canonical `/actuator/prometheus`. The shim exists because the annotation names no path and the template cannot be edited to add one |
+| Resources | limits cpu `1000m` / memory `2Gi`, requests cpu `500m` / memory `1Gi` | Nothing is pinned in the image; the base image's `run-java.sh` sizes the heap from the container memory limit. Fit is confirmed by the [manual memory-fit check](#image-build-scan-and-push) — no in-repo test asserts it |
+
+### `vault.enabled` must stay `false`
+
+When `vault.enabled` is true the template injects Liberty-specific container arguments
+(`/opt/ol/helpers/runtime/docker-server.sh`) that a Spring Boot image cannot execute, alongside the Vault agent
+annotations. The template is **not** edited to accommodate this service, so the release must deploy with
+`vault.enabled: false`; the chart's own default is already `false`. A Vault-compatible argument shape for a non-Liberty
+workload is an [open item](#open-items) for the chart's owners, not a change made here.
+
+### Cutover is a values set, applied by the operator
+
+Nothing in this repository routes traffic to the new service, and nothing here should. At cutover the platform operator
+applies a values set — `cashAccount.enabled: true`, `cashAccount.image.*` at the recorded digest, `cashAccount.url` at
+the chart default — against a **captured live snapshot** of the release (`helm get values <release>` or
+`kubectl get stocktrader <name> -o yaml`), which is also what a rollback restores. The procedure, its gates, its
+evidence and its sign-offs are `docs/operational-runbook.md` Step 3. This deliverable changes no such value; see
+[Prohibitions](#prohibitions).
+
+## Endpoints
+
+### Retail contract — the seam
+
+Reproduced exactly as `CashAccountClient` issues it. Every success is `200` with the body
+`{"owner": "<stored uppercase owner>", "balance": <plain decimal>, "currency": "<ISO code>"}`; `balance` is written as
+plain decimal text, never exponent notation, because the caller and the contract test both read it literally.
+
+| Legacy code | Verb and path | Request | Errors |
+| --- | --- | --- | --- |
+| `Q` | `GET /cash-account/{owner}` | — | `404` ACCOUNT_NOT_FOUND |
+| `A` | `POST /cash-account/{owner}` | body `{owner, balance, currency}`; a null `currency` defaults to `USD` | `409` ACCOUNT_ALREADY_EXISTS, `400` INVALID_OWNER / INVALID_AMOUNT / INVALID_CURRENCY, `422` AMOUNT_OUT_OF_RANGE |
+| `U` | `PUT /cash-account/{owner}` | body `{owner, balance, currency}` — an absolute overwrite of the available balance and the currency | `404`, `400`, `422`, `409` RESERVATIONS_OUTSTANDING |
+| `X` | `DELETE /cash-account/{owner}` | — (returns the deleted account) | `404`, `409` RESERVATIONS_OUTSTANDING |
+| `D` | `PUT /cash-account/{owner}/debit?amount=<decimal>` | `amount` bound from its string form to `BigDecimal`, then scaled to 2 decimals `DOWN` | `404`, `400` INVALID_AMOUNT, `422` INSUFFICIENT_FUNDS, `422` AMOUNT_OUT_OF_RANGE, `503` EXCHANGE_RATE_UNAVAILABLE |
+| `C` | `PUT /cash-account/{owner}/credit?amount=<decimal>` | as debit | `404`, `400`, `422` AMOUNT_OUT_OF_RANGE, `503` EXCHANGE_RATE_UNAVAILABLE |
+
+Retail `balance` is the **available** balance. With no reservation outstanding it equals the total, which is the only
+state the legacy single-balance program could ever be in, so parity is exact; with funds held it is the spendable
+amount, which is what a retail debit has to be checked against. A `0` amount is accepted exactly as the legacy `C`/`D`
+accepted it: `200`, balance unchanged, one zero-amount ledger row, so transaction counts still reconcile.
+
+### Institutional reservation surface
+
+Additive, under its own path space. No retail path, verb, query parameter or payload schema changes by its existence.
+
+| Verb and path | Request | Success |
+| --- | --- | --- |
+| `POST /cash-account/institutional/accounts/{owner}/holds` | header `Idempotency-Key` (required); body `{orderReference, amount, currency, expiresAt?}` | `201` with the hold in state `HELD`. A replay with the same key and an identical payload returns `200` with the original body and `Idempotent-Replayed: true`; the same key with a different payload is `422` IDEMPOTENCY_KEY_REUSED |
+| `POST /cash-account/institutional/reservations/{reservationId}/settle` | body `{amount?}` — absent or null settles the full held amount; a partial amount settles it and releases the remainder; `0` is legal | `200` with state `SETTLED`; settling an already-settled reservation returns its current state |
+| `POST /cash-account/institutional/reservations/{reservationId}/release` | — | `200` with state `RELEASED`; releasing an already released or expired reservation returns its current state |
+| `GET /cash-account/institutional/reservations/{reservationId}` | — | `200` with the reservation |
+| `GET /cash-account/institutional/accounts/{owner}` | — | `200` `{owner, currency, availableBalance, reservedBalance, totalBalance}` |
+| `GET /cash-account/institutional/accounts/{owner}/ledger?since=&limit=` | `since` optional, an inclusive ISO-8601 (UTC) lower bound on `recordedAt`; `limit` optional, default `100`, maximum `1000` | `200` with the entries ordered `recordedAt DESC, entryId DESC`. Rows outlive the account, so a deleted owner still returns its audit trail; an owner with neither rows nor an account returns `[]` |
+
+A hold's `currency` must equal the account currency (`400` CURRENCY_MISMATCH); nothing converts on the institutional
+path. Holds, settlements, releases and expiries each write their ledger row in the **same** transaction as the balance
+change, so `…/ledger` returns it on the very next call — no polling, no eventual consistency.
+
+Two interactions a retail caller can observe, and only after an institutional caller has acted on the same owner:
+
+1. Retail `balance` reports the spendable amount, which is lower than the total while funds are held.
+2. Retail `PUT` and `DELETE` answer `409 RESERVATIONS_OUTSTANDING` while a `HELD` reservation exists, because
+   overwriting or deleting an account with funds on hold would corrupt the reservation.
+
+### Error model
+
+Every error — from a controller, from Spring MVC's own routing, or from the security filter chain before any
+controller runs — is the same payload:
+
+```json
+{"code": "ACCOUNT_NOT_FOUND", "message": "Cash account not found.", "owner": "JOHN", "timestamp": "2026-01-01T00:00:00Z"}
+```
+
+`owner` and `reservationId` appear only where the condition has them. `CashAccountErrorCode` binds each code to
+exactly one HTTP status, and it is the only place that mapping lives — this is what replaces the legacy `SQLCODE`
+return channel, which dropped the sign in a `X(10)` field and reported only the last statement's code.
+
+| Code | HTTP | Condition |
+| --- | --- | --- |
+| `ACCOUNT_NOT_FOUND` | 404 | No such owner (legacy `SQLCODE 100` on `Q/U/X/C/D`) |
+| `ACCOUNT_ALREADY_EXISTS` | 409 | Create on an existing owner (legacy `-803`) |
+| `INVALID_OWNER` | 400 | Blank, or longer than 32 characters (legacy truncated silently to 15) |
+| `INVALID_AMOUNT` | 400 | Missing, negative or non-numeric `amount`; a hold of `≤ 0`; a settlement above the held amount |
+| `INVALID_CURRENCY` | 400 | Not a three-letter code in the accepted set, after trim and uppercase |
+| `CURRENCY_MISMATCH` | 400 | Hold currency ≠ account currency |
+| `INSUFFICIENT_FUNDS` | 422 | The operation would drive the available balance negative (legacy stored the absolute value) |
+| `AMOUNT_OUT_OF_RANGE` | 422 | The result leaves `0.00 … 9999999.99` (legacy dropped high-order digits) |
+| `IDEMPOTENCY_KEY_REQUIRED` | 400 | A hold without the `Idempotency-Key` header |
+| `IDEMPOTENCY_KEY_REUSED` | 422 | Known key, different payload |
+| `RESERVATION_NOT_FOUND` | 404 | No such reservation |
+| `INVALID_TRANSITION` | 409 | Settle from `RELEASED`/`EXPIRED`, or release from `SETTLED` |
+| `RESERVATIONS_OUTSTANDING` | 409 | Retail `PUT`/`DELETE` while a `HELD` reservation exists |
+| `EXCHANGE_RATE_UNAVAILABLE` | 503 + `Retry-After: 5` | The rate is missing, unreachable or unparsable; the balance is unchanged and no ledger row is written (legacy returned success over an uninitialized rate) |
+| `DATASTORE_UNAVAILABLE` | 503 + `Retry-After: 5` | Database unreachable (legacy `-911` / `-913` / `-904`) |
+| `UNSUPPORTED_PATH` | 404 | An unmapped path — fail closed, where the legacy `EVALUATE` fell through as success |
+| `UNSUPPORTED_METHOD` | 405 | A known path with an unmapped verb |
+| `INVALID_QUERY` | 400 | `limit` below 1 or above 1000, or an unparsable `since` |
+| `CONCURRENT_MODIFICATION` | 409 + `Retry-After: 1` | A lock conflict. One second, not five: the conflict clears as soon as the competing transaction commits |
+| `UNAUTHORIZED` | 401 | Missing or invalid token, rendered by the filter chain's entry point |
+| `FORBIDDEN` | 403 | Authenticated but lacking the required role, rendered by the access-denied handler |
+| `INTERNAL` | 500 | Any unexpected exception |
+
+That is the complete set: 22 codes, one status each, nothing else reachable.
+
+## Security
+
+The service validates the **existing** estate token. Broker propagates the caller's JWT unchanged as the
+`Authorization` header — `org.eclipse.microprofile.rest.client.propagateHeaders=Authorization,Proxy-Authorization` in
+`backend/broker/src/main/resources/META-INF/microprofile-config.properties` — so this service verifies the same RS256
+token, signer, issuer and audience the estate already mints, and introduces no new identity mechanism.
+
+### Modes
+
+`AUTH_TYPE` (`cashaccount.security.auth-type`) selects one of four:
+
+| Mode | How a token is verified |
+| --- | --- |
+| `basic` (default), `ldap` | Against the `jwtSigner` **public** certificate at `cashaccount.security.jwt.public-key-location`, plus an issuer validator and an audience validator. The two modes differ only in the user registry Liberty siblings authenticate against, which is upstream of this service and invisible to it |
+| `oidc` | Against the JWKS at `OIDC_JWKS_URL`, mirroring the `jwksUri` broker resolves from the same variable |
+| `none` | **No authentication at all.** The service's own path space is `permitAll` |
+
+`none` is a deliberate dev/test deviation from the siblings, not parity: their `none.xml` disables `mpJwt` but still
+enables a dummy `basicRegistry` and adds `overrideHttpAuthMethod="BASIC"`, so a caller still presents credentials.
+This service replicates neither. **`AUTH_TYPE=none` is unfit for any shared environment** — treat it as a
+single-developer convenience and nothing more. An unrecognized `AUTH_TYPE` fails start-up rather than being guessed:
+reading it as `none` would silently open the service, and reading it as `basic` would authenticate against a mechanism
+the operator did not ask for.
+
+### Roles
+
+The token's `groups` claim becomes `ROLE_StockTrader` / `ROLE_StockViewer` authorities. The filter chain then decides
+in this order:
+
+1. `/actuator/**` and `/metrics` — `permitAll`. The chart's probes carry no credentials, so an authenticated probe
+   path means the pod never passes its startup probe and the deployment never rolls.
+2. `/cash-account/institutional/**` — `hasRole('StockTrader')`.
+3. `GET /cash-account/{owner}` — `hasAnyRole('StockViewer','StockTrader')`.
+4. `POST`, `PUT`, `DELETE /cash-account/{owner}` and `PUT /cash-account/{owner}/{debit,credit}` —
+   `hasRole('StockTrader')`.
+5. Anything else under `/cash-account/**` — `authenticated()`, so an authenticated caller asking for an unsupported
+   path or verb reaches Spring MVC and receives the `404 UNSUPPORTED_PATH` / `405 UNSUPPORTED_METHOD` `ApiError`, while
+   an unauthenticated one is refused with `401`.
+6. `anyRequest()` — `denyAll()`. This is the analogue of broker's `deny-uncovered-http-methods` for everything outside
+   this service's path space, and it holds in every mode, `none` included.
+
+Rules 2–4 reproduce broker's `web.xml` GET-versus-write split.
+
+**The deployed default makes that split latent, on purpose.** `cashaccount.security.all-authenticated-hold-stocktrader`
+defaults to `true`, which grants `StockTrader` to every authenticated principal — mirroring the siblings'
+`ALL_AUTHENTICATED_USERS → StockTrader` binding in broker's `server.xml`. Through broker today, any authenticated
+caller may write; the new service behaves the same way rather than tightening a rule mid-migration. Setting it to
+`false` is a supported, documented **strict mode** in which only the token's `groups` decide, and it is tested as its
+own configuration.
+
+### The caller's token goes nowhere
+
+This service makes no downstream call that carries the caller's credentials. Its only outbound call is to the public
+exchange-rate API, and forwarding `Authorization` there is prohibited: the FX client is built with no default headers,
+and the currency-conversion test asserts the recorded FX request carries none.
+
+### Key hygiene
+
+**Only the public X.509 certificate ships**, at `src/main/resources/security/jwtsigner.pem`. It was exported from the
+shared Liberty trust store with:
+
+```bash
+keytool -exportcert -rfc -alias jwtsigner \
+  -keystore ../broker/src/main/liberty/config/resources/security/trust.p12 \
+  -storetype PKCS12 -storepass "$TRUST_STORE_PASSWORD" \
+  > src/main/resources/security/jwtsigner.pem
+```
+
+Supply the trust store's configured password (see broker's `server.xml`) through the environment as shown; it is not
+reproduced here. `keytool -exportcert -rfc` emits a `-----BEGIN CERTIFICATE-----` PEM, which
+`config/JwtDecoderConfig` reads through a `CertificateFactory`; it also accepts a `-----BEGIN PUBLIC KEY-----` PEM,
+which is what the tests' ephemeral keys produce.
+
+**Neither `trust.p12` nor `key.p12` is copied into this module**, and no keystore is. The reason is specific rather
+than stylistic: that shared store's `jwtSigner` alias is a *private* key entry, and the siblings ship it inside every
+image — a known defect this module does not repeat. A public certificate is all a resource server needs to verify a
+signature, so a private key in this image would be pure liability.
+
+Tests never use the real signer. `JwtTestTokens` generates an **ephemeral RSA-2048 key pair per test JVM**, writes its
+public key as PEM to a temporary directory and repoints `cashaccount.security.jwt.public-key-location` at it through
+`@DynamicPropertySource`. **No key material is checked in**, and tokens signed by the real `jwtSigner` are verified
+only in a deployed environment.
+
+## Migration and reconciliation tooling
+
+The same jar is the migration CLI. Under the `tool` profile the web server is off and `MigrationToolRunner` executes
+one command per invocation:
+
+```bash
+# One batch id per runbook step, shared by the load and the reconcile that judges it.
+BATCH_ID=$(uuidgen 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())')
+
+java -jar target/cash-account-modernized-1.0.0-SNAPSHOT.jar \
+     --spring.profiles.active=tool \
+     --tool.command=load \
+     --tool.input=src/test/resources/fixtures/legacy-export/matched \
+     --tool.batch-id="$BATCH_ID"
+
+java -jar target/cash-account-modernized-1.0.0-SNAPSHOT.jar \
+     --spring.profiles.active=tool \
+     --tool.command=reconcile \
+     --tool.input=src/test/resources/fixtures/legacy-export/matched \
+     --tool.batch-id="$BATCH_ID"
+
+java -jar target/cash-account-modernized-1.0.0-SNAPSHOT.jar \
+     --spring.profiles.active=tool \
+     --tool.command=shadow-compare \
+     --tool.input=src/test/resources/fixtures/shadow/matched \
+     --tool.batch-id="$(uuidgen 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())')"
+```
+
+The tool profile needs the same `JDBC_*` environment as a normal run. Each invocation is its own `migration_run` row;
+the shared `--tool.batch-id` is how a `reconcile` names the `load` it judges.
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | Clean — no variance rows |
+| `2` | Variance — the run completed and recorded variances |
+| `1` | Error — the run failed |
+
+A variance is never only a log line: every one is a `migration_reconciliation` row carrying the owner, the variance
+kind, the legacy value, the migrated value, the signed difference and a status (`MATCHED`, `VARIANCE`,
+`ACCEPTED_EXCEPTION`), summarized by its `migration_run`. That is what an operator signs off against, and a log cannot
+be signed off.
+
+A `load` runs in **one** database transaction: either the whole export is applied and the run is recorded
+`CLEAN`/`VARIANCE`, or nothing is applied and the run is `FAILED`. A retry is therefore simply a new run under the same
+batch id, and a partial unique index on `ledger_entry` guarantees a completed run can never write a second
+`MIGRATION_LOAD` row for an owner.
+
+### Input shapes
+
+Delimited files — `cashaccounty.csv`, `frankfurt1.csv`, `history.csv` and `target-state.csv`:
+
+- UTF-8, LF line endings, an optional BOM ignored.
+- The first line is a header naming the columns; readers key by header name, never by position. Headers are
+  `owner,balance,currencyc`; `currnkey,currnbase,amount,rates,loaddt`;
+  `name,event_date,event_time,request_code,balance,currency,retcode`. `target-state.csv` carries the
+  `cashaccounty.csv` columns, because it describes a divergent *migrated* state in the same shape.
+- RFC 4180 quoting: a field containing a comma, a quote or a newline is double-quoted with embedded quotes doubled.
+  Trailing `CHAR` padding may be present and is right-trimmed.
+- NULL is an **empty unquoted field**. The literal text `NULL` is not recognized — it would be indistinguishable from
+  an owner or currency legitimately spelled that way.
+- Decimals are plain text matching `-?\d+\.\d{2}`: no thousands separators and no exponent. `loaddt` is `YYYY-MM-DD`;
+  history stamps are `YYYYMMDD` and `HHMMSS`.
+
+`frankfurt1.csv` accepts **either `currnbase` or `cyrrnbase`** as the second column header. The shipped DB2 DDL
+declares the column `cyrrnbase` while the copybook and the program's own `SELECT` use `CURRNBASE`; which spelling the
+deployed catalog carries cannot be read from this repository, so the reader accepts both rather than guessing (see
+[Open items](#open-items)).
+
+Binary history — `history.cp037.bin`:
+
+- Raw EBCDIC bytes, decoded field by field in `tool.legacy-charset` (default `IBM037`), never as a whole record in the
+  platform default charset.
+- Fixed-length records at the field offsets of the 57-byte layout the program writes. Balances are unsigned zoned
+  decimal, nine digits, implied scale 2.
+- The record length is **declared**, never inferred: `tool.history-record-length` must be `57` (what the program
+  writes) or `100` (the cluster's `RECSZ`), the file length must be an exact multiple of it, and anything else is
+  rejected with an explicit error. Bytes 57–99 of a padded record are treated as padding.
+
+### `tool.rate-source`
+
+Parity has to be judged on identical inputs, so the default is `legacy-table`: expected values are computed from the
+staged `frankfurt1` rate rows with the legacy arithmetic. With `tool.rate-source=live` the live exchange-rate lookup is
+used instead, and a balance difference that the rate difference fully explains is recorded as a `RATE_SOURCE` variance
+with status `ACCEPTED_EXCEPTION`; anything left over is a `BALANCE` variance with status `VARIANCE`.
+
+### Proven against fixtures only
+
+The tooling is verified against the synthetic fixtures under `src/test/resources/fixtures/` — DB2-UNLOAD-shaped CSVs,
+an IBM037 history dump and shadow transaction streams, each directory in a **matched** and a **seeded-mismatch**
+variant, with a `MANIFEST.md` recording which characterization finding and which seed every file encodes:
+
+- `src/test/resources/fixtures/legacy-export/{matched,seeded-mismatch}/` — `cashaccounty.csv`, `frankfurt1.csv`,
+  `history.csv`, `history.cp037.bin`, and `target-state.csv` in the seeded variant
+- `src/test/resources/fixtures/shadow/{matched,seeded-mismatch}/` — `transactions.csv` and `legacy-responses.csv`,
+  plus `src/test/resources/fixtures/shadow/rollback-replay.csv`
+- `src/test/resources/fixtures/fx/frankfurter-latest-usd.json` — the recorded exchange-rate response shape
+
+Matched fixtures must reconcile with zero variance; seeded fixtures must flag exactly the seeded rows and nothing else.
+
+Running any of this against the real DB2 for z/OS or the real VSAM history is **not** something this deliverable does.
+That is `docs/operational-runbook.md` Step 1, with its own preconditions, read-only credentials, disposable rehearsal
+schema and data-owner sign-off — see [Prohibitions](#prohibitions).
+
+## Image build, scan and push
+
+**This section is the only place the build → scan → push path is documented, because no CI workflow exists for this
+module.** The umbrella repository has no root `.github` directory, and every sibling's workflow executes only inside
+that sibling's own repository, so a workflow file placed under `backend/cash-account-modernized/` could not run here.
+When the module is promoted to its own repository, a workflow following
+`backend/portfolio/.github/workflows/build-test-push-azure-acr.yml` reproduces exactly the steps below — that is a
+promotion-time task, not part of this deliverable.
+
+Run the steps in this order:
+
+```bash
+cd backend/cash-account-modernized
+
+# 1. The gate. The image is only worth building if this passes.
+./mvnw -B clean verify
+
+# 2. Build the image. The Dockerfile only packages; nothing compiles inside it.
+docker build -t <registry>/cash-account:<version> .
+
+# 3. Scan. Non-blocking, matching the siblings' workflow shape: findings are reported, not gated.
+trivy image --exit-code 0 --severity CRITICAL,HIGH,MEDIUM <registry>/cash-account:<version>
+
+# 4. Push.
+docker push <registry>/cash-account:<version>
+
+# 5. Capture the digest. This is the reference that matters.
+docker inspect --format '{{index .RepoDigests 0}}' <registry>/cash-account:<version>
+```
+
+The captured **digest** — not the tag — is the immutable reference the runbook's cutover value set uses for
+`cashAccount.image.repository` / `cashAccount.image.tag`. A tag can be re-pointed after the fact; a digest cannot, which
+is what makes "the image we validated" and "the image the pod runs" the same statement. Step 5 only answers after
+step 4: a locally built image carries no `RepoDigests` entry until it has been pushed to a registry.
+
+### Memory-fit check (manual, and it has to be)
+
+```bash
+docker run --rm --memory=2g --cpus=1 \
+  -e JDBC_KIND=postgres -e JDBC_HOST=<host> -e JDBC_PORT=5432 -e JDBC_DB=trader \
+  -e JDBC_ID=<id> -e JDBC_PASSWORD=<password> -e AUTH_TYPE=basic \
+  -p 8080:8080 <registry>/cash-account:<version>
+# then, from another shell:
+curl -s http://localhost:8080/actuator/health/readiness   # must answer 200 {"status":"UP"}
+```
+
+The container must reach readiness inside the chart's envelope (limits cpu `1000m` / memory `2Gi`). The check is manual
+because **no in-repo test asserts memory fit**: the base image's `run-java.sh` derives the heap from the container
+memory limit (`JAVA_MAX_MEM_RATIO`, emitting `-XX:MaxRAMPercentage`), so the answer depends on the runtime limit rather
+than on anything a unit or integration test can see. Record the result as a `docs/operational-runbook.md` Step 0
+evidence item, alongside the image digest.
+
+## Local development notes
+
+### Broker's local-dev default URL ends in `/account`, and stays that way
+
+`backend/broker/src/main/liberty/config/jvm.options` line 3 defaults
+`…broker.client.CashAccountClient/mp-rest/url` to `http://cash-account-service:8080/account`, while the chart publishes
+`cashAccount.url` as `http://{{ .Release.Name }}-cash-account-service:8080/cash-account`. The chart's value wins in
+every deployment, so this mismatch is invisible in a cluster; it only surfaces when someone runs broker outside the
+chart. In that case, point `CASH_ACCOUNT_URL` at `…/cash-account` yourself.
+
+**Broker is out of scope and is not modified** — not this line, not anything else. Recording the mismatch is the
+correct action; editing broker is a [stop-and-flag](#stop-and-flag) condition.
+
+### Why the fail-closed error model is safe to adopt
+
+Broker wraps every cash-account call in `try`/`catch Throwable` and logs the failure, so an explicit HTTP error status
+from this service never fails a broker request. That is precisely what makes fail-closed behaviour safe here: where
+the legacy program answered an unknown request code with a success-looking return field and echoed the caller's own
+amount back as a balance, this service answers `404`/`405`/`503` with an `ApiError`, and broker degrades exactly as it
+already does when the cash service is unreachable.
+
+### Schema application
+
+`src/main/resources/schema/cash-account-schema.sql` holds the seven tables, their constraints and indexes, the
+`ledger_entry_reject()` function and the `ledger_entry_immutable` trigger. It is applied at start-up by Spring Boot's
+own SQL initialization (`spring.sql.init.mode=always`,
+`spring.sql.init.schema-locations=classpath:schema/cash-account-schema.sql`) with
+`spring.jpa.hibernate.ddl-auto=validate`, so any drift between the entities and the DDL stops start-up instead of being
+silently auto-corrected against a ledger.
+
+Two mechanics are worth knowing before editing that file:
+
+- `spring.sql.init.separator` is `;;` and **every statement in the script ends with `;;`**. Spring's script runner
+  splits on a single `;`, which would sever the function body and the trigger's `DO` block. The separator and the
+  terminators are one contract — changing either alone breaks start-up.
+- The script is written to be re-runnable: a session advisory lock serializes concurrent pod start-ups,
+  `CREATE TABLE IF NOT EXISTS` and `CREATE OR REPLACE FUNCTION` are idempotent, and the trigger is created inside a
+  `DO` block guarded on `pg_trigger` for this relation and schema, so a restart never drops the immutability guard.
+  It uses no feature newer than PostgreSQL 12, the version the estate provisions.
+
+Spring Boot was chosen for this rather than Flyway or Liquibase because neither appears in any `pom.xml` in this
+checkout, `backend/portfolio` hand-applies its `createTables.ddl`, and the mechanism is part of the mandated framework.
+The same file can be applied by hand:
+
+```bash
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f src/main/resources/schema/cash-account-schema.sql
+```
+
+`psql` tolerates the `;;` terminators (the second semicolon is an empty statement), so the one file serves both the
+start-up initializer and the hand-applied path — and running it twice changes nothing.
+
+**Hardened production posture.** The chart supplies a single database identity, used for DDL and DML alike, exactly as
+portfolio's hand-applied DDL is. Under that identity the immutability trigger protects the ledger against every
+application code path but not against a privileged operator who could drop it. The hardened arrangement is:
+
+1. Apply the script once with `psql` under a DDL-owning role.
+2. Run the service under a **DML-only** role holding `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the tables but not
+   `TRIGGER`, `ALTER` or `DROP`.
+3. Set `spring.sql.init.mode=never`.
+
+Supplying that second identity to the pod needs a second secret key in the chart, which is a template change. That is
+an [open item](#open-items) for the chart's owners and **not something this deliverable performs**; until it is
+answered, the guard covers application paths only, as stated above.
+
+**Accepted limitation:** there is no versioned migration history. A future schema change needs either a versioned
+migration tool or a hand-written `ALTER` step appended to this file, applied in the same idempotent style.
+
+## Documents
+
+| Document | What it is |
+| --- | --- |
+| [`docs/legacy-characterization.md`](docs/legacy-characterization.md) | The behaviour of the CICS/COBOL program, read from its source with an inline `file:line` citation behind every claim: what `amount` resolves to in the credit/debit computation, owner casing, the missing dispatch catch-all, the write-only audit file, the acceptance baseline, and the disposition of every legacy behaviour (preserved, deliberately changed, or not replicated). It ends with an **Acceptance** section carrying `Status: DRAFT | ACCEPTED`, the named reviewer and the date. The tooling copies that status into every `migration_run`, and a `DRAFT` characterization can exercise fixtures but can never be signed off against a real export |
+| [`docs/operational-runbook.md`](docs/operational-runbook.md) | Step 0 prerequisites and Steps 1–4 — bulk migration rehearsal and reconciliation, shadow-mode dual-run, controlled cutover, decommission — each with preconditions, actions, evidence, sign-offs and a rollback criterion. **Every step is documented here and executed by the platform operator and the mainframe team, never by this deliverable** |
+
+## Open items
+
+Each of these is raised rather than guessed, and `docs/legacy-characterization.md` carries the detail and the citation
+for those that came from the legacy source.
+
+| Open item | What settles it |
+| --- | --- |
+| **Data-retention requirement for decommission.** This repository contains no retention policy, audit-control matrix or compliance artifact | An explicit **written** answer from the requesting organization before runbook Step 4 runs. **Defaulting a retention period is prohibited** |
+| VSAM record length: the program writes 57 bytes into a cluster defined `RECSZ(100 100)` | The CICS FILE/FCT definition (`RECORDFORMAT`, `RECORDSIZE`), or a real `REPRO`/`PRINT` sample. Meanwhile `tool.history-record-length` accepts either length and the decoder tolerates both |
+| The CICS region's code page and time zone (assumed `IBM037` and `UTC`) | Confirmation from the mainframe team. Both are `tool.*` properties, not constants, precisely so the answer is configuration rather than a code change |
+| The rate-table column spelled `cyrrnbase` in the shipped DDL and `CURRNBASE` in the copybook and the program's `SELECT` | The column name in the real DB2 catalog. The export reader accepts either header meanwhile |
+| Spring Boot 3.3.x reached open-source end of life with 3.3.13 (June 2025), and 3.3 is the mandated line | A decision to stay on 3.3.13, adopt commercial support, or authorize a later minor line before production |
+| The estate's Azure module provisions PostgreSQL **12**, which is past community end of life; the schema is written to that floor and tested on `postgres:12.22-alpine` | The platform owners decide whether to raise the server version. Nothing in this module requires it |
+| `database.kind` is chart-global, and this service requires `postgres` | Confirmation of the target estate's relational store. If DB2 must remain for portfolio, a separate datasource path would need a chart template change → [stop and flag](#stop-and-flag) |
+| Ledger immutability against a privileged operator needs a DML-only runtime role beside a DDL-owning role, but the chart supplies **one** database identity | The chart's owners decide whether to add a second secret key (a template change). Until then the trigger guards application paths only |
+| `vault.enabled` must remain `false`, because the enabled branch injects Liberty-specific container arguments | A Vault-compatible argument shape for a non-Liberty workload, decided by the chart's owners |
+| The rounding the (absent) z/OS Connect mapping applied to a caller amount with more than two decimals | The z/OS Connect API/SAR definition. This service scales `DOWN` to 2, consistent with COBOL's default truncation, and every parity fixture uses two-decimal amounts so no expected value depends on the choice |
+| The `NUMERIC(9,2)` ceiling of `9,999,999.99`, inherited to preserve legacy precision exactly | The requesting organization confirms the ceiling or authorizes widening (one DDL change plus the `Money` bounds; parity within range is unaffected) |
+
+## Prohibitions
+
+These hold regardless of what access an executing environment happens to have.
+
+- **Do not connect to, read from, or write to the real DB2 for z/OS or the VSAM KSDS.** The tooling is verified against
+  fixtures only. The mainframe data is production state owned by the requesting organization, and live migration is
+  runbook Step 1.
+- **Do not run the dual-run comparator against the live legacy system.** It is proven against synthetic transaction
+  streams. A live shadow run needs capture infrastructure, sign-off and a rollback plan that the runbook documents but
+  this deliverable does not own.
+- **Do not change any deployment configuration value that would route traffic to this service.**
+  `cashAccount.enabled`, `cashAccount.url`, `database.kind`, the StockTrader CR and broker's `CASH_ACCOUNT_URL` stay
+  exactly as they are. That cutover needs only these values is verified by inspection, not by flipping them.
+- **Take no decommissioning or retention action.** No CICS, DB2 or VSAM asset is retired, exported for retention or
+  deleted. The repository holds no retention policy and defaulting one is prohibited.
+
+Nothing in this README claims that real DB2 or VSAM data has been migrated or reconciled, that shadow mode has run
+against production traffic, or that any cutover has been performed. Criteria that can only be closed by the
+operational hand-off — migration with zero variance in production, a dual-run clean for N consecutive windows, a
+completed cutover — live in `docs/operational-runbook.md` as pending sign-offs.
+
+## Stop and flag
+
+If implementing or operating this module ever appears to require one of the following, **stop and report** rather than
+proceeding. The list of existing files that would have to change is empty by design, and a non-empty list is the
+signal that a design assumption has broken:
+
+| Apparent need | What holds instead |
+| --- | --- |
+| A code change in `backend/broker` | `CashAccountClient` and `CashAccount` are unchanged, and this service satisfies them as-is — proven by contract tests through a verbatim copy plus a drift guard |
+| Adding or editing a Helm chart template | The existing `templates/cash-account.yaml` already probes, exposes and injects everything this service needs; the service conforms to the template, never the reverse |
+| Wiring `backend/execution-control` — or any caller — to the reservation endpoints | That module is absent from this repository and the institutional surface is deliberately a follow-on, exercised only by this module's tests |
+| Changing an existing module's import, interface or configuration reference | This refactor is additive; that list is empty |
+
+Report the exact file, template attribute or seam behaviour believed incompatible. Do not work around it.
