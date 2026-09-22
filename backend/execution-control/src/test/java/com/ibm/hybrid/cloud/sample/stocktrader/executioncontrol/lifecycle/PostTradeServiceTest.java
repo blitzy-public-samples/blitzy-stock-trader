@@ -19,6 +19,7 @@ package com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.lifecycle;
 
 import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.audit.AuditTimeline;
 import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.control.ControlLimits;
+import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.dao.CapacityLimits;
 import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.dao.OrderStore;
 import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.dao.ReferenceDataStore;
 import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.dao.SettlementExceptionStore;
@@ -113,6 +114,13 @@ public class PostTradeServiceTest {
     /* A bound, not a pause: the race test's two threads hand over through latches, so this only
        fails a run in which one of them never arrives rather than pacing the test. */
     private static final long RACE_TIMEOUT_SECONDS = 5L;
+
+    /* The smallest ceilings CapacityLimits admits: one settlement exception, and thirty audit
+       events because the timeline is coupled to ten events for each of the three orders the seed
+       set writes. They are what let the two capacity tests below reach a ceiling in a handful of
+       calls, where their default-sized equivalents above fill 150,000 events to do it. */
+    private static final int SMALL_EXCEPTION_CEILING = 1;
+    private static final int SMALL_EVENT_CEILING = 30;
 
     private OrderStore orderStore;
     private SettlementExceptionStore exceptionStore;
@@ -791,13 +799,13 @@ public class PostTradeServiceTest {
            legal edge, so an analyst could append events to an exception that already exists
            without ever creating an order, an exception or a position. Filling the timeline to its
            ceiling is what proves the gate that closes it. */
-        for (int event = auditTimeline.count(); event < AuditTimeline.MAX_EVENTS; event++) {
+        for (int event = auditTimeline.count(); event < auditTimeline.maxEvents(); event++) {
             auditTimeline.append(ENTITY_EXCEPTION, exceptionId, StateMachine.EXCEPTION,
                     ExceptionStatus.ASSIGNED.name(), ExceptionStatus.ASSIGNED.name(), ACTOR,
                     "filling the timeline to its ceiling", CLOCK);
         }
 
-        assertEquals(AuditTimeline.MAX_EVENTS, auditTimeline.count(), "the timeline is full");
+        assertEquals(auditTimeline.maxEvents(), auditTimeline.count(), "the timeline is full");
         assertThrows(CapacityExceededException.class,
                 () -> postTrade.assign(exceptionId, OWNER, ACTOR),
                 "an assignment that cannot be recorded must be refused");
@@ -811,7 +819,7 @@ public class PostTradeServiceTest {
                 "a refused workflow step leaves the exception open");
         assertNull(exceptionStore.find(exceptionId).getOwner(),
                 "no owner may be recorded by a refused assignment");
-        assertEquals(AuditTimeline.MAX_EVENTS, auditTimeline.count(),
+        assertEquals(auditTimeline.maxEvents(), auditTimeline.count(),
                 "a refused workflow step appends no event");
     }
 
@@ -821,12 +829,12 @@ public class PostTradeServiceTest {
         postTrade.assign(exceptionId, OWNER, ACTOR);
         postTrade.resolve(exceptionId, new ResolveRequest(null, NOTE), ACTOR);
 
-        for (int event = auditTimeline.count(); event < AuditTimeline.MAX_EVENTS; event++) {
+        for (int event = auditTimeline.count(); event < auditTimeline.maxEvents(); event++) {
             auditTimeline.append(ENTITY_EXCEPTION, exceptionId, StateMachine.EXCEPTION,
                     ExceptionStatus.ASSIGNED.name(), ExceptionStatus.ASSIGNED.name(), ACTOR,
                     "filling the timeline to its ceiling", CLOCK);
         }
-        assertEquals(AuditTimeline.MAX_EVENTS, auditTimeline.count(), "the timeline is full");
+        assertEquals(auditTimeline.maxEvents(), auditTimeline.count(), "the timeline is full");
 
         /* Identity and legality are settled before capacity, so an exhausted service still answers
            the question the caller asked. A 503 for either of these would be a retry invitation for
@@ -855,7 +863,7 @@ public class PostTradeServiceTest {
                 "no settlement-ready instant may be written");
         assertEquals(PostTradeStatus.EXCEPTION, orderStore.find("ORD-000001").getPostTradeStatus(),
                 "the parent order stays in exception");
-        assertEquals(AuditTimeline.MAX_EVENTS, auditTimeline.count(),
+        assertEquals(auditTimeline.maxEvents(), auditTimeline.count(),
                 "no refused step appends an event");
     }
 
@@ -893,6 +901,85 @@ public class PostTradeServiceTest {
         assertEquals(postTrade.events("EXC-000002").size(),
                 postTrade.events("EXC-000002", 0, 0).size(),
                 "the unpaged read and the uncut page agree");
+    }
+
+    @Test
+    void testExceptionCapacityIsReportedAndRefusedAtAConfiguredCeiling() {
+        //A store sized to one exception, so the gate the submission path asks - and the claim
+        //behind it - are both reached without opening ten thousand breaks.
+        SettlementExceptionStore bounded = new SettlementExceptionStore(smallLimits());
+        PostTradeService service = new PostTradeService(orderStore, bounded, referenceData,
+                auditTimeline, CLOCK, limits);
+
+        assertEquals(SMALL_EXCEPTION_CEILING, bounded.maxExceptions(),
+                "the store reports the ceiling configuration sized it to");
+        assertTrue(service.hasCapacityToOpenException(),
+                "an empty store has room for the break an execution may find");
+
+        service.onExecuted(storedExecutedOrder(FABRIKAM_ID, "C1", QUANTITY), ACTOR);
+
+        assertEquals(SMALL_EXCEPTION_CEILING, bounded.count(), "the ceiling is reached exactly");
+        assertEquals(0, bounded.exceptionHeadroom(), "a full store reports no headroom");
+        /* This is the gate OrderLifecycleService asks of every submission: it reports false while
+           the submission can still be refused whole, which is what keeps an order from reaching
+           EXECUTED with nowhere to record the break its execution found. */
+        assertFalse(service.hasCapacityToOpenException(),
+                "a full store reports no room, so no further order may be admitted");
+
+        CapacityExceededException refused = assertThrows(CapacityExceededException.class,
+                () -> service.onExecuted(storedExecutedOrder(FABRIKAM_ID, "C2", QUANTITY), ACTOR),
+                "a break that cannot be stored must be refused rather than lost");
+        assertTrue(refused.getMessage().contains("SETTLEMENT_EXCEPTION_CAPACITY"),
+                "the refusal must name the key to raise: " + refused.getMessage());
+        assertEquals(SMALL_EXCEPTION_CEILING, bounded.count(),
+                "a refused break stores no exception");
+    }
+
+    @Test
+    void testTheWorkflowGatesRefuseAtAConfiguredAuditCeiling() {
+        //A timeline sized to thirty events, so the assign and resolve gates are reached in a few
+        //appends; their default-sized equivalents above have to write 150,000.
+        AuditTimeline bounded = new AuditTimeline(smallLimits());
+        PostTradeService service = new PostTradeService(orderStore, exceptionStore, referenceData,
+                bounded, CLOCK, limits);
+
+        service.onExecuted(storedExecutedOrder(FABRIKAM_ID, "C1", QUANTITY), ACTOR);
+        String exceptionId = "EXC-000001";
+        assertEquals(SMALL_EVENT_CEILING, bounded.maxEvents(),
+                "the timeline reports the ceiling configuration sized it to");
+
+        for (int event = bounded.count(); event < bounded.maxEvents(); event++) {
+            bounded.append(ENTITY_EXCEPTION, exceptionId, StateMachine.EXCEPTION,
+                    ExceptionStatus.ASSIGNED.name(), ExceptionStatus.ASSIGNED.name(), ACTOR,
+                    "filling the configured timeline to its ceiling", CLOCK);
+        }
+        assertEquals(0, bounded.eventHeadroom(), "the configured timeline is full");
+
+        CapacityExceededException assignRefused = assertThrows(CapacityExceededException.class,
+                () -> service.assign(exceptionId, OWNER, ACTOR),
+                "an assignment that cannot be recorded must be refused");
+        assertTrue(assignRefused.getMessage().contains("AUDIT_EVENT_CAPACITY"),
+                "the refusal must name the key to raise: " + assignRefused.getMessage());
+        assertThrows(CapacityExceededException.class,
+                () -> service.resolve(exceptionId, new ResolveRequest(OWNER, NOTE), ACTOR),
+                "a resolution that cannot be recorded must be refused");
+
+        //Refused before the transition at a configured ceiling exactly as at the default one: the
+        //record can never be the reason a state change went unrecorded.
+        assertEquals(ExceptionStatus.OPEN, exceptionStore.find(exceptionId).getStatus(),
+                "a refused workflow step leaves the exception open");
+        assertNull(exceptionStore.find(exceptionId).getOwner(),
+                "no owner may be recorded by a refused assignment");
+        assertEquals(SMALL_EVENT_CEILING, bounded.count(),
+                "a refused workflow step appends no event");
+    }
+
+    /* The smallest ceilings the validation admits, which is what makes a capacity test instant:
+       one exception and thirty audit events, with the order and position minimums the seed set
+       needs. Built once here so the two tests above cannot drift apart on what "small" means. */
+    private static CapacityLimits smallLimits() {
+        return new CapacityLimits(CapacityLimits.MIN_MAX_ORDERS, SMALL_EXCEPTION_CEILING,
+                CapacityLimits.MIN_MAX_POSITIONS, SMALL_EVENT_CEILING);
     }
 
     private void assertExceptionEvent(AuditEvent event, String exceptionId, String fromState,

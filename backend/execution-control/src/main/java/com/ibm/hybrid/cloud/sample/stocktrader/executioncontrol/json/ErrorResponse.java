@@ -17,7 +17,16 @@
 
 package com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json;
 
+//mpOpenAPI 4.1
+import org.eclipse.microprofile.openapi.annotations.media.Schema;
+
+//Named explicitly so the published contract carries this type under the name the README and the
+//error tables use. It reaches the contract only because the resource methods declare it on their
+//error responses: it is produced by @Provider ExceptionMappers, which the OpenAPI scanner never
+//sees, so without those declarations a generated client had no model for any refusal at all.
 /** JSON body returned for a rejected request */
+@Schema(name = "ErrorResponse", description = "The body every refused request carries: the HTTP status, its reason phrase, "
+        + "a message naming the offending field, identifier or state, and the request path")
 public class ErrorResponse {
     //Deliberately unlabelled, unlike every other response type in this package: this body
     //describes a refused request rather than an order, an execution or seeded reference

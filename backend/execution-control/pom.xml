@@ -246,9 +246,17 @@
                     <execution>
                         <id>start-server</id>
                         <phase>pre-integration-test</phase>
+                        <!-- deploy before test-start, so the freshly packaged WAR is in the
+                             server's apps directory before the server boots and the application
+                             the ITs meet is started exactly once. Started the other way round, a
+                             build that reuses a target/ directory boots the previous run's WAR,
+                             deploy's search for the application-started message matches that
+                             start instead of the new artefact's, and copying the new WAR then
+                             restarts the application underneath the running tests - every path
+                             under the context root answering 404 while it does. -->
                         <goals>
-                            <goal>test-start</goal>
                             <goal>deploy</goal>
+                            <goal>test-start</goal>
                         </goals>
                         <configuration>
                             <looseApplication>false</looseApplication>

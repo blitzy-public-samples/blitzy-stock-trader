@@ -25,23 +25,33 @@ public class OrderRequest {
     private String clientId;
     private String symbol;
     private String side;
-    //quantity and limitPrice are boxed so an absent JSON key stays null: primitives would
-    //arrive as 0, making "field is required" indistinguishable from "field must be greater
-    //than zero", and the two cases owe the caller different messages.
-    private Long quantity;
+    /* quantity and limitPrice are boxed so an absent JSON key stays null: primitives would
+       arrive as 0, making "field is required" indistinguishable from "field must be greater
+       than zero", and the two cases owe the caller different messages.
+
+       quantity is a BigDecimal rather than a Long for the same reason limitPrice is one: the
+       deserializer must hand the lifecycle service the number the caller actually sent. Bound to
+       Long, a submitted 1.5 arrives here as 1 - truncated toward zero by the conversion, before
+       any validation can see it - and the order would then be stored, filled and audited for a
+       quantity nobody submitted. Held as a decimal, the fractional value survives to
+       OrderLifecycleService, which refuses it exactly as it refuses a sub-cent price. */
+    private BigDecimal quantity;
     private BigDecimal limitPrice;
 
 
     public OrderRequest() {
     }
 
+    //A whole share count is what the module's own producers - the seed loader and the unit tests -
+    //have to hand, so this convenience form takes one and widens it. The JSON-B property stays a
+    //decimal: only a submitted body can carry a fraction, and only it needs one to be refused with.
     public OrderRequest(String initialClientOrderId, String initialClientId, String initialSymbol,
             String initialSide, Long initialQuantity, BigDecimal initialLimitPrice) {
         setClientOrderId(initialClientOrderId);
         setClientId(initialClientId);
         setSymbol(initialSymbol);
         setSide(initialSide);
-        setQuantity(initialQuantity);
+        setQuantity((initialQuantity == null) ? null : BigDecimal.valueOf(initialQuantity));
         setLimitPrice(initialLimitPrice);
     }
 
@@ -77,11 +87,11 @@ public class OrderRequest {
         side = newSide;
     }
 
-    public Long getQuantity() {
+    public BigDecimal getQuantity() {
         return quantity;
     }
 
-    public void setQuantity(Long newQuantity) {
+    public void setQuantity(BigDecimal newQuantity) {
         quantity = newQuantity;
     }
 

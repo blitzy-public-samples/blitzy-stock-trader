@@ -17,6 +17,8 @@
 
 package com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.control;
 
+import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.Order;
+
 //Arbitrary-precision arithmetic
 import java.math.BigDecimal;
 import java.math.RoundingMode;
@@ -43,6 +45,10 @@ import jakarta.enterprise.inject.Vetoed;
 public class ControlLimits {
     private static final int AMOUNT_SCALE = 2;
 
+    //The smallest ceiling the two-decimal scale can hold, and therefore the smallest one that
+    //still admits an order. See requirePositiveAmount().
+    private static final BigDecimal MIN_AMOUNT = new BigDecimal("0.01");
+
     private final BigDecimal maxOrderNotional;
     private final BigDecimal maxPositionNotional;
     private final BigDecimal fatFingerNotionalThreshold;
@@ -56,20 +62,75 @@ public class ControlLimits {
         //Every consumer renders these amounts with two decimals - the pre-trade control reason
         //strings and the GET /controls body - so the scale is normalized once here and no
         //consumer re-derives it.
-        this.maxOrderNotional = Objects.requireNonNull(maxOrderNotional,
-                "maxOrderNotional is required").setScale(AMOUNT_SCALE, RoundingMode.HALF_UP);
-        this.maxPositionNotional = Objects.requireNonNull(maxPositionNotional,
-                "maxPositionNotional is required").setScale(AMOUNT_SCALE, RoundingMode.HALF_UP);
-        this.fatFingerNotionalThreshold = Objects.requireNonNull(fatFingerNotionalThreshold,
-                "fatFingerNotionalThreshold is required").setScale(AMOUNT_SCALE, RoundingMode.HALF_UP);
+        this.maxOrderNotional = requirePositiveAmount(maxOrderNotional, "MAX_ORDER_NOTIONAL",
+                "maxOrderNotional is required");
+        this.maxPositionNotional = requirePositiveAmount(maxPositionNotional,
+                "MAX_POSITION_NOTIONAL", "maxPositionNotional is required");
+        this.fatFingerNotionalThreshold = requirePositiveAmount(fatFingerNotionalThreshold,
+                "FAT_FINGER_NOTIONAL_THRESHOLD", "fatFingerNotionalThreshold is required");
         this.restrictedSymbols = canonicalize(restrictedSymbols);
+        //Zero is a legitimate SLA: an exception is then due the instant it opens, and slaDeadline
+        //equals openedAt. A negative value puts the deadline before the opening, so every
+        //exception is born breached and no owner can ever resolve one in time.
+        if (exceptionSlaHours < 0) {
+            throw new IllegalArgumentException(
+                    "EXCEPTION_SLA_HOURS must not be negative, not " + exceptionSlaHours);
+        }
         this.exceptionSlaHours = exceptionSlaHours;
     }
 
     //Retained because ControlLimitsProducer declares the bean it returns @ApplicationScoped, and CDI
     //generates that bean's client proxy only from a non-private no-arg constructor; nothing calls it.
+    //The fields are assigned here rather than by delegating to the constructor above, because these
+    //placeholders are exactly the values that constructor now refuses: the proxy carries them only
+    //to satisfy the final fields and forwards every call to the produced instance, so refusing them
+    //would fail every deployment instead of only a misconfigured one.
     protected ControlLimits() {
-        this(BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, Collections.emptySet(), 0);
+        maxOrderNotional = BigDecimal.ZERO;
+        maxPositionNotional = BigDecimal.ZERO;
+        fatFingerNotionalThreshold = BigDecimal.ZERO;
+        restrictedSymbols = Collections.emptySet();
+        exceptionSlaHours = 0;
+    }
+
+    /* A ceiling of zero or less is not a strict configuration but an unusable one: no order with a
+       positive quantity and a positive limit price can sit under it, so the service would report
+       itself healthy - readiness reads no limit - while rejecting every order ever submitted,
+       including the seeded ones. Refusing it in this constructor reaches both the producer, whose
+       IllegalArgumentException the container turns into the deployment failure a non-convertible
+       value already produces, and the unit tests, which build this object with new.
+
+       The submitted value is validated before the scale is normalized so the refusal names what the
+       operator configured rather than a rounded form of it, and the property name is the
+       environment-variable name so the log line is directly actionable. */
+    private static BigDecimal requirePositiveAmount(BigDecimal value, String property,
+            String nullMessage) {
+        if (Objects.requireNonNull(value, nullMessage).signum() <= 0) {
+            throw new IllegalArgumentException(
+                    property + " must be greater than zero, not " + render(value));
+        }
+
+        /* Positivity has to hold of the normalized value as well, because that is the ceiling the
+           controls actually compare against: 0.001 is positive and normalizes to 0.00, which is
+           the unusable ceiling this guard exists to refuse, reached by a value the check above
+           admits. The minimum named is the smallest amount two decimals can hold, and the message
+           reports what was configured so the rounding is visible rather than implied. */
+        BigDecimal normalized = value.setScale(AMOUNT_SCALE, RoundingMode.HALF_UP);
+        if (normalized.signum() <= 0) {
+            throw new IllegalArgumentException(property + " must be at least "
+                    + MIN_AMOUNT.toPlainString() + ", not " + render(value));
+        }
+
+        return normalized;
+    }
+
+    //Reports the representation instead of the amount for a value whose exponent makes rendering it
+    //the allocation the amount bounds exist to refuse - a configured -1E+1000000 is negative and
+    //would otherwise put a million digits in a start-up log line - which is the same trade-off
+    //PreTradeControlService makes when it reports a limit it cannot render.
+    private static String render(BigDecimal value) {
+        return Order.isAmountWithinBounds(value) ? value.toPlainString()
+                : "an amount of " + Order.describeAmount(value);
     }
 
     //Canonicalized here rather than at the configuration boundary because unit tests construct this object

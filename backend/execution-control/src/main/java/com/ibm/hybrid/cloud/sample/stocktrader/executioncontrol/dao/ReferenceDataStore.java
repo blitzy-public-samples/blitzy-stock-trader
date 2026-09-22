@@ -35,13 +35,13 @@ import java.util.Objects;
 
 //Concurrency
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
 //CDI 4.0
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
 
 
 /** In-memory store of the synthetic institutional clients and their positions */
@@ -49,10 +49,9 @@ import jakarta.enterprise.context.ApplicationScoped;
 public class ReferenceDataStore {
     private static final String KEY_SEPARATOR = "|";
 
-    //The ceiling on distinct client-and-symbol holdings. Lower than the order ceiling because a
-    //position is a key, not a record per order: only a client's first fill in a symbol adds one,
-    //and every later fill in that symbol rewrites it in place.
-    public static final int MAX_POSITIONS = 5_000;
+    //The label and the configuration key the admission counter reports this structure under.
+    private static final String STRUCTURE = "position";
+    private static final String CAPACITY_KEY = "POSITION_CAPACITY";
 
     //Ordered on the way out because ConcurrentHashMap iteration order is arbitrary, and
     //GET /positions is read entry by entry by its consumers.
@@ -69,13 +68,25 @@ public class ReferenceDataStore {
 
     private final ReentrantLock[] positionLocks = createPositionLocks();
 
-    /* Claims, not stored positions: a claim is taken inside the atomic step that would create the
-       key and released if no position came of it, so this counter - never positions.size() - is
-       what makes the ceiling exact under concurrency. Comparing the map's size would let any
-       number of simultaneous first fills in distinct symbols each read the same under-ceiling
-       size and all proceed. */
-    private final AtomicInteger admittedPositions = new AtomicInteger();
+    /* The ceiling on distinct client-and-symbol holdings, sized per instance from configuration.
+       Its default is lower than the order ceiling's because a position is a key, not a record per
+       order: only a client's first fill in a symbol adds one, and every later fill in that symbol
+       rewrites it in place. */
+    private final AdmissionCounter admission;
 
+
+    @Inject
+    public ReferenceDataStore(CapacityLimits limits) {
+        this.admission = new AdmissionCounter(STRUCTURE, CAPACITY_KEY, limits.getMaxPositions());
+    }
+
+    //Public rather than protected, and for two reasons: CDI generates the @ApplicationScoped
+    //client proxy only from a non-private no-arg constructor, and the lifecycle unit tests build
+    //the whole collaborator graph with new in a different package. A store built this way carries
+    //the shipped defaults, which are the values microprofile-config.properties holds.
+    public ReferenceDataStore() {
+        this(CapacityLimits.defaults());
+    }
 
     public void putClient(ClientAccount client) {
         clients.put(client.getClientId(), client);
@@ -92,7 +103,8 @@ public class ReferenceDataStore {
         positions.compute(positionKey(clientId, symbol), (key, current) -> {
             if (current == null && !tryAdmitPosition()) {
                 throw new CapacityExceededException("the position store is at capacity, so no new "
-                        + symbol + " position can be opened for clientId " + clientId);
+                        + symbol + " position can be opened for clientId " + clientId
+                        + "; raise POSITION_CAPACITY or restart to clear");
             }
             return position;
         });
@@ -118,8 +130,11 @@ public class ReferenceDataStore {
             boolean claimed = false;
             if (current == null) {
                 if (!tryAdmitPosition()) {
+                    //Named as in every other refusal: the message is the 503 body a caller reads,
+                    //and the ceiling is operator-sized, so it carries the remedy too.
                     throw new CapacityExceededException("the position store is at capacity, so no "
-                            + "new " + symbol + " position can be opened for clientId " + clientId);
+                            + "new " + symbol + " position can be opened for clientId " + clientId
+                            + "; raise POSITION_CAPACITY or restart to clear");
                 }
                 claimed = true;
             }
@@ -172,25 +187,15 @@ public class ReferenceDataStore {
         return locks;
     }
 
-    //A compare-and-set loop rather than incrementAndGet followed by a test, as in
-    //OrderStore.tryAdmitOrder: incrementing first would let concurrent claimants push the counter
-    //past the ceiling and then hand some of them a refusal, so the ceiling would be exact only
-    //after the fact. Here a claim is never recorded unless it was granted.
+    //The exact atomic claim taken inside the compute that would create the key, and the one
+    //authority on the ceiling: hasPositionCapacityFor below is the gate that decides which refusal
+    //a caller gets.
     private boolean tryAdmitPosition() {
-        int admitted = admittedPositions.get();
-        while (admitted < MAX_POSITIONS) {
-            if (admittedPositions.compareAndSet(admitted, admitted + 1)) {
-                return true;
-            }
-            admitted = admittedPositions.get();
-        }
-
-        return false;
+        return admission.tryAdmit();
     }
 
-    //Floored at zero so an unbalanced release cannot mint capacity that was never claimed.
     private void releasePositionAdmission() {
-        admittedPositions.updateAndGet(admitted -> (admitted > 0) ? admitted - 1 : 0);
+        admission.release();
     }
 
     /* Answered per key rather than on the map's size alone: a fill into a holding this client
@@ -202,11 +207,11 @@ public class ReferenceDataStore {
        what stays exact when two first fills in distinct symbols pass this gate together. */
     public boolean hasPositionCapacityFor(String clientId, String symbol) {
         if (clientId == null || symbol == null) {
-            return positions.size() < MAX_POSITIONS;
+            return positions.size() < admission.ceiling();
         }
 
         return positions.containsKey(positionKey(clientId, symbol))
-                || positions.size() < MAX_POSITIONS;
+                || positions.size() < admission.ceiling();
     }
 
     public ClientAccount findClient(String clientId) {
@@ -243,6 +248,19 @@ public class ReferenceDataStore {
 
     public int positionCount() {
         return positions.size();
+    }
+
+    //Read off the store rather than off configuration, which is what lets the health probes report
+    //the ceiling and the headroom without reading a configuration source of their own.
+    public int maxPositions() {
+        return admission.ceiling();
+    }
+
+    /* Headroom in claims rather than in stored keys, as in the other two stores: a claim taken
+       inside a fill still in flight is capacity this store will not grant twice. It bounds only
+       first fills in new holdings - an order in a holding the client already has needs none. */
+    public int positionHeadroom() {
+        return admission.headroom();
     }
 
     //strip rather than trim, matching the canonicalization the lifecycle applies before it gets

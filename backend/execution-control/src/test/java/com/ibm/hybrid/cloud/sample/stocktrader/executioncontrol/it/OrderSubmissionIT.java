@@ -32,6 +32,9 @@ import java.io.StringReader;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 import org.junit.jupiter.api.Assertions;
@@ -51,7 +54,17 @@ class OrderSubmissionIT {
     private static final String APP_ROOT = "http://localhost:" + PORT + "/" + WAR_CONTEXT;
     private static final String ORDERS_URL = APP_ROOT + "/orders";
     private static final String POSITIONS_URL = APP_ROOT + "/positions";
+    private static final String AUDIT_URL = APP_ROOT + "/audit";
     private static final String READY_URL = "http://localhost:" + PORT + "/health/ready";
+    //Served by the Liberty runtime outside the WAR's context root, like the health endpoints, and
+    //deliberately unauthenticated - the published contract is not privileged information.
+    private static final String OPENAPI_URL = "http://localhost:" + PORT + "/openapi";
+
+    private static final String LOCATION_HEADER = "Location";
+    private static final String TOTAL_COUNT_HEADER = "X-Total-Count";
+    private static final String PAGE_OFFSET_HEADER = "X-Page-Offset";
+    private static final String PAGE_LIMIT_HEADER = "X-Page-Limit";
+    private static final String LINK_HEADER = "Link";
 
     private static final int MAX_RETRY_COUNT = 5;
     private static final int SLEEP_TIMEOUT = 3000;
@@ -277,6 +290,23 @@ class OrderSubmissionIT {
     }
 
     @Test
+    void testFractionalQuantityIsRejected() {
+        /* A JSON number can carry a fraction and a share count cannot, so a quantity of 1.5 has to
+           be refused rather than reconciled: narrowed to a whole count it would be stored, filled
+           and audited as 1, with the caller told nothing and the audit trail recording a quantity
+           nobody submitted. Over the wire it must answer 400 and name quantity, like any other
+           unusable field in the body - and a fraction below one must be named as a fraction rather
+           than as a value that is not greater than zero. */
+        assertBadRequest(fractionalQuantityBody(uniqueClientOrderId(), "1.5"), "quantity");
+        assertBadRequest(fractionalQuantityBody(uniqueClientOrderId(), "2.5"), "quantity");
+        assertBadRequest(fractionalQuantityBody(uniqueClientOrderId(), "0.5"), "quantity");
+        //A whole count written with a scale or as an exponent is not a fraction, so the rule must
+        //admit both: JSON-B leniency over the wire is preserved, not traded away for the refusal.
+        assertExecuted(fractionalQuantityBody(uniqueClientOrderId(), "100.00"));
+        assertExecuted(fractionalQuantityBody(uniqueClientOrderId(), "1E+2"));
+    }
+
+    @Test
     void testCompactExponentLimitPriceIsRejected() {
         /* One ordinary-sized JSON body whose limitPrice is 1E+1000000: the exponent lives in the
            number's scale, so the body stays small and the digits appear only when the price is
@@ -290,6 +320,151 @@ class OrderSubmissionIT {
         //Representable, and one cent above the absolute ceiling that keeps a notional bounded for
         //every share count a long can hold.
         assertBadRequest(orderBody(uniqueClientOrderId(), 100L, "1000000000000.01"), "limitPrice");
+    }
+
+    @Test
+    void testCreatedOrderCarriesLocationHeader() {
+        RestResult result = post(ORDERS_URL, orderBody(uniqueClientOrderId(), 1L, LIMIT_PRICE));
+
+        Assertions.assertEquals(201, result.status,
+                "Unexpected status submitting an in-limit order: " + result.body);
+
+        String orderId = readObject(result).getString("orderId");
+        String location = result.header(LOCATION_HEADER);
+        Assertions.assertNotNull(location, "A 201 must name the created order in a Location header");
+        Assertions.assertTrue(location.endsWith("/orders/" + orderId),
+                "Location did not address the created order: " + location);
+
+        //The header is only worth carrying if it resolves, so it is followed rather than parsed:
+        //the order that comes back has to be the one the submission reported.
+        RestResult followed = get(location);
+        Assertions.assertEquals(200, followed.status,
+                "The Location header did not resolve: " + location + " -> " + followed.body);
+        Assertions.assertEquals(orderId, readObject(followed).getString("orderId"),
+                "Following Location returned a different order: " + followed.body);
+    }
+
+    /* Malformed page parameters are clamped rather than refused, so the documented clamp holds for
+       input that cannot be parsed at all. Bound as int these answered a bodyless 404 from the
+       JAX-RS runtime - a status claiming the collection does not exist, carrying none of this
+       service's error envelope - which is why the parameters are read as strings and parsed by the
+       service itself. */
+    @Test
+    void testMalformedPageParametersAreClamped() {
+        String[] malformed = {
+            ORDERS_URL + "?offset=abc",
+            ORDERS_URL + "?limit=abc",
+            ORDERS_URL + "?offset=2.5",
+            ORDERS_URL + "?offset=-1&limit=0",
+            POSITIONS_URL + "?limit=abc",
+            AUDIT_URL + "?limit=abc"
+        };
+
+        for (String url : malformed) {
+            RestResult result = get(url);
+            Assertions.assertEquals(200, result.status,
+                    "A malformed page parameter must clamp rather than refuse: " + url + " -> " + result.body);
+            Assertions.assertFalse(readArray(result).isEmpty(),
+                    "A clamped read must still answer with the nearest page that exists: " + url);
+        }
+
+        //A whole number past the end is not malformed and must not fall back to the first page:
+        //it addresses a page that does not exist, and the honest answer is an empty one.
+        RestResult beyondEnd = get(ORDERS_URL + "?offset=999999999999999999999999");
+        Assertions.assertEquals(200, beyondEnd.status,
+                "An offset past the end must answer 200: " + beyondEnd.body);
+        Assertions.assertTrue(readArray(beyondEnd).isEmpty(),
+                "An offset past the end must answer with an empty page: " + beyondEnd.body);
+    }
+
+    /* A page has to say what it left behind. Without the total and the links a caller holding a
+       full page cannot tell a collection that ends there from one truncated at the page size, and
+       the audit timeline - which holds far more than one page - would read as complete. */
+    @Test
+    void testPagedCollectionReportsItsTotalAndLinks() {
+        //Two orders of headroom guaranteed by this class's own submissions plus the three seeded
+        //ones, so a one-record page always has a page after it.
+        post(ORDERS_URL, orderBody(uniqueClientOrderId(), 1L, LIMIT_PRICE));
+
+        RestResult firstPage = get(ORDERS_URL + "?limit=1");
+        Assertions.assertEquals(200, firstPage.status, "Unexpected status paging orders: " + firstPage.body);
+        Assertions.assertEquals(1, readArray(firstPage).size(),
+                "A limit of 1 must serialize one record: " + firstPage.body);
+
+        int total = Integer.parseInt(firstPage.header(TOTAL_COUNT_HEADER));
+        Assertions.assertTrue(total > 1, "The order total must count the whole collection, not the page: " + total);
+        Assertions.assertEquals("0", firstPage.header(PAGE_OFFSET_HEADER), "First page reported the wrong offset");
+        Assertions.assertEquals("1", firstPage.header(PAGE_LIMIT_HEADER), "The applied page size was not reported");
+
+        String links = firstPage.header(LINK_HEADER);
+        Assertions.assertNotNull(links, "A paged response must carry RFC 8288 page links");
+        Assertions.assertTrue(links.contains("rel=\"first\"") && links.contains("rel=\"next\"")
+                && links.contains("rel=\"last\""), "Page links were incomplete: " + links);
+        Assertions.assertTrue(links.contains("offset=1&limit=1"),
+                "The next link did not step by the applied page size: " + links);
+
+        //The limit a caller cannot exceed is reported as applied, so a traversal steps by the size
+        //it was actually served rather than the one it asked for.
+        RestResult oversized = get(ORDERS_URL + "?limit=10000");
+        Assertions.assertEquals("500", oversized.header(PAGE_LIMIT_HEADER),
+                "An oversized limit must report the clamped page size: " + oversized.body);
+
+        //The final page is the one with nothing after it, which is the traversal's own stop
+        //condition: no next link, and an offset that reports the end.
+        RestResult lastPage = get(ORDERS_URL + "?offset=" + (total - 1) + "&limit=1");
+        Assertions.assertEquals(200, lastPage.status, "Unexpected status reading the final page: " + lastPage.body);
+        Assertions.assertFalse(lastPage.header(LINK_HEADER).contains("rel=\"next\""),
+                "The final page must not advertise a next page: " + lastPage.header(LINK_HEADER));
+
+        //The audit timeline is the collection the total matters most on: it is the one structure
+        //with no entity ceiling, so a single read is a fraction of the record by design.
+        RestResult auditPage = get(AUDIT_URL + "?limit=1");
+        Assertions.assertTrue(Integer.parseInt(auditPage.header(TOTAL_COUNT_HEADER)) > 1,
+                "The audit total must count the whole timeline: " + auditPage.header(TOTAL_COUNT_HEADER));
+
+        //A filtered read pages its own matches, so its links have to carry the filter or a
+        //traversal would widen to the whole timeline on its second page.
+        RestResult filtered = get(AUDIT_URL + "?entityType=ORDER&entityId=ORD-000001&limit=2");
+        Assertions.assertEquals("5", filtered.header(TOTAL_COUNT_HEADER),
+                "A filtered page must total its own matches: " + filtered.body);
+        Assertions.assertTrue(filtered.header(LINK_HEADER).contains("entityId=ORD-000001"),
+                "Page links dropped the filter: " + filtered.header(LINK_HEADER));
+    }
+
+    /* The published contract is what a generated client is built from, so the statuses this
+       service really returns have to appear in it: undeclared, mpOpenAPI offered one 200 per
+       operation and no error model, and POST /orders was documented as 200 while every submission
+       answers 201. */
+    @Test
+    void testPublishedContractCarriesErrorModelAndCreatedStatus() {
+        RestResult result = get(OPENAPI_URL);
+        Assertions.assertEquals(200, result.status, "The OpenAPI contract was not served: " + result.body);
+
+        JsonObject contract = readObject(result);
+        Assertions.assertTrue(contract.getJsonObject("components").getJsonObject("schemas")
+                        .containsKey("ErrorResponse"),
+                "The contract carries no ErrorResponse schema, so no client has a model for a refusal");
+
+        JsonObject submit = contract.getJsonObject("paths").getJsonObject("/orders").getJsonObject("post");
+        JsonObject responses = submit.getJsonObject("responses");
+        Assertions.assertTrue(responses.containsKey("201"),
+                "POST /orders must be documented as 201, the status it returns: " + responses.keySet());
+        Assertions.assertFalse(responses.containsKey("200"),
+                "POST /orders must not be documented as 200: " + responses.keySet());
+        Assertions.assertTrue(responses.getJsonObject("201").getJsonObject("headers").containsKey("Location"),
+                "The documented 201 does not mention its Location header");
+
+        for (String errorStatus : new String[] {"400", "409", "503"}) {
+            Assertions.assertEquals("#/components/schemas/ErrorResponse",
+                    responses.getJsonObject(errorStatus).getJsonObject("content")
+                            .getJsonObject(MediaType.APPLICATION_JSON).getJsonObject("schema").getString("$ref"),
+                    "POST /orders " + errorStatus + " does not describe an ErrorResponse body");
+        }
+
+        //A read operation's own refusal, to prove the error model is not only on the submit path.
+        Assertions.assertTrue(contract.getJsonObject("paths").getJsonObject("/orders/{orderId}")
+                        .getJsonObject("get").getJsonObject("responses").containsKey("404"),
+                "GET /orders/{orderId} does not document the 404 it returns for an unknown id");
     }
 
     @Test
@@ -391,6 +566,27 @@ class OrderSubmissionIT {
         assertMalformedBodyRejected("[1,2,3]");
     }
 
+    @Test
+    void testOversizeRequestBodyIsRefusedByTheContainer() {
+        /* A body one megabyte long, made so by a field the request model does not declare: unknown
+           JSON properties are ignored, so without a size ceiling the payload can be arbitrary and
+           the server allocates all of it before discovering there was nothing in it to read. The
+           ceiling is configured on the HTTP channel, which answers 413 and carries no ErrorResponse
+           body, because the refusal happens before the application is reached - and that is the
+           assertion below: the same clientOrderId then submits successfully, which it could not do
+           if the oversize attempt had got as far as reserving it. */
+        String clientOrderId = uniqueClientOrderId();
+        RestResult oversize = post(ORDERS_URL, oversizeOrderBody(clientOrderId));
+
+        Assertions.assertEquals(413, oversize.status,
+                "An oversize request body must be refused by the container: " + oversize.body);
+
+        RestResult accepted = post(ORDERS_URL, orderBody(clientOrderId, 100L, LIMIT_PRICE));
+        Assertions.assertEquals(201, accepted.status,
+                "The refused body must have reserved nothing, so " + clientOrderId
+                        + " must still be submittable: " + accepted.body);
+    }
+
     //One POST, one set of assertions: the four invalid bodies differ only in the field they spoil,
     //and a shared assertion keeps that the only difference between them.
     private static void assertBadRequest(String jsonBody, String expectedField) {
@@ -404,6 +600,18 @@ class OrderSubmissionIT {
                 "ErrorResponse status did not repeat the HTTP status: " + result.body);
         Assertions.assertTrue(error.getString("message", "").contains(expectedField),
                 "The 400 did not name the offending field " + expectedField + ": " + result.body);
+    }
+
+    //The other half of the whole-number rule: a body the rule must still accept, asserted on the
+    //terminal state so a quantity written with a scale is proved to have filled rather than merely
+    //not been refused.
+    private static void assertExecuted(String jsonBody) {
+        RestResult result = post(ORDERS_URL, jsonBody);
+
+        Assertions.assertEquals(201, result.status,
+                "A whole share count must be accepted: " + result.body);
+        Assertions.assertEquals("EXECUTED", readObject(result).getString("status", ""),
+                "A whole share count under every limit must execute: " + result.body);
     }
 
     /* Separate from assertBadRequest rather than a parameter of it: that helper asserts the refusal
@@ -455,6 +663,38 @@ class OrderSubmissionIT {
                 .add("side", BUY)
                 .add("quantity", quantity)
                 .add("limitPrice", new BigDecimal(limitPrice))
+                .build()
+                .toString();
+    }
+
+    /* orderBody() takes a whole share count and so cannot express the one shape this rule is
+       about. The quantity is added as a BigDecimal, so it reaches the wire as a JSON number
+       carrying its scale - "1.5" as a string would be a different test, refused by the
+       deserializer rather than by the service. */
+    private static String fractionalQuantityBody(String clientOrderId, String quantity) {
+        return Json.createObjectBuilder()
+                .add("clientOrderId", clientOrderId)
+                .add("clientId", CLIENT_ID)
+                .add("symbol", SYMBOL)
+                .add("side", BUY)
+                .add("quantity", new BigDecimal(quantity))
+                .add("limitPrice", new BigDecimal(LIMIT_PRICE))
+                .build()
+                .toString();
+    }
+
+    //A well-formed order body padded past the configured request-size ceiling by a property the
+    //request model does not declare, so the only thing making it oversize is padding a caller
+    //controls freely.
+    private static String oversizeOrderBody(String clientOrderId) {
+        return Json.createObjectBuilder()
+                .add("clientOrderId", clientOrderId)
+                .add("clientId", CLIENT_ID)
+                .add("symbol", SYMBOL)
+                .add("side", BUY)
+                .add("quantity", 100L)
+                .add("limitPrice", new BigDecimal(LIMIT_PRICE))
+                .add("junk", "A".repeat(1_000_000))
                 .build()
                 .toString();
     }
@@ -536,24 +776,40 @@ class OrderSubmissionIT {
     //409 observe a status at all.
     private static RestResult capture(Response response) {
         try {
-            //close() releases the entity stream, so the body has to be read ahead of it.
-            return new RestResult(response.getStatus(), response.readEntity(String.class));
+            //Headers are copied before close() for the same reason the body is read before it: the
+            //response is released on the way out and nothing on it survives the call.
+            return new RestResult(response.getStatus(), response.readEntity(String.class),
+                    new HashMap<>(response.getStringHeaders()));
         } finally {
             response.close();
         }
     }
 
-    /** Both halves of one REST answer: the status code and the body that explains it */
+    /** One REST answer in the three parts these tests assert on: status, body and headers */
     private static final class RestResult {
 
         private final int status;
         private final String body;
+        private final Map<String, List<String>> headers;
 
-        private RestResult(int status, String body) {
+        private RestResult(int status, String body, Map<String, List<String>> headers) {
             this.status = status;
             //An absent entity is normalised so a body assertion reports the mismatch it found
             //rather than failing with a NullPointerException that names nothing.
             this.body = (body == null) ? "" : body;
+            this.headers = headers;
+        }
+
+        //Null for an absent header rather than an empty string, so a missing metadata header is
+        //reported as missing instead of as a value that failed to match.
+        private String header(String name) {
+            for (Map.Entry<String, List<String>> entry : headers.entrySet()) {
+                //HTTP field names are case-insensitive and the container chooses their casing.
+                if (entry.getKey().equalsIgnoreCase(name)) {
+                    return entry.getValue().isEmpty() ? null : entry.getValue().get(0);
+                }
+            }
+            return null;
         }
     }
 }

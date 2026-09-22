@@ -17,6 +17,7 @@
 
 package com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.audit;
 
+import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.dao.CapacityLimits;
 import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.AuditEvent;
 import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.StateMachine;
 import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.lifecycle.CapacityExceededException;
@@ -47,6 +48,14 @@ class AuditTimelineTest {
        carried the wall clock, or no clock at all, fails rather than passing by luck. */
     private static final Instant FIXED = Instant.parse("2025-01-02T03:04:05Z");
     private static final Clock CLOCK = Clock.fixed(FIXED, ZoneOffset.UTC);
+
+    //Thirty is the smallest ceiling CapacityLimits admits - ten events for each of the three
+    //orders the seed set writes - so it is what a "configured ceiling" test can reach in a loop.
+    private static final int SMALL_EVENT_CEILING = 30;
+
+    //The shipped default, restated here rather than read from CapacityLimits alone, so lowering
+    //that constant fails this test instead of silently changing what the README documents.
+    private static final int DOCUMENTED_EVENT_CEILING = 150_000;
 
     private AuditTimeline timeline;
 
@@ -191,9 +200,9 @@ class AuditTimelineTest {
     @Test
     void testCapacityIsReportedAgainstTheCeiling() {
         assertEquals(0, timeline.count(), "a fresh timeline holds nothing");
-        assertTrue(timeline.hasCapacityFor(AuditTimeline.MAX_EVENTS),
+        assertTrue(timeline.hasCapacityFor(timeline.maxEvents()),
                 "an empty timeline has room for the whole ceiling");
-        assertFalse(timeline.hasCapacityFor(AuditTimeline.MAX_EVENTS + 1),
+        assertFalse(timeline.hasCapacityFor(timeline.maxEvents() + 1),
                 "no timeline has room for more than the ceiling");
 
         /* Filled in one loop with nothing asserted per event: what matters here is the ceiling,
@@ -201,13 +210,13 @@ class AuditTimelineTest {
            each asserted once in the tests above rather than a hundred thousand times. A flow asks
            for the headroom its edges need before it moves anything, which is why the reported
            figure has to be exact at the boundary and not merely close to it. */
-        for (int event = timeline.count(); event < AuditTimeline.MAX_EVENTS; event++) {
+        for (int event = timeline.count(); event < timeline.maxEvents(); event++) {
             timeline.append("ORDER", "ORD-000001", StateMachine.ORDER, "SUBMITTED", "ACCEPTED",
                     "stock", "all pre-trade controls passed", CLOCK);
         }
 
-        assertEquals(AuditTimeline.MAX_EVENTS, timeline.count(), "the timeline is at its ceiling");
-        assertEquals(AuditTimeline.MAX_EVENTS, timeline.all().size(),
+        assertEquals(timeline.maxEvents(), timeline.count(), "the timeline is at its ceiling");
+        assertEquals(timeline.maxEvents(), timeline.all().size(),
                 "every appended event is still readable at the ceiling");
         assertTrue(timeline.hasCapacityFor(0),
                 "a flow that records nothing is never refused, even at the ceiling");
@@ -219,14 +228,14 @@ class AuditTimelineTest {
     void testAppendAtTheCeilingIsRefusedAndConsumesNoSequenceNumber() {
         //Filled in the tightest loop the timeline offers, because the ceiling itself is the
         //subject here and the per-event guarantees are each asserted once above.
-        for (int event = timeline.count(); event < AuditTimeline.MAX_EVENTS; event++) {
+        for (int event = timeline.count(); event < timeline.maxEvents(); event++) {
             timeline.append("ORDER", "ORD-000001", StateMachine.ORDER, "SUBMITTED", "ACCEPTED",
                     "stock", "all pre-trade controls passed", CLOCK);
         }
 
         List<AuditEvent> full = timeline.all();
         AuditEvent last = full.get(full.size() - 1);
-        assertEquals(AuditTimeline.MAX_EVENTS, last.getSequence(),
+        assertEquals(timeline.maxEvents(), last.getSequence(),
                 "the ordinal of the last event at the ceiling");
 
         /* The gates the callers ask are reads that two threads can pass against the same headroom,
@@ -242,11 +251,11 @@ class AuditTimelineTest {
         /* A refused append takes no ordinal, which at the ceiling cannot be shown by a later
            successful append - there is none to be had - so the evidence is that nothing moved: the
            count stands and the last recorded event still carries the last ordinal issued. */
-        assertEquals(AuditTimeline.MAX_EVENTS, timeline.count(),
+        assertEquals(timeline.maxEvents(), timeline.count(),
                 "a refused append leaves the timeline at its ceiling");
-        assertEquals(AuditTimeline.MAX_EVENTS, timeline.all().size(),
+        assertEquals(timeline.maxEvents(), timeline.all().size(),
                 "every recorded event is still readable after the refusal");
-        AuditEvent lastAfterRefusal = timeline.all().get(AuditTimeline.MAX_EVENTS - 1);
+        AuditEvent lastAfterRefusal = timeline.all().get(timeline.maxEvents() - 1);
         assertSame(last, lastAfterRefusal, "the last recorded event is untouched");
         assertEquals(last.getSequence(), lastAfterRefusal.getSequence(),
                 "a refused append consumes no sequence number");
@@ -289,5 +298,66 @@ class AuditTimelineTest {
         assertThrows(UnsupportedOperationException.class,
                 () -> timeline.page(null, null, 0, 10).remove(0),
                 "a page is as unmodifiable as every other read view here");
+    }
+
+    @Test
+    void testAConfiguredEventCeilingIsReportedRefusedAtAndConsumesNoSequenceNumber() {
+        /* Thirty events rather than the default hundred and fifty thousand, and the ceiling is
+           reached in thirty appends instead of a hundred and fifty thousand: the ceiling is now a
+           configured value, so the behaviour at it is testable at any size an operator may set.
+           Thirty is the smallest legal audit ceiling, because CapacityLimits couples it to ten
+           times the order ceiling and three orders is the least the seed set allows. */
+        AuditTimeline bounded = new AuditTimeline(new CapacityLimits(CapacityLimits.MIN_MAX_ORDERS,
+                CapacityLimits.MIN_MAX_SETTLEMENT_EXCEPTIONS, CapacityLimits.MIN_MAX_POSITIONS,
+                SMALL_EVENT_CEILING));
+
+        assertEquals(SMALL_EVENT_CEILING, bounded.maxEvents(),
+                "the timeline reports the ceiling configuration sized it to");
+        assertEquals(SMALL_EVENT_CEILING, bounded.eventHeadroom(),
+                "an empty timeline has the whole ceiling as headroom");
+
+        for (int event = 0; event < SMALL_EVENT_CEILING; event++) {
+            bounded.append("ORDER", "ORD-000001", StateMachine.ORDER, "SUBMITTED", "ACCEPTED",
+                    "stock", "all pre-trade controls passed", CLOCK);
+            //Headroom falls by exactly one per append, which is what makes it a signal an operator
+            //can act on before the first refusal rather than a figure that only moves at the end.
+            assertEquals(SMALL_EVENT_CEILING - (event + 1), bounded.eventHeadroom(),
+                    "headroom after " + (event + 1) + " events");
+        }
+
+        assertEquals(0, bounded.eventHeadroom(), "a full timeline reports no headroom");
+        assertFalse(bounded.hasCapacityFor(1), "a full timeline reports no room for one more");
+
+        AuditEvent last = bounded.all().get(SMALL_EVENT_CEILING - 1);
+        assertEquals(SMALL_EVENT_CEILING, last.getSequence(),
+                "the ordinal of the last event at the configured ceiling");
+
+        CapacityExceededException refused = assertThrows(CapacityExceededException.class,
+                () -> bounded.append("ORDER", "ORD-000002", StateMachine.ORDER, "SUBMITTED",
+                        "ACCEPTED", "stock", "one event past the configured ceiling", CLOCK),
+                "an append at a configured ceiling must be refused rather than recorded");
+        //The refusal names the key an operator raises, because this text is the 503 body a caller
+        //reads and it is the shortest path from the symptom to the remedy.
+        assertTrue(refused.getMessage().contains("AUDIT_EVENT_CAPACITY"),
+                "the refusal must name the key to raise: " + refused.getMessage());
+
+        assertEquals(SMALL_EVENT_CEILING, bounded.count(),
+                "a refused append leaves the timeline at its ceiling");
+        assertSame(last, bounded.all().get(SMALL_EVENT_CEILING - 1),
+                "the last recorded event is untouched");
+        assertEquals(last.getSequence(), bounded.all().get(SMALL_EVENT_CEILING - 1).getSequence(),
+                "a refused append consumes no sequence number");
+    }
+
+    @Test
+    void testTheDefaultEventCeilingIsTheDocumentedFigure() {
+        /* The README quotes 150,000 events and the operational runbook extrapolates its sizing
+           figure from it, so the shipped default is pinned here: a deployment that supplies no
+           AUDIT_EVENT_CAPACITY must behave exactly as this module did before the ceiling became
+           configurable. */
+        assertEquals(DOCUMENTED_EVENT_CEILING, timeline.maxEvents(),
+                "a timeline built with no configuration carries the documented default");
+        assertEquals(DOCUMENTED_EVENT_CEILING, CapacityLimits.DEFAULT_MAX_AUDIT_EVENTS,
+                "the documented default of AUDIT_EVENT_CAPACITY");
     }
 }

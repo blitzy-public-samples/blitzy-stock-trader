@@ -47,6 +47,7 @@ public class LivenessProbe implements HealthCheck {
     private @Inject OrderStore orderStore;
     private @Inject SettlementExceptionStore settlementExceptionStore;
     private @Inject ReferenceDataStore referenceDataStore;
+    private @Inject AdmissionCapacityReport admissionCapacity;
 
 
     @Override
@@ -69,6 +70,13 @@ public class LivenessProbe implements HealthCheck {
             builder = builder.withData("exceptions", exceptions);
             builder = builder.withData("clients", clients);
             builder = builder.withData("positions", positions);
+
+            /* The ceilings and what remains of them, reported beside the counts so an exhausted
+               admission capacity is visible before the first refusal rather than only in the 503
+               that follows it. Liveness stays UP at saturation: the process answers, every read
+               and the whole exception workflow still work, and a restart would discard the state
+               a caller may still be reading. The data is the signal; the status is not. */
+            builder = admissionCapacity.describe(builder);
             builder = builder.withData("message", LIVE_MESSAGE);
 
             response = builder.build();

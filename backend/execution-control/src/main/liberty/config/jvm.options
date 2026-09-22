@@ -1,0 +1,19 @@
+# Heap bounds for the server JVM, in the server configuration directory so that the
+# container image, the Maven integration-test server and a local `server run` all get the
+# same ones.
+#
+# An absolute ceiling rather than -XX:MaxRAMPercentage: a percentage is only as good as the
+# memory figure the JVM reads, and a JVM inside a container that does not carry its own
+# memory limit reads the whole machine's. Measured on a build host that exposes 3.1 TB, the
+# unconfigured JVM chose a 30 GB maximum heap and a 2 GB initial heap, and resident memory
+# reached 1.9 GB for a live set of roughly 71 MB; a percentage of that same figure would
+# have bounded nothing. These two values bound it wherever the image runs.
+#
+# 384 MB is sized from what this service can actually hold: every structure has a ceiling
+# (10,000 orders, 10,000 exceptions, 5,000 positions, 150,000 audit events) and a full
+# estate retains roughly 130 MB, so the maximum leaves about three times the live set for
+# collection headroom and sits inside the 1Gi memory limit the README's manifest requests.
+# A deployment that raises those ceilings, or that wants a larger young generation for
+# throughput, should raise -Xmx here in step and grant the pod the memory to match.
+-Xms64m
+-Xmx384m

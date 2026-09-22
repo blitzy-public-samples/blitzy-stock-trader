@@ -31,7 +31,25 @@
 
     <variable name="TRACE_SPEC" defaultValue="*=info"/>
 
-    <logging traceSpecification="${TRACE_SPEC}" consoleLogLevel="INFO" />
+    <!-- Two messages are hidden, both raised by the runtime for something this service cannot
+         answer in code, and both driven by callers who need no credentials to repeat them:
+         SRVE0190E, which the file-serving extension logs as a WARNING with a stack trace for any
+         unknown sub-path under a runtime web app (/health, /openapi, /jwt), and SRVE0315E, which
+         the web container logs as an ERROR with a stack trace whenever an exception reaches it -
+         for this WAR only when the container itself refuses the request, a URI carrying an encoded
+         path separator being the reachable case, and otherwise from the runtime's own /jwt web app.
+         Neither hides an application diagnostic: Jakarta REST maps every failure this service
+         decides and answers it itself, so nothing of ours escapes to the container. Hiding
+         redirects rather than discards - both land in trace.log with their full stack, the FFDC
+         incident notice stays in messages.log, and TRAS3001I records the hiding at startup.
+         The file bounds matter for the same reason the messages do: redirected or not, an
+         anonymous caller drives them, so the logs are capped rather than left to grow, and maxFiles
+         bounds the FFDC exception summaries with them. FFDC incidents are de-duplicated by the
+         runtime per signature, which bounds the directory within a run but not across restarts;
+         maxFfdcAge ages the files out. -->
+    <logging traceSpecification="${TRACE_SPEC}" consoleLogLevel="INFO"
+         hideMessage="SRVE0190E,SRVE0315E"
+         maxFileSize="20" maxFiles="5" maxFfdcAge="1d" />
 
     <!-- The ports are variables rather than literals so the listener can be moved on a
          shared host: the build sets liberty.var.default.http.port, which Liberty maps
@@ -41,13 +59,36 @@
     <variable name="default.http.port" defaultValue="9080"/>
     <variable name="default.https.port" defaultValue="9443"/>
 
+    <!-- The ceiling below is the size of a whole incoming message - request line, headers
+         and body - not of the body alone, which is why it is not set at the 1 KB a
+         legitimate request needs. The largest body any endpoint accepts is a resolution
+         (a 64-character owner and a 1024-character note, 1,047 bytes), and the header
+         block a caller arrives with is the part that varies: a bearer token, an SSO
+         cookie and proxy headers together reach a few kilobytes. 8 KB leaves room for
+         both and still refuses a megabyte body at the channel, before the request reaches
+         the application and before JSON-B allocates anything for it. Raise it only for a
+         deployment whose identity provider issues unusually large tokens. -->
+    <variable name="MAX_REQUEST_SIZE_BYTES" defaultValue="8192"/>
+
     <!-- One listener per scheme, because Liberty's response-header policy is scoped to an
          endpoint and not to a scheme: HSTS means something only to a client that already
          arrived over TLS, so the cleartext listener must not assert it while the TLS one
          must. Each endpoint disables the port it does not serve with -1. $WSEP is removed
          because the web container emits it on every response, naming the product to anyone
-         who asks; removeServerHeader and disableXPoweredBy do not cover it. -->
+         who asks; removeServerHeader and disableXPoweredBy do not cover it.
+
+         Compression is declared per endpoint because the element is scoped to one, and it
+         names text/* alongside application/json because listing a type replaces Liberty's
+         default list rather than extending it. It earns its place on this service's
+         collections specifically: every record repeats the same constant disclaimer, which
+         is the most compressible thing a payload can carry - a 500-event audit page of
+         about 235 KB is served in under 10 KB. A caller that offers no encoding still
+         receives the identical uncompressed body. -->
     <httpEndpoint httpPort="${default.http.port}" httpsPort="-1" host="*" id="defaultHttpEndpoint">
+        <compression serverPreferredAlgorithm="gzip">
+            <types>application/json</types>
+            <types>text/*</types>
+        </compression>
         <headers>
             <set>X-Content-Type-Options: nosniff</set>
             <set>Cache-Control: no-store</set>
@@ -56,6 +97,10 @@
     </httpEndpoint>
 
     <httpEndpoint httpPort="-1" httpsPort="${default.https.port}" host="*" id="defaultHttpsEndpoint">
+        <compression serverPreferredAlgorithm="gzip">
+            <types>application/json</types>
+            <types>text/*</types>
+        </compression>
         <headers>
             <set>X-Content-Type-Options: nosniff</set>
             <set>Cache-Control: no-store</set>
@@ -65,8 +110,12 @@
     </httpEndpoint>
 
     <!-- The id is the one both endpoints reach through the default httpOptionsRef, so a
-         single element suppresses the server signature on either listener. -->
-    <httpOptions id="defaultHttpOptions" removeServerHeader="true"/>
+         single element suppresses the server signature and applies the request-size
+         ceiling on either listener. An oversize message is answered 413 by the channel
+         itself, so that refusal carries no ErrorResponse body: nothing in the application
+         ran, which is the point of bounding it here rather than in a resource method. -->
+    <httpOptions id="defaultHttpOptions" removeServerHeader="true"
+         MessageSizeLimit="${MAX_REQUEST_SIZE_BYTES}"/>
 
     <webContainer disableXPoweredBy="true"/>
 
@@ -82,9 +131,22 @@
     <variable name="JWT_AUDIENCE" defaultValue="stock-trader"/>
     <variable name="JWT_ISSUER" defaultValue="http://stock-trader.ibm.com"/>
 
+    <!-- Load-bearing, not decoration: this attribute has no default in Liberty, and with
+         nothing supplying one the server invents a different password on every boot. The
+         key file it wrote on the first boot then cannot be decrypted on the second - a
+         BadPaddingException, CWWKS4106E, and every authenticated request answering 401
+         while all three health probes still report UP, because the failure is in the token
+         service rather than in the application. A stable value makes the file readable
+         across restarts, and is also what lets replicas of this service share a session.
+         The default is the same demonstration material the keystores above carry: override
+         it in any real deployment, keep it identical across replicas, and note that
+         changing it invalidates an existing key file, which must be deleted before the
+         server will start clean on it. -->
+    <variable name="LTPA_KEYS_PASSWORD" defaultValue="St0ckTr@der"/>
+
     <include optional="false" location="${server.config.dir}/includes/${AUTH_TYPE}.xml"/>
 
-    <ltpa expiration="1h"/>
+    <ltpa keysPassword="${LTPA_KEYS_PASSWORD}" expiration="1h"/>
 
     <webApplication id="ExecutionControl" name="ExecutionControl" location="ExecutionControl.war" contextRoot="/execution-control">
         <classloader apiTypeVisibility="+third-party"/>

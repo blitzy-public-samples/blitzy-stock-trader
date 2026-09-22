@@ -29,7 +29,6 @@ import java.util.Objects;
 
 //Concurrency
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -39,18 +38,16 @@ import java.util.function.UnaryOperator;
 
 //CDI 4.0
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
 
 
 /** In-memory store of every simulated order, keyed by order id */
 @ApplicationScoped
 public class OrderStore {
 
-    /* The ceiling on how many orders this process will ever admit. Submission is the estate's
-       primary growth vector - one accepted order also writes an execution, a position mark and up
-       to six audit events - so the whole in-memory footprint is governed from here, and it is a
-       constant rather than configuration because a deployment that needs more state needs a
-       datastore instead of a larger heap. */
-    public static final int MAX_ORDERS = 10_000;
+    //The label and the configuration key the admission counter reports this structure under.
+    private static final String STRUCTURE = "order";
+    private static final String CAPACITY_KEY = "ORDER_CAPACITY";
 
     //A fixed stripe count, not one lock per order: the table then cannot grow with the number of
     //orders, and two orders that happen to share a stripe contend only for the few microseconds a
@@ -63,11 +60,26 @@ public class OrderStore {
     private final AtomicLong executionIdSequence = new AtomicLong();
     private final ReentrantLock[] orderLocks = createOrderLocks();
 
-    /* Claims, not stored orders: a claim is taken before the order exists and released if the
-       submission is refused after it, so this counter - never orders.size() - is what makes the
-       ceiling exact under concurrency. Comparing the map's size would let any number of
-       simultaneous submissions each read the same under-ceiling size and all proceed. */
-    private final AtomicInteger admittedOrders = new AtomicInteger();
+    /* Submission is the estate's primary growth vector - one accepted order also writes an
+       execution, a position mark and up to six audit events - so the whole in-memory footprint is
+       governed from this ceiling, and it is sized per instance from configuration rather than held
+       as a code constant: a deployment whose volume exceeds the default must be able to say so
+       without a code change, and one that needs unbounded state still needs a datastore. */
+    private final AdmissionCounter admission;
+
+
+    @Inject
+    public OrderStore(CapacityLimits limits) {
+        this.admission = new AdmissionCounter(STRUCTURE, CAPACITY_KEY, limits.getMaxOrders());
+    }
+
+    //Public rather than protected, and for two reasons: CDI generates the @ApplicationScoped
+    //client proxy only from a non-private no-arg constructor, and the lifecycle and audit unit
+    //tests build the whole collaborator graph with new in a different package. A store built this
+    //way carries the shipped defaults, which are the values microprofile-config.properties holds.
+    public OrderStore() {
+        this(CapacityLimits.defaults());
+    }
 
     //Formatted under Locale.ROOT rather than the JVM's default: %d follows the default formatting
     //locale, so under a non-Latin numbering system these ids would come out in localized digits.
@@ -81,28 +93,17 @@ public class OrderStore {
         return String.format(Locale.ROOT, "EXE-%06d", executionIdSequence.incrementAndGet());
     }
 
-    //A compare-and-set loop rather than incrementAndGet followed by a test: incrementing first
-    //would let concurrent claimants push the counter past the ceiling and then hand some of them a
-    //refusal, so the ceiling would be exact only after the fact. Here a claim is never recorded
-    //unless it was granted, and the caller that is refused has changed nothing.
+    //The exact atomic claim every submission passes, and the one authority on the ceiling: the
+    //size comparisons the lifecycle asks first are gates that decide which refusal a caller gets.
     public boolean tryAdmitOrder() {
-        int admitted = admittedOrders.get();
-        while (admitted < MAX_ORDERS) {
-            if (admittedOrders.compareAndSet(admitted, admitted + 1)) {
-                return true;
-            }
-            admitted = admittedOrders.get();
-        }
-
-        return false;
+        return admission.tryAdmit();
     }
 
     //Returns a claim that never became a stored order - a duplicate client order id refused after
     //admission - because a slot consumed by an order that does not exist would shrink the usable
-    //ceiling for the life of the process. Floored at zero so an unbalanced release cannot mint
-    //capacity that was never claimed.
+    //ceiling for the life of the process.
     public void releaseOrderAdmission() {
-        admittedOrders.updateAndGet(admitted -> (admitted > 0) ? admitted - 1 : 0);
+        admission.release();
     }
 
     //Duplicate submission is settled here, in one atomic step, before any order object exists, so
@@ -182,7 +183,8 @@ public class OrderStore {
 
     //Ordering is a property of the whole store rather than of a page, so the snapshot is sorted
     //before the page is cut: without that, two calls could return overlapping or skipped orders
-    //while the map iterated differently. MAX_ORDERS is what keeps the intermediate copy bounded.
+    //while the map iterated differently. The order ceiling is what keeps the intermediate copy
+    //bounded.
     public List<Order> list(int offset, int limit) {
         List<Order> snapshot = new ArrayList<>(orders.values());
         snapshot.sort(Comparator.comparing(Order::getOrderId));
@@ -191,6 +193,19 @@ public class OrderStore {
 
     public int count() {
         return orders.size();
+    }
+
+    //Read off the store rather than off configuration, which is what lets the health probes report
+    //the ceiling and the headroom without reading a configuration source of their own.
+    public int maxOrders() {
+        return admission.ceiling();
+    }
+
+    /* Headroom in claims rather than in stored orders, because a claim is what the next submission
+       has to win: a claim taken by a submission still in flight is capacity this store will not
+       grant twice, so reporting ceiling minus count would overstate what remains. */
+    public int orderHeadroom() {
+        return admission.headroom();
     }
 
     /* Both arguments are taken defensively rather than asserted: a page read is a GET, and a

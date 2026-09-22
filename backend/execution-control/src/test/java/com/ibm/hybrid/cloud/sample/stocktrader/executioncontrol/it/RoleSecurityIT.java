@@ -54,6 +54,23 @@ class RoleSecurityIT {
     private static final int MAX_RETRY_COUNT = 5;
     private static final int SLEEP_TIMEOUT = 3000;
 
+    /* Liberty serves its own "Context Root Not Found" page, with a 404, for every path under a
+       context root whose application is not installed, so any other status - including the 401 an
+       anonymous caller draws from a constrained resource - proves the application itself is
+       answering. That is why the gate below sends no credentials: the predicate presupposes no
+       role, so the gate can never stand in for one of the four assertions this class exists to
+       make. */
+    private static final int CONTEXT_ROOT_NOT_FOUND = 404;
+
+    /* Several samples spread over a couple of seconds rather than one, because the application can
+       be up at the instant it is first sampled and still be torn down a moment later: deploying a
+       rebuilt WAR onto an already-running server restarts the application, and Liberty's
+       application monitor can take up to a second to notice the new file. A single sample taken
+       inside that gap would satisfy the gate and leave the checks themselves to meet the 404. */
+    private static final int APP_ROOT_CONFIRMATIONS = 3;
+    private static final int APP_ROOT_SETTLE_TIMEOUT = 1000;
+    private static final int APP_ROOT_MAX_ATTEMPTS = 20;
+
     private static final String AUTHORIZATION_HEADER = "Authorization";
 
     /* Two identities, and deliberately only these two. Under AUTH_TYPE=none the basicRegistry of
@@ -88,9 +105,22 @@ class RoleSecurityIT {
        the first to reach it, and mpHealth legitimately answers 503 for a moment between the WAR
        being deployed and the seed load finishing. A bounded wait tells that transient state apart
        from a service that never becomes healthy, and failing here reports the server rather than
-       misattributing the delay to a role constraint. */
+       misattributing the delay to a role constraint.
+
+       Two stages, because the two observations are different things. mpHealth is served by the
+       Liberty runtime, so it answers UP while the WAR itself is stopped and restarting - which is
+       exactly what deploying a rebuilt application onto an already-running server does. Waiting on
+       health alone therefore proceeds into a window where every path under the context root
+       answers 404, and a role constraint that was never reached gets reported as unenforced. The
+       application root has to be observed as well, as the two application-level sibling IT classes
+       already observe theirs. */
     @BeforeAll
     static void awaitReadiness() throws Exception {
+        awaitRuntimeReadiness();
+        awaitApplicationRoot();
+    }
+
+    private static void awaitRuntimeReadiness() throws Exception {
         RestResult result = get(READY_URL, null);
         for (int i = 0; (result.status != 200) && (i < MAX_RETRY_COUNT); i++) {
             System.out.println(READY_URL + " returned " + result.status + ", retrying ... ("
@@ -103,6 +133,38 @@ class RoleSecurityIT {
             throw new IllegalStateException("Service never became ready; last status from "
                     + READY_URL + " was " + result.status + ", body: " + result.body);
         }
+    }
+
+    //The URL polled is the very one the four checks use, so the gate confirms exactly what they
+    //need: that this path is answered by the application and not by Liberty's
+    //context-root-not-found page.
+    private static void awaitApplicationRoot() throws Exception {
+        RestResult result = get(ORDERS_URL, null);
+        int confirmations = servingContextRoot(result) ? 1 : 0;
+
+        for (int attempt = 0; (confirmations < APP_ROOT_CONFIRMATIONS)
+                && (attempt < APP_ROOT_MAX_ATTEMPTS); attempt++) {
+            //An unserved sample waits the full retry interval, a confirming one only the short
+            //settle interval, so an application that is already up costs the gate two seconds.
+            Thread.sleep((confirmations == 0) ? SLEEP_TIMEOUT : APP_ROOT_SETTLE_TIMEOUT);
+            result = get(ORDERS_URL, null);
+            //A 404 restarts the count: what matters is not that the application answered once but
+            //that it kept answering across the window in which a redeploy would take it down.
+            confirmations = servingContextRoot(result) ? (confirmations + 1) : 0;
+            System.out.println(ORDERS_URL + " returned " + result.status + " (" + confirmations
+                    + " of " + APP_ROOT_CONFIRMATIONS + " confirmations), attempt " + attempt
+                    + " of " + APP_ROOT_MAX_ATTEMPTS);
+        }
+
+        if (confirmations < APP_ROOT_CONFIRMATIONS) {
+            throw new IllegalStateException("Application never served its context root steadily;"
+                    + " last status from " + ORDERS_URL + " was " + result.status + ", body: "
+                    + result.body);
+        }
+    }
+
+    private static boolean servingContextRoot(RestResult result) {
+        return result.status != CONTEXT_ROOT_NOT_FOUND;
     }
 
     @Test

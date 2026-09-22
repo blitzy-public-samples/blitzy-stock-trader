@@ -17,6 +17,7 @@
 
 package com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.audit;
 
+import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.dao.CapacityLimits;
 import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.AuditEvent;
 import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.StateMachine;
 //The module's one capacity type, which is what lets one mapper answer 503 wherever a ceiling is
@@ -38,22 +39,25 @@ import java.util.Objects;
 //Concurrency
 import java.util.concurrent.atomic.AtomicLong;
 
+//Logging (JSR 47)
+import java.util.logging.Logger;
+
 //CDI 4.0
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
 
 
 /** Append-only, in-memory timeline of every state transition this service records */
 @ApplicationScoped
 public class AuditTimeline {
+    private static Logger logger = Logger.getLogger(AuditTimeline.class.getName());
 
-    /* The ceiling on how many events this process will hold. It sits strictly above the worst case
-       the entity ceilings imply - the README carries that arithmetic - because the record must
-       never be the thing that refuses a state change the stores would have accepted: a fully
-       worked estate has to be able to record its own last transitions, and an order that moved
-       with its transition unrecorded is exactly the outcome this timeline exists to make
-       impossible. Admission is therefore refused upstream, while headroom remains, and this
-       ceiling is reached only by a caller that got past every gate. */
-    public static final int MAX_EVENTS = 150_000;
+    //Remaining events at which the warning fires, a tenth of the ceiling floored at one, matching
+    //dao/AdmissionCounter: a signal that only arrived at saturation would report an exhaustion an
+    //operator can no longer get ahead of.
+    private static final int LOW_WATERMARK_DIVISOR = 10;
+
+    private static final String CAPACITY_KEY = "AUDIT_EVENT_CAPACITY";
 
     /* Appending is the only operation offered: nothing here amends or discards a recorded
        event, nothing hands out the live list, and AuditEvent is itself immutable. The
@@ -62,10 +66,43 @@ public class AuditTimeline {
     private final List<AuditEvent> events = new ArrayList<>();
     private final AtomicLong sequence = new AtomicLong();
 
+    /* The ceiling on how many events this process will hold, sized per instance from
+       configuration. CapacityLimits keeps it strictly above the worst case the order ceiling
+       implies - the README carries that arithmetic, and the coupling rule there enforces it
+       whatever an operator supplies - because the record must never be the thing that refuses a
+       state change the stores would have accepted: a fully worked estate has to be able to record
+       its own last transitions, and an order that moved with its transition unrecorded is exactly
+       the outcome this timeline exists to make impossible. Admission is therefore refused
+       upstream, while headroom remains, and this ceiling is reached only by a caller that got past
+       every gate. */
+    private final int maxEvents;
+    private final int lowWatermark;
+
+    //Guarded by this object's monitor, like the list itself, so the one-shot warnings need no
+    //atomics: every read and write of them happens inside a synchronized method. One shot each,
+    //so sustained appending at the ceiling cannot turn either warning into a log flood.
+    private boolean lowHeadroomWarned;
+    private boolean saturationWarned;
+
+
+    @Inject
+    public AuditTimeline(CapacityLimits limits) {
+        this.maxEvents = limits.getMaxAuditEvents();
+        this.lowWatermark = Math.max(1, this.maxEvents / LOW_WATERMARK_DIVISOR);
+    }
+
+    //Public rather than protected, and for two reasons: CDI generates the @ApplicationScoped
+    //client proxy only from a non-private no-arg constructor, and the lifecycle and audit unit
+    //tests build the whole collaborator graph with new in a different package. A timeline built
+    //this way carries the shipped default, which is the value microprofile-config.properties holds.
+    public AuditTimeline() {
+        this(CapacityLimits.defaults());
+    }
+
     /* The ordinal, the timestamp and the list position are all fixed under this method's
        monitor, so the three can never disagree: an event's ordinal always matches its place
        in the list, and no reader can observe an event out of order or half-recorded. The
-       clock arrives as a parameter because this bean is constructed with no dependencies,
+       clock arrives as a parameter because this bean takes nothing but its own ceiling,
        while the service's single injected UTC clock stays the one source of time - tests
        pin it with Clock.fixed(...) and compare timestamps exactly.
        The event id is formatted under Locale.ROOT rather than the JVM's default, because %d
@@ -80,9 +117,16 @@ public class AuditTimeline {
            two concurrent appends the way a read taken outside it can. It refuses before the
            ordinal is taken, so a refused append consumes no sequence number and leaves no gap in
            the record that a reader would have to explain. */
-        if (events.size() >= MAX_EVENTS) {
+        if (events.size() >= maxEvents) {
+            if (!saturationWarned) {
+                saturationWarned = true;
+                logger.warning("The audit timeline is saturated at its ceiling of " + maxEvents
+                        + " events, so further state changes are refused with 503. Raise "
+                        + CAPACITY_KEY + " and restart, or restart to clear the state.");
+            }
+
             throw new CapacityExceededException("the audit timeline is at capacity, so no further "
-                    + "event can be recorded");
+                    + "event can be recorded; raise " + CAPACITY_KEY + " or restart to clear");
         }
 
         long next = sequence.incrementAndGet();
@@ -90,6 +134,14 @@ public class AuditTimeline {
         AuditEvent event = new AuditEvent(String.format(Locale.ROOT, "EVT-%06d", next), next,
                 timestamp, entityType, entityId, stateMachine, fromState, toState, actor, reason);
         events.add(event);
+
+        if (!lowHeadroomWarned && (maxEvents - events.size()) <= lowWatermark) {
+            lowHeadroomWarned = true;
+            logger.warning("The audit timeline is close to its ceiling: " + events.size() + " of "
+                    + maxEvents + " events recorded. Raise " + CAPACITY_KEY
+                    + " and restart before it saturates, or restart to clear the state.");
+        }
+
         return event;
     }
 
@@ -102,11 +154,49 @@ public class AuditTimeline {
        flows may pass them against the same headroom and only append is exact. */
     public synchronized boolean hasCapacityFor(int eventCount) {
         int requested = Math.max(eventCount, 0);
-        return (long) events.size() + requested <= MAX_EVENTS;
+        return (long) events.size() + requested <= maxEvents;
     }
 
     public synchronized int count() {
         return events.size();
+    }
+
+    /* The size of the set page() narrows to, counted under the same monitor and by the same
+       matching rule, so a paged read can report the whole of what it cut a page from. Counted
+       rather than derived from a copy: the timeline is the one structure here with no entity
+       ceiling to bound it, and a total is a number - materializing 150,000 events to measure them
+       is the allocation page() already exists to avoid. */
+    public synchronized int count(String entityType, String entityId) {
+        boolean narrowByType = (entityType != null) && !entityType.isBlank();
+        boolean narrowById = (entityId != null) && !entityId.isBlank();
+
+        if (!narrowByType && !narrowById) {
+            return events.size();
+        }
+
+        int matches = 0;
+        for (AuditEvent event : events) {
+            if (narrowByType && !entityType.equals(event.getEntityType())) {
+                continue;
+            }
+            if (narrowById && !entityId.equals(event.getEntityId())) {
+                continue;
+            }
+            matches++;
+        }
+        return matches;
+    }
+
+    //Read off the timeline rather than off configuration, which is what lets the health probes
+    //report the ceiling and the headroom without reading a configuration source of their own.
+    public int maxEvents() {
+        return maxEvents;
+    }
+
+    //Read under the same monitor as append, because a size taken outside it could be observed
+    //mid-append. Floored at zero, so a consumer of the health data never sees a negative headroom.
+    public synchronized int eventHeadroom() {
+        return Math.max(0, maxEvents - events.size());
     }
 
     /* Both reads answer with an unmodifiable view over a copy taken under the same monitor as

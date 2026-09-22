@@ -72,6 +72,17 @@ public class OrderLifecycleService {
     //stored and rendered value is held to. See price().
     private static final BigDecimal MAX_LIMIT_PRICE = new BigDecimal("1000000000000.00");
 
+    //The share count an Order, a Position and every resulting-quantity sum are held in. A submitted
+    //value above it is a field violation that names quantity rather than an arithmetic surprise
+    //later. See shares().
+    private static final BigDecimal MAX_QUANTITY = BigDecimal.valueOf(Long.MAX_VALUE);
+
+    /* How wide a refused quantity may be before it is reported by its representation rather than
+       its digits. Any share count a caller could plausibly have meant fits far inside this; beyond
+       it, rendering the value is itself the allocation the refusal exists to avoid, since
+       1E-1000000 is a dozen characters to send and a million digits to print. */
+    private static final int MAX_RENDERED_QUANTITY_DIGITS = 64;
+
     /* Semantic lengths, held as code constants rather than configuration: these are what the
        fields mean - an identifier a caller's own system issued and an exchange ticker - not a
        tuning knob, and a client that could raise them could store a megabyte under a key the
@@ -190,15 +201,7 @@ public class OrderLifecycleService {
             throw new ValidationException("side must be BUY or SELL");
         }
 
-        Long requestedQuantity = request.getQuantity();
-        if (requestedQuantity == null) {
-            throw new ValidationException("quantity is required");
-        }
-        long quantity = requestedQuantity.longValue();
-        if (quantity <= 0L) {
-            throw new ValidationException("quantity must be greater than zero");
-        }
-
+        long quantity = shares(request.getQuantity());
         BigDecimal limitPrice = price(request.getLimitPrice());
 
         //An unknown client is a bad field in a submitted body rather than a missing addressed
@@ -209,6 +212,54 @@ public class OrderLifecycleService {
         }
 
         return new SubmittedOrder(clientOrderId, clientId, symbol, side, quantity, limitPrice);
+    }
+
+    /* A quantity is shares, so it has to be a whole number of them and it has to be positive. The
+       whole number is a refusal rather than a narrowing, for the same reason the cent check in
+       price() is: a submitted 1.5 narrowed to 1 would store, fill and audit an order for a quantity
+       nobody sent, and the caller would be told nothing. The sign is read first, so zero and a
+       negative keep the message that names them - a fraction below one is a fraction, not an absent
+       or non-positive value, and is refused as one. */
+    private static long shares(BigDecimal quantity) {
+        if (quantity == null) {
+            throw new ValidationException("quantity is required");
+        }
+        //signum() reads the sign off the magnitude the caller already parsed, so it is safe to ask
+        //before the width checks below; nothing above this line expands the value.
+        if (quantity.signum() <= 0) {
+            throw new ValidationException("quantity must be greater than zero");
+        }
+
+        //Trailing zeros are not a fraction: 1.00 and 1E+2 are whole share counts and are admitted.
+        //A scale that survives stripping is a genuine fraction of a share and cannot be filled.
+        if (quantity.stripTrailingZeros().scale() > 0) {
+            throw new ValidationException("quantity must be a whole number of shares"
+                    + (isRenderable(quantity) ? ", not " + quantity.toPlainString()
+                            : " (" + Order.describeAmount(quantity) + ")"));
+        }
+
+        /* compareTo settles this without expanding either side - it compares adjusted exponents
+           before it matches scales - so a compact 1E+1000000 is refused here rather than converted.
+           The ceiling is the long range the stored quantity, the filled quantity and every
+           resulting-position sum live in; a value past it is corrected and resubmitted, so it
+           answers 400 naming the field like any other unusable value in the body. */
+        if (quantity.compareTo(MAX_QUANTITY) > 0) {
+            throw new ValidationException("quantity must not exceed " + Long.MAX_VALUE);
+        }
+
+        return quantity.longValueExact();
+    }
+
+    /* Whether a refused quantity may be printed back to the caller. Its digit count and decimal
+       places bound the length of the plain string without building it, and the bit length is asked
+       first for the reason Order.isAmountWithinBounds asks it first: precision() walks the whole
+       magnitude, and four bits per decimal digit over-estimates the 3.33 a digit needs, so this
+       refuses nothing the digit count would have admitted. The scale is widened to a long before
+       Math.abs, because abs(Integer.MIN_VALUE) is negative. */
+    private static boolean isRenderable(BigDecimal quantity) {
+        return quantity.unscaledValue().bitLength() <= MAX_RENDERED_QUANTITY_DIGITS * 4
+                && quantity.precision() <= MAX_RENDERED_QUANTITY_DIGITS
+                && Math.abs((long) quantity.scale()) <= MAX_RENDERED_QUANTITY_DIGITS;
     }
 
     /* A price is money, so it has to be a whole number of cents and it has to be positive. The sign
@@ -308,27 +359,33 @@ public class OrderLifecycleService {
        checks run first and the exact order claim last, which is what leaves exactly one claim to
        release and no claim taken for a check that then refused. */
     private void requireCapacity(SubmittedOrder submitted) {
+        /* Each refusal names the variable that governs the ceiling it hit, because this message is
+           the 503 body the caller reads and it is the shortest path from the symptom to the
+           remedy: the ceilings are operator-sized, so "raise ORDER_CAPACITY" is an action, where
+           "at capacity" alone was only a diagnosis. The existing wording stays as the lead clause
+           so the refusal a caller already matches on is unchanged. */
         if (!auditTimeline.hasCapacityFor(MAX_EVENTS_PER_SUBMISSION)) {
-            throw new CapacityExceededException(
-                    "the audit timeline is at capacity, so no further order can be recorded");
+            throw new CapacityExceededException("the audit timeline is at capacity, so no further "
+                    + "order can be recorded; raise AUDIT_EVENT_CAPACITY or restart to clear");
         }
 
         //Asked of every submission although most orders open no break: any execution may find one,
         //and an order must not reach EXECUTED with nowhere to record it.
         if (!postTrade.hasCapacityToOpenException()) {
             throw new CapacityExceededException("the settlement-exception store is at capacity, so "
-                    + "no order that might open a break can be admitted");
+                    + "no order that might open a break can be admitted; raise "
+                    + "SETTLEMENT_EXCEPTION_CAPACITY or restart to clear");
         }
 
         if (!referenceData.hasPositionCapacityFor(submitted.clientId, submitted.symbol)) {
             throw new CapacityExceededException("the position store is at capacity, so no new "
                     + submitted.symbol + " position can be opened for clientId "
-                    + submitted.clientId);
+                    + submitted.clientId + "; raise POSITION_CAPACITY or restart to clear");
         }
 
         if (!orderStore.tryAdmitOrder()) {
-            throw new CapacityExceededException(
-                    "the order store is at capacity, so no further order can be admitted");
+            throw new CapacityExceededException("the order store is at capacity, so no further "
+                    + "order can be admitted; raise ORDER_CAPACITY or restart to clear");
         }
     }
 
@@ -455,6 +512,12 @@ public class OrderLifecycleService {
     //its ceiling is never serialized whole into one response.
     public List<Order> list(int offset, int limit) {
         return orderStore.list(offset, limit);
+    }
+
+    //How many orders the page above was cut from, so a paged response can report the truncation
+    //instead of leaving a caller to infer it from a page that happens to be full.
+    public int count() {
+        return orderStore.count();
     }
 
     public List<AuditEvent> events(String orderId) {

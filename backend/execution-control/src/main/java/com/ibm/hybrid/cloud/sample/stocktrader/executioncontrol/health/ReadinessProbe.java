@@ -49,6 +49,7 @@ public class ReadinessProbe implements HealthCheck {
     private static final String NOT_SET = "(not set)";
 
     private @Inject SeedDataLoader seedDataLoader;
+    private @Inject AdmissionCapacityReport admissionCapacity;
 
     //Both settings have server.xml <variable> defaults and resolve through MicroProfile Config,
     //which exposes those variables as a config source alongside any deployment environment
@@ -78,6 +79,14 @@ public class ReadinessProbe implements HealthCheck {
                 builder = builder.up();
                 logger.fine("Returning ready!");
             }
+
+            /* The same admission data the liveness probe carries, and deliberately not a down()
+               condition. Readiness stays UP at saturation because every read, and the whole
+               assign/resolve/settlement-ready workflow, still function at the order ceiling:
+               reporting DOWN would take the pod out of its Service and break those too, while a
+               Deployment never restarts a pod for a failing readiness probe, so the refusals would
+               continue with the reads broken as well. The `admission` datum is the signal. */
+            builder = admissionCapacity.describe(builder);
 
             builder = builder.withData("message", message);
             builder = builder.withData("jwtAudience", jwtAudience.orElse(NOT_SET));

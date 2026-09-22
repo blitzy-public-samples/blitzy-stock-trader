@@ -38,9 +38,11 @@ public class CapacityExceededExceptionMapper implements ExceptionMapper<Capacity
 	public Response toResponse(CapacityExceededException exception) {
 		/* 503 rather than 429: the exhausted ceiling belongs to the whole service, not to the
 		   calling client, so no caller can clear it by slowing down and no per-client quota was
-		   crossed. No Retry-After either - the estate holds this state only in memory, so the
-		   headroom returns when the service restarts and not after any interval this service
-		   could honestly name. */
+		   crossed. No Retry-After either - the estate holds this state only in memory and the
+		   ceiling is operator-sized, so the headroom returns when an operator raises the
+		   governing *_CAPACITY variable or restarts the service, and at no interval this service
+		   could honestly name. The remedy travels in the message instead, which names that
+		   variable. */
 		ErrorResponse body = new ErrorResponse(Response.Status.SERVICE_UNAVAILABLE.getStatusCode(),
 				Response.Status.SERVICE_UNAVAILABLE.getReasonPhrase(), exception.getMessage(), uriInfo.getPath());
 

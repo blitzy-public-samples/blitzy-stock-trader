@@ -55,11 +55,28 @@ public class ControlLimitsProducer {
     @Produces
     @ApplicationScoped
     public ControlLimits controlLimits() {
-        ControlLimits limits = new ControlLimits(maxOrderNotional, maxPositionNotional,
-                fatFingerNotionalThreshold,
-                ControlLimits.restrictedSymbolsFrom(restrictedSymbols.getRawValue(),
-                        restrictedSymbols.getValue(), restrictedSymbols.getSourceName()),
-                exceptionSlaHours);
+        ControlLimits limits;
+        try {
+            limits = new ControlLimits(maxOrderNotional, maxPositionNotional,
+                    fatFingerNotionalThreshold,
+                    ControlLimits.restrictedSymbolsFrom(restrictedSymbols.getRawValue(),
+                            restrictedSymbols.getValue(), restrictedSymbols.getSourceName()),
+                    exceptionSlaHours);
+        } catch (IllegalArgumentException refused) {
+            /* ControlLimits refuses an unusable rule value during construction, which is before the
+               start-up line below runs, so without this the refusal would reach the log only as the
+               container's own deployment failure and the operator would not see which values were in
+               force. Logged with the submitted set - BigDecimal concatenation keeps a compact
+               exponent compact - and rethrown unchanged, because installing the application with a
+               ceiling no order can satisfy is the outcome the refusal exists to prevent. */
+            logger.severe("Refusing the configured pre-trade controls: " + refused.getMessage()
+                    + " (submitted MAX_ORDER_NOTIONAL=" + maxOrderNotional
+                    + ", MAX_POSITION_NOTIONAL=" + maxPositionNotional
+                    + ", FAT_FINGER_NOTIONAL_THRESHOLD=" + fatFingerNotionalThreshold
+                    + ", RESTRICTED_SYMBOLS=" + restrictedSymbols.getValue()
+                    + ", EXCEPTION_SLA_HOURS=" + exceptionSlaHours + ")");
+            throw refused;
+        }
 
         //The four pre-trade controls decide whether an order is accepted or rejected and the last
         //value ages settlement exceptions, so an operator diagnosing a rejection or an SLA figure

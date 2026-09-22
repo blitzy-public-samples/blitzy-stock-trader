@@ -3,7 +3,23 @@
 	<display-name>Execution Control</display-name>
 	<description>Institutional execution and post-trade control microservice from the Stock Trader application</description>
 	<!-- The authentication method is declared by @LoginConfig(MP-JWT) on ExecutionControlApplication, so this
-	     descriptor is deliberately left to carry the per-method role constraints and nothing else. -->
+	     descriptor carries the per-method role constraints and the container-level error surface. -->
+	<!-- Every refusal the application itself decides is answered by a Jakarta REST ExceptionMapper. This
+	     servlet answers the ones it never sees, because the web container settled them before any resource
+	     was reached - a URI it will not decode being the reachable case - and left to itself the container
+	     renders those as an HTML page naming the runtime class and line that threw. The error pages at the
+	     end of this descriptor route them here, and rest/WebApplicationExceptionMapper does the same for
+	     the statuses the Jakarta REST runtime raises for itself, so both produce the one
+	     {status, error, message, path} envelope. The mapping is an exact path, so it wins over the Jakarta
+	     REST application's /* mapping; reached directly it holds no resource and answers 404. -->
+	<servlet>
+		<servlet-name>ContainerErrorServlet</servlet-name>
+		<servlet-class>com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.rest.ContainerErrorServlet</servlet-class>
+	</servlet>
+	<servlet-mapping>
+		<servlet-name>ContainerErrorServlet</servlet-name>
+		<url-pattern>/container-error</url-pattern>
+	</servlet-mapping>
 	<security-role>
 		<description>Group with read-only access to simulated orders, settlement exceptions, audit events and synthetic reference data</description>
 		<role-name>StockViewer</role-name>
@@ -45,4 +61,32 @@
 			<role-name>StockTrader</role-name>
 		</auth-constraint>
 	</security-constraint>
+	<!-- The statuses the container and the Jakarta REST runtime decide on their own. 401 and 403 are
+	     deliberately absent: those are answered by the security collaborator together with the
+	     authentication challenge, and rewriting that response would change the authentication surface
+	     rather than the error surface. -->
+	<error-page>
+		<error-code>400</error-code>
+		<location>/container-error</location>
+	</error-page>
+	<error-page>
+		<error-code>404</error-code>
+		<location>/container-error</location>
+	</error-page>
+	<error-page>
+		<error-code>405</error-code>
+		<location>/container-error</location>
+	</error-page>
+	<error-page>
+		<error-code>406</error-code>
+		<location>/container-error</location>
+	</error-page>
+	<error-page>
+		<error-code>415</error-code>
+		<location>/container-error</location>
+	</error-page>
+	<error-page>
+		<error-code>500</error-code>
+		<location>/container-error</location>
+	</error-page>
 </web-app>

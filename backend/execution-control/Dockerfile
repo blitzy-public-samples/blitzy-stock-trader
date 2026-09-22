@@ -24,6 +24,11 @@ FROM icr.io/appcafe/open-liberty:26.0.0.9-full-java21-openj9-ubi-minimal@sha256:
 
 USER root
 
+# The whole server configuration directory, which carries jvm.options as well as server.xml
+# and the includes. That file is what bounds the heap: the base image supplies its JVM
+# options through JAVA_TOOL_OPTIONS and ships no jvm.options of its own, so this copy adds
+# one rather than replacing anything, and a command-line -Xmx from it takes precedence over
+# the image's environment.
 COPY src/main/liberty/config /opt/ol/wlp/usr/servers/defaultServer/
 
 # The destination file name must stay ExecutionControl.war: server.xml loads the
@@ -43,3 +48,11 @@ USER 1001
 # Last, and as 1001: configure.sh primes the shared class cache and applies file
 # permissions over the configuration and application copied above.
 RUN configure.sh
+
+# Priming the class cache starts the server, which creates an LTPA key file under the
+# password in effect at build time. Two reasons it must not ship inside the image: a
+# deployment that supplies its own LTPA_KEYS_PASSWORD could not read a file encrypted with
+# the default one, and key material built into a published image is material every copy of
+# that image shares. Removed here, each deployment generates its own keys on first boot,
+# under whatever password is effective then, and reads them back on every boot after.
+RUN rm -f /opt/ol/wlp/output/defaultServer/resources/security/ltpa.keys

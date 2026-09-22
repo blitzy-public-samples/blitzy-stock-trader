@@ -20,6 +20,7 @@ package com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.lifecycle;
 import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.audit.AuditTimeline;
 import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.control.ControlLimits;
 import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.control.PreTradeControlService;
+import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.dao.CapacityLimits;
 import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.dao.OrderStore;
 import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.dao.ReferenceDataStore;
 import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.dao.SeedDataLoader;
@@ -96,6 +97,25 @@ public class OrderLifecycleServiceTest {
     private static final String CONTROL_RESTRICTED_SYMBOL = "RESTRICTED_SYMBOL";
     private static final String CONTROL_FAT_FINGER = "FAT_FINGER";
     private static final int CONTROL_COUNT = 4;
+
+    /* Two configured order ceilings, both at or just above the three orders the seed set writes,
+       which is the least CapacityLimits admits. They are what makes an admission-ceiling test
+       instant: the same behaviour at the default ceiling costs ten thousand claims. */
+    private static final int SMALL_ORDER_CEILING = 3;
+    private static final int RAISED_ORDER_CEILING = 4;
+
+    /* The shipped defaults, restated here rather than read from CapacityLimits alone, so lowering
+       one of those constants fails this class instead of silently changing the figures the README
+       documents and an operator sizes a deployment from. */
+    private static final int DOCUMENTED_ORDER_CEILING = 10_000;
+    private static final int DOCUMENTED_EXCEPTION_CEILING = 10_000;
+    private static final int DOCUMENTED_POSITION_CEILING = 5_000;
+    private static final int DOCUMENTED_EVENT_CEILING = 150_000;
+
+    //Ten audit events for each of the three orders the seed set writes: the smallest audit ceiling
+    //the coupling rule admits beside the smallest order ceiling.
+    private static final int SEED_AUDIT_CEILING =
+            CapacityLimits.EVENTS_PER_FULLY_WORKED_ORDER * CapacityLimits.MIN_MAX_ORDERS;
 
     private static final int SEEDED_POSITIONS = 5;
     private static final int DUPLICATE_SUBMITTERS = 8;
@@ -394,6 +414,115 @@ public class OrderLifecycleServiceTest {
         assertMonetaryGuard("fillPrice",
                 () -> new Execution("EXE-000001", subCent, 100L, FIXED_INSTANT));
         assertMonetaryGuard("lastPrice", () -> new Position("INST-001", "SYNA", 100L, subCent));
+    }
+
+    @Test
+    void testFractionalQuantityIsRefusedRatherThanTruncatedTowardZero() {
+        /* A share count is whole and a JSON number is not, so the two have to be reconciled
+           somewhere. Reconciled by the deserializer - a Long property - a submitted 1.5 arrives as
+           1: the order is stored, filled and audited for a quantity nobody sent, the caller is told
+           nothing, and the audit trail records the altered value as though it were the request. The
+           submitted number therefore reaches validation intact and is refused there, for the same
+           reason a sub-cent price is refused rather than rounded to zero. */
+        assertValidationMessage("quantity",
+                () -> service.submit(decimalQuantity("API-020", "1.5", "100.00"), ACTOR));
+        assertValidationMessage("quantity",
+                () -> service.submit(decimalQuantity("API-020", "1.9", "100.00"), ACTOR));
+        //Truncation toward zero, not rounding, is what the old binding did: 2.5 became 2, so a
+        //caller could not even predict which whole count their fraction would be filled as.
+        assertValidationMessage("quantity",
+                () -> service.submit(decimalQuantity("API-020", "2.5", "100.00"), ACTOR));
+        //Seventeen decimal places - more than a double can hold - is still a fraction of a share
+        //and is refused by the same rule rather than by a width bound.
+        ValidationException longFraction = assertThrows(ValidationException.class,
+                () -> service.submit(decimalQuantity("API-020", "1.0000000000000001", "100.00"),
+                        ACTOR),
+                "a quantity with seventeen decimal places must be refused");
+        assertEquals("quantity must be a whole number of shares, not 1.0000000000000001",
+                longFraction.getMessage(), "the refusal must report the fraction it refused");
+
+        /* A fraction below one is a fraction, not an absent or non-positive quantity. Truncation
+           turned it into zero first, so the caller was told "must be greater than zero" about a
+           value they had written as greater than zero. */
+        ValidationException belowOne = assertThrows(ValidationException.class,
+                () -> service.submit(decimalQuantity("API-020", "0.5", "100.00"), ACTOR),
+                "a fraction of a single share must be refused");
+        assertEquals("quantity must be a whole number of shares, not 0.5", belowOne.getMessage(),
+                "a fraction below one must be named as a fraction, not as a non-positive value");
+        //The sign is read before the fraction, as it is for a price, so a negative keeps the
+        //message that names its sign.
+        ValidationException negative = assertThrows(ValidationException.class,
+                () -> service.submit(decimalQuantity("API-020", "-0.5", "100.00"), ACTOR),
+                "a negative quantity must be refused");
+        assertEquals("quantity must be greater than zero", negative.getMessage(),
+                "the sign is read before the whole-number rule");
+
+        assertEquals(0, orderStore.count(), "a fractional quantity stores no order");
+        assertTrue(auditTimeline.all().isEmpty(), "a fractional quantity records no audit event");
+        assertEquals(10000L, referenceData.findPosition("INST-001", "SYNA").getQuantity(),
+                "a fractional quantity leaves the position untouched");
+
+        /* Trailing zeros are not a fraction, and neither is an exponent that lands on a whole
+           number: both denote a whole share count however the caller wrote it, so both are filled
+           for the count they denote rather than refused for their scale. */
+        Order writtenWithAScale = service.submit(
+                decimalQuantity("API-021", "100.00", "100.00"), ACTOR);
+
+        assertEquals(OrderStatus.EXECUTED, writtenWithAScale.getStatus(),
+                "a whole count written with a scale is accepted");
+        assertEquals(100L, writtenWithAScale.getQuantity(), "stored quantity");
+        assertEquals(100L, writtenWithAScale.getExecution().getFilledQuantity(),
+                "the whole order quantity is filled");
+
+        Order writtenAsAnExponent = service.submit(
+                decimalQuantity("API-022", "1E+2", "100.00"), ACTOR);
+
+        assertEquals(OrderStatus.EXECUTED, writtenAsAnExponent.getStatus(),
+                "a whole count written as an exponent is accepted");
+        assertEquals(100L, writtenAsAnExponent.getQuantity(), "stored quantity");
+    }
+
+    @Test
+    void testQuantityBeyondTheShareCountRangeIsRefusedAsAField() {
+        /* The stored quantity, the filled quantity and every resulting-position sum are longs, so a
+           submitted count past that range is a value the caller can correct and resubmit: it
+           answers as a field violation naming quantity rather than reaching the arithmetic. */
+        ValidationException pastRange = assertThrows(ValidationException.class,
+                () -> service.submit(decimalQuantity("API-023", "9223372036854775808", "100.00"),
+                        ACTOR),
+                "a quantity one past the long range must be refused");
+        assertEquals("quantity must not exceed 9223372036854775807", pastRange.getMessage(),
+                "the refusal must name the ceiling it applied");
+
+        /* A quantity carries its exponent as a scale just as a price does, so each of these is a
+           handful of characters until something converts or renders it. Both are refused while
+           still narrow - one by the ceiling above without expanding the magnitude, the other as a
+           fraction reported by its representation instead of its million digits - which is what the
+           bounded-message assertion checks. */
+        assertBoundedValidationMessage("quantity",
+                () -> service.submit(decimalQuantity("API-024", "1E+1000000", "100.00"), ACTOR));
+        assertBoundedValidationMessage("quantity",
+                () -> service.submit(decimalQuantity("API-024", "1E-1000000", "100.00"), ACTOR));
+
+        assertEquals(0, orderStore.count(), "an out-of-range quantity stores no order");
+        assertTrue(auditTimeline.all().isEmpty(),
+                "an out-of-range quantity records no audit event");
+        assertEquals(10000L, referenceData.findPosition("INST-001", "SYNA").getQuantity(),
+                "an out-of-range quantity leaves the position untouched");
+
+        /* The ceiling bounds what the module can hold and judges nothing: a quantity sitting
+           exactly on it is admitted and then judged by the configured controls, as a recorded
+           control result carrying the breach - which is what a control rejection owes the audit
+           trail and a 400 would have thrown away. A symbol the client holds nothing in, because
+           the largest holdable count added to an existing holding is the separate refusal that
+           keeps a resulting position representable. */
+        Order judged = service.submit(
+                decimalQuantity("API-025", "SYNZ", "9223372036854775807", "100.00"), ACTOR);
+
+        assertEquals(OrderStatus.REJECTED, judged.getStatus(),
+                "a representable quantity is judged by the controls, not by validation");
+        assertFalse(control(judged, CONTROL_MAX_ORDER_NOTIONAL).isPassed(),
+                "a notional built from the largest holdable share count must breach the ceiling");
     }
 
     @Test
@@ -905,13 +1034,13 @@ public class OrderLifecycleServiceTest {
            atomic claim taken before the order object exists, so exhausting it through the store is
            the same state the ceiling would reach through the API and costs no allocation. */
         int claimed = 0;
-        for (int slot = 0; slot < OrderStore.MAX_ORDERS; slot++) {
+        for (int slot = 0; slot < orderStore.maxOrders(); slot++) {
             if (orderStore.tryAdmitOrder()) {
                 claimed++;
             }
         }
 
-        assertEquals(OrderStore.MAX_ORDERS, claimed, "every slot up to the ceiling is claimable");
+        assertEquals(orderStore.maxOrders(), claimed, "every slot up to the ceiling is claimable");
         assertFalse(orderStore.tryAdmitOrder(), "the ceiling refuses the next claim");
 
         CapacityExceededException refused = assertThrows(CapacityExceededException.class,
@@ -932,7 +1061,7 @@ public class OrderLifecycleServiceTest {
 
     @Test
     void testReleasedAdmissionSlotAdmitsExactlyOneFurtherSubmission() {
-        for (int slot = 0; slot < OrderStore.MAX_ORDERS; slot++) {
+        for (int slot = 0; slot < orderStore.maxOrders(); slot++) {
             orderStore.tryAdmitOrder();
         }
 
@@ -962,7 +1091,7 @@ public class OrderLifecycleServiceTest {
 
         //Claimed directly rather than by submitting ten thousand orders, as in the ceiling test
         //above: the claim is the same state the ceiling reaches through the API.
-        for (int slot = orderStore.count(); slot < OrderStore.MAX_ORDERS; slot++) {
+        for (int slot = orderStore.count(); slot < orderStore.maxOrders(); slot++) {
             orderStore.tryAdmitOrder();
         }
         assertFalse(orderStore.tryAdmitOrder(), "the order ceiling is exhausted");
@@ -993,11 +1122,11 @@ public class OrderLifecycleServiceTest {
         /* Filled through putPosition rather than by submitting: the claim under test is the same
            one whichever path creates the key, and the point of the test is the last free slot. */
         for (int slot = referenceData.positionCount();
-                slot < ReferenceDataStore.MAX_POSITIONS - 1; slot++) {
+                slot < referenceData.maxPositions() - 1; slot++) {
             referenceData.putPosition(
                     new Position("INST-001", "FIL" + slot, 100L, new BigDecimal("1.00")));
         }
-        assertEquals(ReferenceDataStore.MAX_POSITIONS - 1, referenceData.positionCount(),
+        assertEquals(referenceData.maxPositions() - 1, referenceData.positionCount(),
                 "exactly one position slot is left free");
 
         Queue<Throwable> failures = new ConcurrentLinkedQueue<>();
@@ -1054,7 +1183,7 @@ public class OrderLifecycleServiceTest {
                     "a losing first fill must be refused at the ceiling, not " + failure);
         }
 
-        assertEquals(ReferenceDataStore.MAX_POSITIONS, referenceData.positionCount(),
+        assertEquals(referenceData.maxPositions(), referenceData.positionCount(),
                 "the position ceiling is reached exactly and never passed");
         assertEquals(1, orderStore.list().stream()
                         .filter(order -> order.getStatus() == OrderStatus.EXECUTED).count(),
@@ -1185,6 +1314,211 @@ public class OrderLifecycleServiceTest {
         assertEquals(3, service.list().size(), "the unpaged read still answers with everything");
     }
 
+    @Test
+    void testAConfiguredOrderCeilingAdmitsExactlyItsOwnCountAndRefusesTheNext() {
+        /* The ceiling is configuration, so the whole behaviour at it is reachable at three orders
+           instead of ten thousand: this graph is the service a deployment would get from
+           ORDER_CAPACITY=3, and nothing but the configured value differs from the default one. */
+        CapacityLimits ceilings = ceilings(SMALL_ORDER_CEILING);
+        OrderStore boundedOrders = new OrderStore(ceilings);
+        ReferenceDataStore boundedReference = new ReferenceDataStore(ceilings);
+        AuditTimeline boundedTimeline = new AuditTimeline(ceilings);
+        OrderLifecycleService bounded =
+                boundedLifecycle(ceilings, boundedOrders, boundedReference, boundedTimeline);
+
+        assertEquals(SMALL_ORDER_CEILING, boundedOrders.maxOrders(),
+                "the store reports the ceiling configuration sized it to");
+
+        for (int order = 1; order <= SMALL_ORDER_CEILING; order++) {
+            assertEquals(OrderStatus.EXECUTED,
+                    bounded.submit(request("CFG-" + order, "INST-001", "SYNA", "BUY", 100L,
+                            "100.00"), ACTOR).getStatus(),
+                    "submission " + order + " is inside the configured ceiling");
+        }
+
+        assertEquals(SMALL_ORDER_CEILING, boundedOrders.count(),
+                "exactly the configured number of orders is admitted");
+        CapacityExceededException refused = assertThrows(CapacityExceededException.class,
+                () -> bounded.submit(request("CFG-NEXT", "INST-001", "SYNA", "BUY", 100L,
+                        "100.00"), ACTOR),
+                "the submission after the configured ceiling must be refused");
+        //The refusal names the key an operator raises, which is what turns a 503 body from a
+        //diagnosis into an action.
+        assertTrue(refused.getMessage().contains("ORDER_CAPACITY"),
+                "the refusal must name the key to raise: " + refused.getMessage());
+
+        //Refused before the client order id is reserved and before any transition, exactly as at
+        //the default ceiling: nothing of the refused submission is left behind.
+        assertEquals(SMALL_ORDER_CEILING, boundedOrders.count(),
+                "a refused submission stores no order");
+        assertNull(boundedOrders.findByClientOrderId("CFG-NEXT"),
+                "a refused submission reserves no client order id");
+    }
+
+    @Test
+    void testARaisedOrderCeilingAdmitsTheSubmissionTheSmallerOneRefused() {
+        /* The finding this test exists for: the ceiling was a code constant, so an operator whose
+           volume exceeded it had no remedy but a restart. Here the same four submissions are made
+           twice against identical code and two configured values, and the fourth is refused by one
+           and admitted by the other. */
+        CapacityLimits small = ceilings(SMALL_ORDER_CEILING);
+        OrderStore smallOrders = new OrderStore(small);
+        OrderLifecycleService smallService = boundedLifecycle(small, smallOrders,
+                new ReferenceDataStore(small), new AuditTimeline(small));
+
+        for (int order = 1; order <= SMALL_ORDER_CEILING; order++) {
+            smallService.submit(request("SML-" + order, "INST-001", "SYNA", "BUY", 100L, "100.00"),
+                    ACTOR);
+        }
+        assertThrows(CapacityExceededException.class,
+                () -> smallService.submit(request("SML-4", "INST-001", "SYNA", "BUY", 100L,
+                        "100.00"), ACTOR),
+                "the fourth submission is beyond an ORDER_CAPACITY of " + SMALL_ORDER_CEILING);
+
+        CapacityLimits raised = ceilings(RAISED_ORDER_CEILING);
+        OrderStore raisedOrders = new OrderStore(raised);
+        OrderLifecycleService raisedService = boundedLifecycle(raised, raisedOrders,
+                new ReferenceDataStore(raised), new AuditTimeline(raised));
+
+        for (int order = 1; order <= SMALL_ORDER_CEILING; order++) {
+            raisedService.submit(request("RSD-" + order, "INST-001", "SYNA", "BUY", 100L, "100.00"),
+                    ACTOR);
+        }
+
+        assertEquals(RAISED_ORDER_CEILING, raisedOrders.maxOrders(),
+                "the raised ceiling is what configuration supplied");
+        assertEquals(OrderStatus.EXECUTED,
+                raisedService.submit(request("RSD-4", "INST-001", "SYNA", "BUY", 100L, "100.00"),
+                        ACTOR).getStatus(),
+                "the submission the smaller ceiling refused is admitted by the raised one");
+        assertEquals(RAISED_ORDER_CEILING, raisedOrders.count(),
+                "the raised ceiling admits exactly its own count");
+    }
+
+    @Test
+    void testTheDefaultCeilingsAreTheDocumentedFigures() {
+        /* A deployment that supplies no capacity configuration must behave exactly as this module
+           did before the ceilings became configurable, because every other test in this module -
+           and the README's sizing arithmetic - is written against these four figures. */
+        assertEquals(DOCUMENTED_ORDER_CEILING, orderStore.maxOrders(), "default ORDER_CAPACITY");
+        assertEquals(DOCUMENTED_EXCEPTION_CEILING, new SettlementExceptionStore().maxExceptions(),
+                "default SETTLEMENT_EXCEPTION_CAPACITY");
+        assertEquals(DOCUMENTED_POSITION_CEILING, referenceData.maxPositions(),
+                "default POSITION_CAPACITY");
+        assertEquals(DOCUMENTED_EVENT_CEILING, auditTimeline.maxEvents(),
+                "default AUDIT_EVENT_CAPACITY");
+
+        assertEquals(DOCUMENTED_ORDER_CEILING, CapacityLimits.DEFAULT_MAX_ORDERS,
+                "the documented default of ORDER_CAPACITY");
+        assertEquals(DOCUMENTED_EXCEPTION_CEILING,
+                CapacityLimits.DEFAULT_MAX_SETTLEMENT_EXCEPTIONS,
+                "the documented default of SETTLEMENT_EXCEPTION_CAPACITY");
+        assertEquals(DOCUMENTED_POSITION_CEILING, CapacityLimits.DEFAULT_MAX_POSITIONS,
+                "the documented default of POSITION_CAPACITY");
+        assertEquals(DOCUMENTED_EVENT_CEILING, CapacityLimits.DEFAULT_MAX_AUDIT_EVENTS,
+                "the documented default of AUDIT_EVENT_CAPACITY");
+    }
+
+    @Test
+    void testOrderHeadroomFallsByOneEachAdmissionAndAccountsForTheWholeCeiling() {
+        /* Headroom is the pre-exhaustion signal the health probes carry, so it has to be exact
+           rather than indicative: an operator watching it decides whether to raise the ceiling
+           before the first refusal, and a figure that drifted from the count would be read as
+           room that does not exist. */
+        CapacityLimits ceilings = ceilings(SMALL_ORDER_CEILING);
+        OrderStore boundedOrders = new OrderStore(ceilings);
+        OrderLifecycleService bounded = boundedLifecycle(ceilings, boundedOrders,
+                new ReferenceDataStore(ceilings), new AuditTimeline(ceilings));
+
+        assertEquals(SMALL_ORDER_CEILING, boundedOrders.orderHeadroom(),
+                "an empty store has the whole ceiling as headroom");
+
+        for (int order = 1; order <= SMALL_ORDER_CEILING; order++) {
+            bounded.submit(request("HDR-" + order, "INST-001", "SYNA", "BUY", 100L, "100.00"),
+                    ACTOR);
+            assertEquals(SMALL_ORDER_CEILING - order, boundedOrders.orderHeadroom(),
+                    "headroom after " + order + " admissions");
+            assertEquals(boundedOrders.maxOrders(),
+                    boundedOrders.count() + boundedOrders.orderHeadroom(),
+                    "the count and the headroom must account for the whole ceiling");
+        }
+
+        assertEquals(0, boundedOrders.orderHeadroom(), "a full store reports no headroom");
+        assertThrows(CapacityExceededException.class,
+                () -> bounded.submit(request("HDR-NEXT", "INST-001", "SYNA", "BUY", 100L,
+                        "100.00"), ACTOR),
+                "no headroom means no further admission");
+        assertEquals(boundedOrders.maxOrders(),
+                boundedOrders.count() + boundedOrders.orderHeadroom(),
+                "a refused submission takes no claim, so the accounting still holds");
+    }
+
+    @Test
+    void testConfiguredCeilingsBelowTheirMinimumOrTheAuditCouplingAreRefusedAtStartup() {
+        /* Refused while CapacityLimits is built, which is during deployment, so a misconfigured
+           ceiling fails the start-up it was supplied to rather than the first seeded submission -
+           a service that started and then could not seed would be permanently un-ready with no
+           caller to report the refusal to. Each minimum is exactly what the seed set consumes. */
+        assertCeilingRefused("ORDER_CAPACITY", CapacityLimits.MIN_MAX_ORDERS - 1,
+                CapacityLimits.MIN_MAX_SETTLEMENT_EXCEPTIONS, CapacityLimits.MIN_MAX_POSITIONS,
+                SEED_AUDIT_CEILING);
+        assertCeilingRefused("SETTLEMENT_EXCEPTION_CAPACITY", CapacityLimits.MIN_MAX_ORDERS,
+                CapacityLimits.MIN_MAX_SETTLEMENT_EXCEPTIONS - 1, CapacityLimits.MIN_MAX_POSITIONS,
+                SEED_AUDIT_CEILING);
+        assertCeilingRefused("POSITION_CAPACITY", CapacityLimits.MIN_MAX_ORDERS,
+                CapacityLimits.MIN_MAX_SETTLEMENT_EXCEPTIONS,
+                CapacityLimits.MIN_MAX_POSITIONS - 1, SEED_AUDIT_CEILING);
+        assertCeilingRefused("AUDIT_EVENT_CAPACITY", CapacityLimits.MIN_MAX_ORDERS,
+                CapacityLimits.MIN_MAX_SETTLEMENT_EXCEPTIONS, CapacityLimits.MIN_MAX_POSITIONS,
+                CapacityLimits.MIN_MAX_AUDIT_EVENTS - 1);
+
+        /* The coupling rule: an audit ceiling below ten events for every admissible order would
+           make the record the binding constraint, which is the exhaustion an operator raised
+           ORDER_CAPACITY to escape. The message names the figure the ceiling has to reach. */
+        IllegalArgumentException uncoupled = assertCeilingRefused("AUDIT_EVENT_CAPACITY",
+                CapacityLimits.MIN_MAX_ORDERS, CapacityLimits.MIN_MAX_SETTLEMENT_EXCEPTIONS,
+                CapacityLimits.MIN_MAX_POSITIONS, SEED_AUDIT_CEILING - 1);
+        assertTrue(uncoupled.getMessage().contains(String.valueOf(SEED_AUDIT_CEILING)),
+                "the message must name the required figure: " + uncoupled.getMessage());
+
+        //The shipped defaults satisfy every one of those rules, which is what lets a deployment
+        //supply nothing at all: 150,000 events is above ten for each of 10,000 orders.
+        CapacityLimits defaults = CapacityLimits.defaults();
+        assertEquals(DOCUMENTED_ORDER_CEILING, defaults.getMaxOrders(), "default order ceiling");
+        assertTrue(defaults.getMaxAuditEvents()
+                        >= CapacityLimits.EVENTS_PER_FULLY_WORKED_ORDER * defaults.getMaxOrders(),
+                "the defaults must satisfy the coupling rule they are validated by");
+    }
+
+    //Ten audit events for every admissible order, which is the coupling rule CapacityLimits
+    //enforces, and the seed-set minimums for the other two, so one argument sizes a whole graph.
+    private static CapacityLimits ceilings(int maxOrders) {
+        return new CapacityLimits(maxOrders, CapacityLimits.MIN_MAX_SETTLEMENT_EXCEPTIONS,
+                CapacityLimits.MIN_MAX_POSITIONS,
+                CapacityLimits.EVENTS_PER_FULLY_WORKED_ORDER * maxOrders);
+    }
+
+    /* The same graph buildCollaboratorGraph assembles, with every ceiling taken from the supplied
+       configuration instead of the shipped defaults. The reference data is seeded here because a
+       submission cannot resolve a client or a position without it. */
+    private static OrderLifecycleService boundedLifecycle(CapacityLimits ceilings,
+            OrderStore orders, ReferenceDataStore reference, AuditTimeline timeline) {
+        seedReferenceData(reference);
+        return lifecycleService(orders, new SettlementExceptionStore(ceilings), reference, timeline);
+    }
+
+    //Returned rather than only asserted, so a caller can go on to assert what else the message
+    //has to name - the coupling rule's required figure, which the minimums do not carry.
+    private static IllegalArgumentException assertCeilingRefused(String key, int maxOrders,
+            int maxExceptions, int maxPositions, int maxAuditEvents) {
+        IllegalArgumentException refused = assertThrows(IllegalArgumentException.class,
+                () -> new CapacityLimits(maxOrders, maxExceptions, maxPositions, maxAuditEvents),
+                "a ceiling below what " + key + " admits must be refused");
+        assertTrue(refused.getMessage().contains(key),
+                "the message must name " + key + ": " + refused.getMessage());
+        return refused;
+    }
+
     private static OrderLifecycleService lifecycleService(OrderStore orders,
             SettlementExceptionStore exceptions, ReferenceDataStore reference, AuditTimeline timeline) {
         ControlLimits limits = new ControlLimits(MAX_ORDER_NOTIONAL, MAX_POSITION_NOTIONAL,
@@ -1230,6 +1564,25 @@ public class OrderLifecycleServiceTest {
             String side, Long quantity, String limitPrice) {
         return new OrderRequest(clientOrderId, clientId, symbol, side, quantity,
                 (limitPrice == null) ? null : new BigDecimal(limitPrice));
+    }
+
+    private static OrderRequest decimalQuantity(String clientOrderId, String quantity,
+            String limitPrice) {
+        return decimalQuantity(clientOrderId, "SYNA", quantity, limitPrice);
+    }
+
+    /* The one request form request() cannot express. Its convenience constructor takes a whole
+       share count, which is what every producer inside the module has; only a submitted body can
+       carry a fraction, a compact exponent or a count past the long range, and those are precisely
+       the values the whole-number rule exists for - so they are written straight onto the decimal
+       property JSON-B fills. */
+    private static OrderRequest decimalQuantity(String clientOrderId, String symbol,
+            String quantity, String limitPrice) {
+        OrderRequest submitted = request(clientOrderId, "INST-001", symbol, "BUY", null,
+                limitPrice);
+        submitted.setQuantity(new BigDecimal(quantity));
+
+        return submitted;
     }
 
     //Looked up by control name rather than by list index so the assertions survive a reordering of

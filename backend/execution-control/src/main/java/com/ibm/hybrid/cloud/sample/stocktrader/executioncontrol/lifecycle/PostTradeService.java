@@ -208,8 +208,12 @@ public class PostTradeService {
            what bounds it. It is made before the transition, so a refusal changes neither the
            exception nor the timeline. */
         if (!auditTimeline.hasCapacityFor(EVENTS_PER_ASSIGN)) {
-            throw new CapacityExceededException(
-                    "the audit timeline is at capacity, so this assignment cannot be recorded");
+            //Named here as in every other refusal: the message is the 503 body an analyst reads,
+            //and the ceiling is operator-sized, so it carries the remedy rather than only the
+            //diagnosis.
+            throw new CapacityExceededException("the audit timeline is at capacity, so this "
+                    + "assignment cannot be recorded; raise AUDIT_EVENT_CAPACITY or restart to "
+                    + "clear");
         }
 
         Instant now = clock.instant();
@@ -246,8 +250,9 @@ public class PostTradeService {
         //Checked before the transition, with the two edges a resolve can write, so an exhausted
         //timeline refuses the whole call rather than closing an exception half-recorded.
         if (!auditTimeline.hasCapacityFor(EVENTS_PER_RESOLVE)) {
-            throw new CapacityExceededException(
-                    "the audit timeline is at capacity, so this resolution cannot be recorded");
+            throw new CapacityExceededException("the audit timeline is at capacity, so this "
+                    + "resolution cannot be recorded; raise AUDIT_EVENT_CAPACITY or restart to "
+                    + "clear");
         }
 
         String suppliedOwner = request.getOwner();
@@ -297,7 +302,8 @@ public class PostTradeService {
         //saturated timeline never masks a missing exception or an illegal edge.
         if (!auditTimeline.hasCapacityFor(EVENTS_PER_SETTLEMENT_READY)) {
             throw new CapacityExceededException("the audit timeline is at capacity, so this "
-                    + "settlement-ready step cannot be recorded");
+                    + "settlement-ready step cannot be recorded; raise AUDIT_EVENT_CAPACITY or "
+                    + "restart to clear");
         }
 
         return withSla(orderStore.inOrderLock(orderId, () -> release(exceptionId, orderId, actor)));
@@ -347,17 +353,11 @@ public class PostTradeService {
     }
 
     public List<SettlementException> list(ExceptionStatus status, String owner) {
-        //isBlank and strip, matching requireOwner: the stored owner is stripped, so a filter that
-        //trimmed only ASCII space would fail to match the very name it was given, and a filter of
-        //Unicode whitespace alone would narrow to nothing instead of meaning "no filter".
-        String ownerFilter = (owner == null || owner.isBlank()) ? null : owner.strip();
+        String ownerFilter = ownerFilter(owner);
         List<SettlementException> matches = new ArrayList<>();
 
         for (SettlementException exception : exceptionStore.list()) {
-            if (status != null && exception.getStatus() != status) {
-                continue;
-            }
-            if (ownerFilter != null && !ownerFilter.equals(exception.getOwner())) {
+            if (!matchesFilter(exception, status, ownerFilter)) {
                 continue;
             }
             matches.add(withSla(exception));
@@ -381,6 +381,40 @@ public class PostTradeService {
                 : (int) Math.min((long) from + limit, matches.size());
 
         return Collections.unmodifiableList(new ArrayList<>(matches.subList(from, to)));
+    }
+
+    /* How many exceptions match the filter the paged read above was given, so a page can report
+       the size of the collection it came from. Counted through the same predicate rather than
+       through list().size(), because a total needs no SLA projection: list() builds a new
+       exception object for every match to carry its computed ageing, and a count that asked for
+       that would double the work of every paged read to learn a number. */
+    public int count(ExceptionStatus status, String owner) {
+        String ownerFilter = ownerFilter(owner);
+        int matches = 0;
+
+        for (SettlementException exception : exceptionStore.list()) {
+            if (matchesFilter(exception, status, ownerFilter)) {
+                matches++;
+            }
+        }
+        return matches;
+    }
+
+    //isBlank and strip, matching requireOwner: the stored owner is stripped, so a filter that
+    //trimmed only ASCII space would fail to match the very name it was given, and a filter of
+    //Unicode whitespace alone would narrow to nothing instead of meaning "no filter".
+    private static String ownerFilter(String owner) {
+        return (owner == null || owner.isBlank()) ? null : owner.strip();
+    }
+
+    //One predicate for the paged read and the total alike: the two have to agree on what a match
+    //is, or a page would be cut from one collection and counted against another.
+    private static boolean matchesFilter(SettlementException exception, ExceptionStatus status,
+            String ownerFilter) {
+        if (status != null && exception.getStatus() != status) {
+            return false;
+        }
+        return ownerFilter == null || ownerFilter.equals(exception.getOwner());
     }
 
     //Delegated rather than checked inside onExecuted: the headroom has to be established while
@@ -407,6 +441,13 @@ public class PostTradeService {
     public List<AuditEvent> events(String exceptionId, int offset, int limit) {
         requireException(exceptionId, exceptionStore.find(exceptionId));
         return auditTimeline.page(ENTITY_EXCEPTION, exceptionId, offset, limit);
+    }
+
+    //The length of that history, for the paged response's total. The store read comes first here
+    //too, so a count for an unknown id is a 404 rather than a zero that reads as "no history".
+    public int eventCount(String exceptionId) {
+        requireException(exceptionId, exceptionStore.find(exceptionId));
+        return auditTimeline.count(ENTITY_EXCEPTION, exceptionId);
     }
 
     private static List<MismatchField> compareSettlementInstructions(ClientAccount client) {
