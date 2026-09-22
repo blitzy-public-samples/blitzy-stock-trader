@@ -44,8 +44,9 @@ import jakarta.ws.rs.core.SecurityContext;
 
 //No role annotation here: web.xml is the estate's enforcement point, granting GET to both
 //StockViewer and StockTrader and POST to StockTrader alone, so the submitting trader is already
-//authorized by the time any method below is entered and every other verb is refused there by
-//deny-uncovered-http-methods.
+//authorized on entry. Authorization and dispatch are two stages: PUT and DELETE are covered for
+//StockTrader on every path, so they clear security and are then answered 405 here, while HEAD,
+//OPTIONS, PATCH and TRACE are covered nowhere and get 403 from deny-uncovered-http-methods.
 @Path("/orders")
 @Produces(MediaType.APPLICATION_JSON)
 @ApplicationScoped

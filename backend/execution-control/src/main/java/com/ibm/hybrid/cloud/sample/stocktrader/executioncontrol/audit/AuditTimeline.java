@@ -28,6 +28,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 
 //Concurrency
@@ -53,23 +54,30 @@ public class AuditTimeline {
        in the list, and no reader can observe an event out of order or half-recorded. The
        clock arrives as a parameter because this bean is constructed with no dependencies,
        while the service's single injected UTC clock stays the one source of time - tests
-       pin it with Clock.fixed(...) and compare timestamps exactly. */
+       pin it with Clock.fixed(...) and compare timestamps exactly.
+       The event id is formatted under Locale.ROOT rather than the JVM's default, because %d
+       follows the default formatting locale: under a non-Latin numbering system EVT-000001
+       would come out in localized digits and stop being an ASCII rendering of the sequence
+       that readers, the audit endpoint and the tests can match literally. */
     public synchronized AuditEvent append(String entityType, String entityId, StateMachine stateMachine,
                                           String fromState, String toState, String actor, String reason,
                                           Clock clock) {
         long next = sequence.incrementAndGet();
         Instant timestamp = clock.instant();
-        AuditEvent event = new AuditEvent(String.format("EVT-%06d", next), next, timestamp, entityType,
-                entityId, stateMachine, fromState, toState, actor, reason);
+        AuditEvent event = new AuditEvent(String.format(Locale.ROOT, "EVT-%06d", next), next,
+                timestamp, entityType, entityId, stateMachine, fromState, toState, actor, reason);
         events.add(event);
         return event;
     }
 
     /* Both reads answer with an unmodifiable view over a copy taken under the same monitor as
        append: a caller can neither reach back into the timeline through the list it was given
-       nor observe that list mid-append. Matching is on entity identity alone - one order's
-       POST_TRADE events carry the same entityType and entityId as its ORDER events, so
-       narrowing by state machine here would hide half of that order's history. */
+       nor observe that list mid-append. Insertion order is sequence order, because append fixes
+       the ordinal and the list position together under that monitor, so this timeline owns the
+       order of what it hands out and a reader returns it as received rather than sorting it
+       again. Matching is on entity identity alone - one order's POST_TRADE events carry the same
+       entityType and entityId as its ORDER events, so narrowing by state machine here would hide
+       half of that order's history. */
     public synchronized List<AuditEvent> forEntity(String entityType, String entityId) {
         List<AuditEvent> matches = new ArrayList<>();
         for (AuditEvent event : events) {

@@ -41,7 +41,6 @@ import java.time.Instant;
 
 //Collections
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.List;
 import java.util.Objects;
 
@@ -260,7 +259,9 @@ public class PostTradeService {
             matches.add(withSla(exception));
         }
 
-        matches.sort(Comparator.comparing(SettlementException::getExceptionId));
+        //No second sort: the store's snapshot is already ordered by exceptionId and this filter
+        //preserves that order, so ordering stays the one thing the store owns. The new list exists
+        //only because every survivor is handed back with its SLA projection applied.
         return matches;
     }
 

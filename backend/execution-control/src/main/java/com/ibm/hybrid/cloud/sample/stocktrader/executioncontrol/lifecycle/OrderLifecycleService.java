@@ -33,14 +33,13 @@ import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.StateMachin
 
 //Arbitrary-precision arithmetic
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 
 //Time (java.time)
 import java.time.Clock;
 import java.time.Instant;
 
 //Collections
-import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.stream.Collectors;
@@ -65,6 +64,7 @@ public class OrderLifecycleService {
     private static final String SELL = "SELL";
     private static final String REASON_SEPARATOR = "; ";
     private static final String REASON_CONTROLS_PASSED = "all pre-trade controls passed";
+    private static final int AMOUNT_SCALE = 2;
 
     private OrderStore orderStore;
     private ReferenceDataStore referenceData;
@@ -104,6 +104,22 @@ public class OrderLifecycleService {
         //executedAt and every audit event agree instead of drifting apart within one request.
         Instant now = clock.instant();
 
+        SubmittedOrder submitted = validate(request);
+        String orderId = reserveOrderId(submitted.clientOrderId);
+        Order stored = insertSubmitted(submitted, orderId, actor, now, source);
+
+        List<ControlResult> results = evaluateAndFill(submitted, stored).getControlResults();
+        String rejectionReason = rejectionReason(results);
+        if (!rejectionReason.isEmpty()) {
+            return reject(orderId, results, rejectionReason, actor, now);
+        }
+
+        accept(orderId, results, actor, now);
+
+        return postTrade.onExecuted(execute(orderId, submitted, actor, now), actor);
+    }
+
+    private SubmittedOrder validate(OrderRequest request) {
         String clientOrderId = required((request == null) ? null : request.getClientOrderId(),
                 "clientOrderId");
         String clientId = required(request.getClientId(), "clientId");
@@ -123,13 +139,7 @@ public class OrderLifecycleService {
             throw new ValidationException("quantity must be greater than zero");
         }
 
-        BigDecimal limitPrice = request.getLimitPrice();
-        if (limitPrice == null) {
-            throw new ValidationException("limitPrice is required");
-        }
-        if (limitPrice.signum() <= 0) {
-            throw new ValidationException("limitPrice must be greater than zero");
-        }
+        BigDecimal limitPrice = price(request.getLimitPrice());
 
         //An unknown client is a bad field in a submitted body rather than a missing addressed
         //resource, so it answers 400; EntityNotFoundException stays reserved for an identifier
@@ -138,6 +148,33 @@ public class OrderLifecycleService {
             throw new ValidationException("clientId " + clientId + " is not a known client");
         }
 
+        return new SubmittedOrder(clientOrderId, clientId, symbol, side, quantity, limitPrice);
+    }
+
+    /* A price is money, so it has to be a whole number of cents and it has to be positive. The sign
+       is read from the value as submitted, and the cent check is a separate refusal rather than a
+       rounding: 0.001 is positive, and rounding it to 0.00 would give the order a notional of zero,
+       clear every configured notional ceiling and fill at no cost. The value returned here is the
+       one the order, its simulated fill and the position it moves are all built from, so the
+       amount the caller is held to is the amount they sent. */
+    private static BigDecimal price(BigDecimal limitPrice) {
+        if (limitPrice == null) {
+            throw new ValidationException("limitPrice is required");
+        }
+        if (limitPrice.signum() <= 0) {
+            throw new ValidationException("limitPrice must be greater than zero");
+        }
+
+        BigDecimal cents = limitPrice.setScale(AMOUNT_SCALE, RoundingMode.DOWN);
+        if (cents.compareTo(limitPrice) != 0) {
+            throw new ValidationException("limitPrice must be a whole number of cents, not "
+                    + limitPrice.toPlainString());
+        }
+
+        return cents;
+    }
+
+    private String reserveOrderId(String clientOrderId) {
         String orderId = orderStore.nextOrderId();
         //The client order id is claimed before an order object exists, so exactly one of any
         //number of concurrent submissions carrying the same key proceeds and every loser writes
@@ -147,54 +184,69 @@ public class OrderLifecycleService {
                     "clientOrderId " + clientOrderId + " has already been submitted");
         }
 
-        Order submitted = new Order(orderId, clientOrderId, clientId, symbol, side, quantity,
-                limitPrice, actor, now, source);
+        return orderId;
+    }
+
+    private Order insertSubmitted(SubmittedOrder submitted, String orderId, String actor,
+            Instant now, RecordSource source) {
+        Order stored = new Order(orderId, submitted.clientOrderId, submitted.clientId,
+                submitted.symbol, submitted.side, submitted.quantity, submitted.limitPrice, actor,
+                now, source);
 
         //The origin edge is asserted through the same table every later edge goes through, so no
         //order state reaches the store or the timeline without having passed assertLegal.
         LifecycleTransitions.assertLegal(null, OrderStatus.SUBMITTED);
-        orderStore.insert(submitted);
+        orderStore.insert(stored);
         auditTimeline.append(ORDER, orderId, StateMachine.ORDER, LifecycleTransitions.NONE,
                 OrderStatus.SUBMITTED.name(), actor,
-                "order received for clientOrderId " + clientOrderId, clock);
+                "order received for clientOrderId " + submitted.clientOrderId, clock);
 
+        return stored;
+    }
+
+    private ReferenceDataStore.FillDecision evaluateAndFill(SubmittedOrder submitted, Order stored) {
         /* Evaluating the controls and applying the fill are one atomic step per client and symbol:
            a second order in the same symbol has to be valued against the position the first one
            left behind rather than a stale copy, and a rejected order has to leave that position
            exactly as it was. Nothing outside this operator reads or writes the position. */
-        ReferenceDataStore.FillDecision decision =
-                referenceData.evaluateAndFill(clientId, symbol, position -> {
-                    List<ControlResult> outcomes = controls.evaluate(submitted, position);
-                    if (!outcomes.stream().allMatch(ControlResult::isPassed)) {
-                        return ReferenceDataStore.FillDecision.unchanged(outcomes);
-                    }
-                    long resulting = ((position == null) ? 0L : position.getQuantity())
-                            + (BUY.equals(side) ? quantity : -quantity);
-                    return ReferenceDataStore.FillDecision.filled(
-                            new Position(clientId, symbol, resulting, limitPrice), outcomes);
-                });
+        return referenceData.evaluateAndFill(submitted.clientId, submitted.symbol, position -> {
+            List<ControlResult> outcomes = controls.evaluate(stored, position);
+            if (!outcomes.stream().allMatch(ControlResult::isPassed)) {
+                return ReferenceDataStore.FillDecision.unchanged(outcomes);
+            }
 
-        List<ControlResult> results = decision.getControlResults();
-        String rejectionReason = results.stream()
+            long resulting = submitted.resultingQuantity(
+                    (position == null) ? 0L : position.getQuantity());
+
+            return ReferenceDataStore.FillDecision.filled(new Position(submitted.clientId,
+                    submitted.symbol, resulting, submitted.limitPrice), outcomes);
+        });
+    }
+
+    private static String rejectionReason(List<ControlResult> results) {
+        return results.stream()
                 .filter(result -> !result.isPassed())
                 .map(ControlResult::getReason)
                 .collect(Collectors.joining(REASON_SEPARATOR));
+    }
 
-        if (!rejectionReason.isEmpty()) {
-            return requireOrder(orderId, orderStore.transition(orderId, current -> {
-                //assertLegal runs before the replacement is built and before the event is
-                //appended, so a refused transition leaves both the order and the timeline untouched.
-                LifecycleTransitions.assertLegal(current.getStatus(), OrderStatus.REJECTED);
-                Order rejected = current.withControlResults(results, rejectionReason)
-                        .withStatus(OrderStatus.REJECTED, now);
-                auditTimeline.append(ORDER, orderId, StateMachine.ORDER,
-                        OrderStatus.SUBMITTED.name(), OrderStatus.REJECTED.name(), actor,
-                        rejectionReason, clock);
-                return rejected;
-            }));
-        }
+    private Order reject(String orderId, List<ControlResult> results, String rejectionReason,
+            String actor, Instant now) {
+        return requireOrder(orderId, orderStore.transition(orderId, current -> {
+            //assertLegal runs before the replacement is built and before the event is
+            //appended, so a refused transition leaves both the order and the timeline untouched.
+            LifecycleTransitions.assertLegal(current.getStatus(), OrderStatus.REJECTED);
+            Order rejected = current.withControlResults(results, rejectionReason)
+                    .withStatus(OrderStatus.REJECTED, now);
+            auditTimeline.append(ORDER, orderId, StateMachine.ORDER,
+                    OrderStatus.SUBMITTED.name(), OrderStatus.REJECTED.name(), actor,
+                    rejectionReason, clock);
+            return rejected;
+        }));
+    }
 
-        requireOrder(orderId, orderStore.transition(orderId, current -> {
+    private Order accept(String orderId, List<ControlResult> results, String actor, Instant now) {
+        return requireOrder(orderId, orderStore.transition(orderId, current -> {
             LifecycleTransitions.assertLegal(current.getStatus(), OrderStatus.ACCEPTED);
             Order accepted = current.withControlResults(results, null)
                     .withStatus(OrderStatus.ACCEPTED, now);
@@ -202,36 +254,38 @@ public class OrderLifecycleService {
                     OrderStatus.ACCEPTED.name(), actor, REASON_CONTROLS_PASSED, clock);
             return accepted;
         }));
+    }
 
+    private Order execute(String orderId, SubmittedOrder submitted, String actor, Instant now) {
         //Allocated before the transition so the operator running inside the store's compute does
         //nothing but assert the edge, build the replacement and append the event.
         String executionId = orderStore.nextExecutionId();
 
-        Order executed = requireOrder(orderId, orderStore.transition(orderId, current -> {
+        return requireOrder(orderId, orderStore.transition(orderId, current -> {
             LifecycleTransitions.assertLegal(current.getStatus(), OrderStatus.EXECUTED);
             //The fill is priced at the order's own limitPrice - the same price the position was
             //marked at above - because this service reaches no exchange, venue or market-data
             //source: the execution is simulated.
             Order filled = current
-                    .withExecution(new Execution(executionId, limitPrice, quantity, now))
+                    .withExecution(new Execution(executionId, submitted.limitPrice,
+                            submitted.quantity, now))
                     .withStatus(OrderStatus.EXECUTED, now);
             auditTimeline.append(ORDER, orderId, StateMachine.ORDER, OrderStatus.ACCEPTED.name(),
                     OrderStatus.EXECUTED.name(), actor,
                     "simulated fill recorded as " + executionId, clock);
             return filled;
         }));
-
-        return postTrade.onExecuted(executed, actor);
     }
 
     public Order get(String orderId) {
         return requireOrder(orderId, orderStore.find(orderId));
     }
 
+    //The store owns the order of a full read and answers with an unmodifiable snapshot, so that
+    //snapshot is what goes back: one layer copying and sorting once, rather than two doing both on
+    //a history that only ever grows.
     public List<Order> list() {
-        List<Order> snapshot = new ArrayList<>(orderStore.list());
-        snapshot.sort(Comparator.comparing(Order::getOrderId));
-        return snapshot;
+        return orderStore.list();
     }
 
     public List<AuditEvent> events(String orderId) {
@@ -240,10 +294,10 @@ public class OrderLifecycleService {
         get(orderId);
 
         //Both of the order's state machines come back, ORDER and POST_TRADE, because both are
-        //filed under this entity; sequence order is what interleaves them readably.
-        List<AuditEvent> timeline = new ArrayList<>(auditTimeline.forEntity(ORDER, orderId));
-        timeline.sort(Comparator.comparingLong(AuditEvent::getSequence));
-        return timeline;
+        //filed under this entity; sequence order is what interleaves them readably, and the
+        //timeline assigns each ordinal and its list position together, so its snapshot is already
+        //in that order.
+        return auditTimeline.forEntity(ORDER, orderId);
     }
 
     private static String required(String value, String field) {
@@ -266,5 +320,43 @@ public class OrderLifecycleService {
             throw new EntityNotFoundException("No order exists with id " + orderId);
         }
         return order;
+    }
+
+    /* The validated, canonical form of one submit body, so the checks run once and every later step
+       - the stored order, the control evaluation, the position key, the fill and the simulated
+       execution - is built from the same values rather than re-reading a mutable request. */
+    private static final class SubmittedOrder {
+        private final String clientOrderId;
+        private final String clientId;
+        private final String symbol;
+        private final String side;
+        private final long quantity;
+        private final BigDecimal limitPrice;
+
+        private SubmittedOrder(String clientOrderId, String clientId, String symbol, String side,
+                long quantity, BigDecimal limitPrice) {
+            this.clientOrderId = clientOrderId;
+            this.clientId = clientId;
+            this.symbol = symbol;
+            this.side = side;
+            this.quantity = quantity;
+            this.limitPrice = limitPrice;
+        }
+
+        /* Checked arithmetic, because the sum of a stored holding and an order quantity is the one
+           value here that a caller can push past what a long holds. Wrapping it would store a
+           position whose sign and magnitude are both wrong, so a share count that cannot be
+           represented is refused as a bad request instead - inside the store's compute step, which
+           leaves the position exactly as it was. */
+        private long resultingQuantity(long existingQuantity) {
+            try {
+                return BUY.equals(side)
+                        ? Math.addExact(existingQuantity, quantity)
+                        : Math.subtractExact(existingQuantity, quantity);
+            } catch (ArithmeticException beyondLongRange) {
+                throw new ValidationException("quantity " + quantity + " would move the " + clientId
+                        + " " + symbol + " position beyond the supported share range");
+            }
+        }
     }
 }

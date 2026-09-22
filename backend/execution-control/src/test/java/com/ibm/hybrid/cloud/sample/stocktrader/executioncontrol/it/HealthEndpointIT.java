@@ -52,15 +52,13 @@ class HealthEndpointIT {
     private static final String UP_FRAGMENT = "\"status\":\"UP\"";
 
     @Test
-    void testLiveEndpoint() throws Exception {
+    void testLiveEndpoint() {
         System.out.println("Testing endpoint " + LIVE_URL);
 
+        //Liveness is independent of the seed load and of the reference-data counts, so it is asserted
+        //on the first response with no retry: a window here would hide a liveness check that only
+        //turns UP once data exists, which is exactly the restart-on-empty-data defect this guards.
         HealthResult result = makeRequest(LIVE_URL);
-        for (int i = 0; (result.status != 200) && (i < MAX_RETRY_COUNT); i++) {
-            System.out.println("Response code : " + result.status + ", retrying ... (" + i + " of " + MAX_RETRY_COUNT + ")");
-            Thread.sleep(SLEEP_TIMEOUT);
-            result = makeRequest(LIVE_URL);
-        }
 
         Assertions.assertEquals(200, result.status, "Unexpected status from " + LIVE_URL + ", body: " + result.body);
         Assertions.assertTrue(result.body.contains(UP_FRAGMENT), "Body from " + LIVE_URL + " did not report UP: " + result.body);

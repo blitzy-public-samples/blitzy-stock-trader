@@ -28,6 +28,8 @@ public class Execution {
        happened anywhere real. */
     private static final String SIMULATED_VENUE = "SIMULATED";
 
+    private static final int AMOUNT_SCALE = 2;
+
     private final String executionId;
     private final BigDecimal fillPrice;
     private final long filledQuantity;
@@ -42,12 +44,25 @@ public class Execution {
            returns 0 - so the scale is fixed once, here, rather than wherever a price literal was
            written. That keeps both the serialized amount and every value assertion on it
            deterministic, including the copies PostTradeService denormalises onto an exception. */
-        this.fillPrice = (fillPrice == null) ? null : fillPrice.setScale(2, RoundingMode.HALF_UP);
+        this.fillPrice = (fillPrice == null) ? null : cents(fillPrice, "fillPrice");
         this.filledQuantity = filledQuantity;
         this.executedAt = executedAt;
         this.venue = SIMULATED_VENUE;
         this.simulated = true;
         this.disclaimer = SimulationLabels.DISCLAIMER;
+    }
+
+    /* Pinning the scale must never change the price. A fill recorded at 0.001 would be rounded to
+       0.00 and the trade would report as free, so a price that cannot be held in cents is refused
+       here rather than rounded away where nobody can see it happen. */
+    private static BigDecimal cents(BigDecimal value, String field) {
+        BigDecimal atCents = value.setScale(AMOUNT_SCALE, RoundingMode.DOWN);
+        if (atCents.compareTo(value) != 0) {
+            throw new IllegalArgumentException(
+                    field + " must be a whole number of cents, not " + value.toPlainString());
+        }
+
+        return atCents;
     }
 
     public String getExecutionId() {

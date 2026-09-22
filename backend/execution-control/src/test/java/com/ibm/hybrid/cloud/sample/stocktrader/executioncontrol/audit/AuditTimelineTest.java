@@ -27,6 +27,7 @@ import java.time.ZoneOffset;
 
 //Collections
 import java.util.List;
+import java.util.Locale;
 
 //JUnit 5 Jupiter
 import org.junit.jupiter.api.BeforeEach;
@@ -87,20 +88,30 @@ class AuditTimelineTest {
 
     @Test
     void testEventIdIsTheSequenceZeroPaddedToSixDigits() {
-        AuditEvent first = timeline.append("ORDER", "ORD-000001", StateMachine.ORDER,
-                "(none)", "SUBMITTED", "stock", "clientOrderId C1 received", CLOCK);
-        AuditEvent second = timeline.append("ORDER", "ORD-000002", StateMachine.ORDER,
-                "(none)", "SUBMITTED", "stock", "clientOrderId C2 received", CLOCK);
-        AuditEvent third = timeline.append("EXCEPTION", "EXC-000001", StateMachine.EXCEPTION,
-                "(none)", "OPEN", "seed", "safekeepingAccount differs", CLOCK);
+        /* Appended while the JVM's formatting locale uses a non-Latin numbering system, which is
+           reachable with nothing more exotic than -Duser.language=ne -Duser.country=NP: the event
+           id is an ASCII rendering of the sequence that the audit endpoint, the README and these
+           literals all read directly, so it must not follow the deployment's locale. */
+        Locale formatLocale = Locale.getDefault(Locale.Category.FORMAT);
+        Locale.setDefault(Locale.Category.FORMAT, Locale.forLanguageTag("ne-NP"));
+        try {
+            AuditEvent first = timeline.append("ORDER", "ORD-000001", StateMachine.ORDER,
+                    "(none)", "SUBMITTED", "stock", "clientOrderId C1 received", CLOCK);
+            AuditEvent second = timeline.append("ORDER", "ORD-000002", StateMachine.ORDER,
+                    "(none)", "SUBMITTED", "stock", "clientOrderId C2 received", CLOCK);
+            AuditEvent third = timeline.append("EXCEPTION", "EXC-000001", StateMachine.EXCEPTION,
+                    "(none)", "OPEN", "seed", "safekeepingAccount differs", CLOCK);
 
-        assertEquals("EVT-000001", first.getEventId(), "first eventId");
-        assertEquals("EVT-000002", second.getEventId(), "second eventId");
-        assertEquals("EVT-000003", third.getEventId(), "third eventId");
+            assertEquals("EVT-000001", first.getEventId(), "first eventId");
+            assertEquals("EVT-000002", second.getEventId(), "second eventId");
+            assertEquals("EVT-000003", third.getEventId(), "third eventId");
 
-        for (AuditEvent event : timeline.all()) {
-            assertEquals(String.format("EVT-%06d", event.getSequence()), event.getEventId(),
-                    "eventId must be the zero-padded sequence");
+            for (AuditEvent event : timeline.all()) {
+                assertEquals(String.format(Locale.ROOT, "EVT-%06d", event.getSequence()),
+                        event.getEventId(), "eventId must be the zero-padded sequence");
+            }
+        } finally {
+            Locale.setDefault(Locale.Category.FORMAT, formatLocale);
         }
     }
 

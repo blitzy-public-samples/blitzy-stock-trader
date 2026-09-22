@@ -17,7 +17,7 @@
 
 package com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json;
 
-/** Constants labelling every execution-control response as simulated, synthetic data */
+/** The shared disclaimer text carried by this module's labelled simulated-domain responses */
 public final class SimulationLabels {
     public static final String DISCLAIMER =
             "Simulated institutional order and post-trade data. No real orders are routed, "

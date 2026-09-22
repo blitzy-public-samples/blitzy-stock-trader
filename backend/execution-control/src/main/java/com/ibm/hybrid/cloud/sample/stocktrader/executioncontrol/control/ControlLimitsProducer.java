@@ -20,12 +20,6 @@ package com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.control;
 //Arbitrary-precision arithmetic
 import java.math.BigDecimal;
 
-//Collections
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Locale;
-import java.util.Set;
-
 //Logging (JSR 47)
 import java.util.logging.Logger;
 
@@ -33,9 +27,9 @@ import java.util.logging.Logger;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Produces;
 import jakarta.inject.Inject;
-import jakarta.inject.Singleton;
 
 //mpConfig 3.1
+import org.eclipse.microprofile.config.ConfigValue;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 
 
@@ -51,20 +45,21 @@ public class ControlLimitsProducer {
     private @Inject @ConfigProperty(name = "MAX_ORDER_NOTIONAL") BigDecimal maxOrderNotional;
     private @Inject @ConfigProperty(name = "MAX_POSITION_NOTIONAL") BigDecimal maxPositionNotional;
     private @Inject @ConfigProperty(name = "FAT_FINGER_NOTIONAL_THRESHOLD") BigDecimal fatFingerNotionalThreshold;
-    private @Inject @ConfigProperty(name = "RESTRICTED_SYMBOLS") List<String> restrictedSymbols;
+    //This one key arrives as its raw ConfigValue rather than a converted list, because a mandatory
+    //injection cannot express a declared-but-empty setting: MicroProfile Config reports an empty
+    //string as a missing property and would fail the deployment an operator meant to clear the list.
+    private @Inject @ConfigProperty(name = "RESTRICTED_SYMBOLS") ConfigValue restrictedSymbols;
     private @Inject @ConfigProperty(name = "EXCEPTION_SLA_HOURS") int exceptionSlaHours;
 
 
-    //@Singleton rather than @ApplicationScoped: ControlLimits is a final value object with no no-arg
-    //constructor, so CDI cannot client-proxy it and a normal scope here would turn every injection
-    //point into a deployment error (Weld WELD-001410). @Singleton is a pseudo-scope - no proxy - and
-    //the method still runs exactly once per application, which is the property that matters: the
-    //limits are read from configuration once and every consumer shares that one immutable instance.
     @Produces
-    @Singleton
+    @ApplicationScoped
     public ControlLimits controlLimits() {
         ControlLimits limits = new ControlLimits(maxOrderNotional, maxPositionNotional,
-                fatFingerNotionalThreshold, canonicalize(restrictedSymbols), exceptionSlaHours);
+                fatFingerNotionalThreshold,
+                ControlLimits.restrictedSymbolsFrom(restrictedSymbols.getRawValue(),
+                        restrictedSymbols.getValue(), restrictedSymbols.getSourceName()),
+                exceptionSlaHours);
 
         //These values decide whether every order is accepted or rejected, so the operator
         //diagnosing a rejection gets them once at start-up without turning on trace.
@@ -75,26 +70,5 @@ public class ControlLimitsProducer {
                 + ", EXCEPTION_SLA_HOURS=" + limits.getExceptionSlaHours());
 
         return limits;
-    }
-
-    //Trimmed and upper-cased here so the pre-trade evaluation compares against the already-canonical
-    //order symbol with no further work, and order-preserving so GET /controls reports the configured
-    //list deterministically. A present-but-blank override means "nothing is restricted", so blank
-    //tokens are dropped rather than becoming a symbol no order could ever match; a missing key never
-    //reaches this method, because the injection point above has no default to fall back on.
-    private static Set<String> canonicalize(List<String> symbols) {
-        Set<String> canonical = new LinkedHashSet<>();
-        if (symbols == null) {
-            return canonical;
-        }
-
-        for (String symbol : symbols) {
-            if (symbol == null || symbol.isBlank()) {
-                continue;
-            }
-            canonical.add(symbol.trim().toUpperCase(Locale.ROOT));
-        }
-
-        return canonical;
     }
 }

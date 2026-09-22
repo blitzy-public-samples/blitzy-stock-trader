@@ -65,8 +65,10 @@ The JSON contract makes this impossible to miss:
 
 `ErrorResponse` carries no label, because it describes no order and no data.
 
-This module is ordinary tracked content in the parent repository, **not** a git submodule, and the
-feature that introduced it creates or changes no file outside `backend/execution-control/`.
+This module is ordinary tracked content in the parent repository, **not** a git submodule and not a
+repository of its own. It is entirely self-contained: every file the service needs — source,
+configuration, security material, container definition and test wiring — lives under
+`backend/execution-control/`, and nothing it needs sits outside that directory.
 
 ## Domain model and flows
 
@@ -101,6 +103,28 @@ then `ASSIGNED → RESOLVED`); calling it on an `OPEN` exception without an owne
 `owner is required`. Any pair outside the tables above — `RESOLVED → RESOLVED`,
 `OPEN → SETTLEMENT_READY`, anything out of `SETTLEMENT_READY` — is refused with `409` before any
 event is written.
+
+### Exception ageing and the SLA clock
+
+`slaDeadline` is `openedAt + EXCEPTION_SLA_HOURS`. It is computed once, when the exception opens,
+and is never recomputed afterwards. `ageHours` and `slaBreached` are the opposite: they are
+**derived on every read** and never stored, and both are measured from a reference instant `t` that
+depends on the exception's status.
+
+| Status | Reference instant `t` | What that means |
+| --- | --- | --- |
+| `OPEN`, `ASSIGNED` | now, from the service's UTC clock | the exception keeps ageing while it is being worked, and crosses into breach as soon as `t` passes `slaDeadline` |
+| `RESOLVED`, `SETTLEMENT_READY` | `resolvedAt` — the instant the resolution note was recorded | both values freeze at resolution; marking the exception settlement-ready afterwards does not move them |
+
+`ageHours` is the whole hours between `openedAt` and `t`, truncated — a 90-minute-old exception
+reports `1`. `slaBreached` is true only when `t` is **strictly after** `slaDeadline`, so an
+exception read exactly on its deadline is not yet breached: the same equality rule the pre-trade
+controls use.
+
+The two consequences worth knowing when reading `GET /exceptions`: an exception resolved inside its
+SLA never reports itself breached later, however long it stays in the store; and an open
+exception's `ageHours` and `slaBreached` can differ between two reads with no state transition in
+between, because the clock moved and nothing else did.
 
 ### Pre-trade controls
 
@@ -137,14 +161,29 @@ Because an order carries two interleaved state machines, `GET /orders/{orderId}/
 The application is served under the context root `/execution-control`. All request and response
 bodies are JSON.
 
-| Endpoint | Method | Roles | Success |
-| --- | --- | --- | --- |
-| `/orders` | POST | `StockTrader` | 201 |
-| `/orders`, `/orders/{orderId}`, `/orders/{orderId}/events` | GET | `StockViewer`, `StockTrader` | 200 |
-| `/exceptions`, `/exceptions/{id}`, `/exceptions/{id}/events` | GET | `StockViewer`, `StockTrader` | 200 |
-| `/exceptions/{id}/assign`, `/exceptions/{id}/resolve`, `/exceptions/{id}/settlement-ready` | PUT | `StockTrader` | 200 |
-| `/audit`, `/controls`, `/clients`, `/positions` | GET | `StockViewer`, `StockTrader` | 200 |
-| any path | HEAD, OPTIONS, PATCH, TRACE | denied by `<deny-uncovered-http-methods/>` | 403 |
+| # | Endpoint | Method | Roles | Success | Returns |
+| --- | --- | --- | --- | --- | --- |
+| 1 | `/orders` | POST | `StockTrader` | 201 | the submitted order in its terminal state, with all four control results |
+| 2 | `/orders` | GET | `StockViewer`, `StockTrader` | 200 | every order, seeded and live |
+| 3 | `/orders/{orderId}` | GET | `StockViewer`, `StockTrader` | 200 | one order |
+| 4 | `/orders/{orderId}/events` | GET | `StockViewer`, `StockTrader` | 200 | that order's `ORDER` and `POST_TRADE` audit events, in `sequence` order |
+| 5 | `/exceptions` | GET | `StockViewer`, `StockTrader` | 200 | settlement exceptions, optionally filtered by `status` and `owner` |
+| 6 | `/exceptions/{exceptionId}` | GET | `StockViewer`, `StockTrader` | 200 | one settlement exception |
+| 7 | `/exceptions/{exceptionId}/events` | GET | `StockViewer`, `StockTrader` | 200 | that exception's `EXCEPTION` audit events |
+| 8 | `/exceptions/{exceptionId}/assign` | PUT | `StockTrader` | 200 | the exception, now `ASSIGNED` to the owner in the body |
+| 9 | `/exceptions/{exceptionId}/resolve` | PUT | `StockTrader` | 200 | the exception, now `RESOLVED` with the resolution note |
+| 10 | `/exceptions/{exceptionId}/settlement-ready` | PUT | `StockTrader` | 200 | the exception, now `SETTLEMENT_READY`; the parent order follows |
+| 11 | `/audit` | GET | `StockViewer`, `StockTrader` | 200 | the whole audit timeline, optionally filtered by `entityType` and `entityId` |
+| 12 | `/controls` | GET | `StockViewer`, `StockTrader` | 200 | the five effective control values as configuration supplied them, `source = CONFIG` |
+| 13 | `/clients` | GET | `StockViewer`, `StockTrader` | 200 | the three synthetic clients with both settlement instructions each |
+| 14 | `/positions` | GET | `StockViewer`, `StockTrader` | 200 | the synthetic positions, as executions have left them |
+
+Those fourteen handlers are the whole application surface. **Any other method on any path — `HEAD`,
+`OPTIONS`, `PATCH`, `TRACE` — is refused with `403`**, because `web.xml` covers `GET` on `/*` and
+`POST`/`PUT`/`DELETE` on `/*` and then declares `<deny-uncovered-http-methods/>`: a method no
+constraint covers is denied rather than allowed. No handler implements `DELETE`; `web.xml` names it
+beside `POST` and `PUT`, so a `DELETE` from a `StockTrader` clears authorization and is then
+answered `405` by the JAX-RS runtime rather than `403`.
 
 Query filters:
 
@@ -186,10 +225,16 @@ role constraints above do not gate them. `/openapi` is served by `mpOpenAPI-4.1`
 
 ## Configuration
 
-Configuration is by environment variable only. **The service starts with no configuration supplied
-at all** — every variable below has a safe default, and a container started with no `env` entries
-seeds its synthetic data, enforces the documented control limits and answers all three health
-probes `UP`.
+Configuration is by environment variable only. **In its default mode the service starts with no
+configuration supplied at all**: `AUTH_TYPE` defaults to `basic` in `server.xml`, and every
+variable that mode reads has a safe default held either in `server.xml` or in
+`microprofile-config.properties`, so a container started with no `env` entries seeds its synthetic
+data, enforces the documented control limits and answers all three health probes `UP`.
+
+Exactly one variable has no default. `OIDC_JWKS_URL` is **mandatory when `AUTH_TYPE=oidc`**,
+because `includes/oidc.xml` resolves it straight into the `mpJwt` consumer's `jwksUri`: select that
+mode without supplying it and the JWT consumer has no key source. Every other variable below is an
+override of a shipped default.
 
 ### Business rules
 
@@ -199,7 +244,7 @@ probes `UP`.
 | `MAX_POSITION_NOTIONAL` | decimal | `5000000.00` (`microprofile-config.properties`) | Ceiling on the absolute resulting position notional for the client and symbol. The whole resulting quantity is marked at the order's `limitPrice`, so the value evaluated equals the `positionNotional` the position will carry if the order fills |
 | `FAT_FINGER_NOTIONAL_THRESHOLD` | decimal | `2500000.00` (`microprofile-config.properties`) | Firm-wide anomaly ceiling on one order's notional, evaluated independently of `MAX_ORDER_NOTIONAL` |
 | `RESTRICTED_SYMBOLS` | comma-separated list | `RSTRA,RSTRB` (`microprofile-config.properties`) | Symbols that may not be traded, matched against the trimmed and upper-cased order symbol. The defaults are synthetic tickers |
-| `EXCEPTION_SLA_HOURS` | integer | `24` (`microprofile-config.properties`) | Hours from exception opening to its SLA deadline. Drives `slaDeadline`, `ageHours` and `slaBreached` |
+| `EXCEPTION_SLA_HOURS` | integer | `24` (`microprofile-config.properties`) | Hours from exception opening to its SLA deadline: `slaDeadline = openedAt + EXCEPTION_SLA_HOURS`, fixed when the exception opens. `ageHours` and `slaBreached` are derived from that deadline on every read, against the status-dependent reference instant set out under [Exception ageing and the SLA clock](#exception-ageing-and-the-sla-clock) |
 
 ### Server and identity
 
@@ -300,10 +345,15 @@ Maven must run before `docker build` — the image compiles nothing and copies t
 produced:
 
 ```bash
-mvn -B clean package -DskipTests
-docker build -t execution-control:local .
-docker run -d --name ec -p 9080:9080 -e AUTH_TYPE=none execution-control:local
+mvn -B clean package -DskipTests && \
+  docker build -t execution-control:local . && \
+  docker run -d --name ec -p 9080:9080 -e AUTH_TYPE=none execution-control:local
 ```
+
+The three steps are chained with `&&` deliberately: run them separately and a failed Maven build
+leaves `docker build` copying whatever WAR was in `target/` beforehand, and a failed `docker build`
+leaves `docker run` starting the previous image under the same tag. Chained, the first failure
+stops the pipeline.
 
 The base image is `icr.io/appcafe/open-liberty:25.0.0.9-full-java21-openj9-ubi-minimal` — the same
 base the sibling Liberty services use. It carries every Liberty feature, so the `microProfile-7.1`,
@@ -360,8 +410,6 @@ spec:
     metadata:
       labels:
         app: execution-control
-      annotations:
-        git-repo: "https://github.com/IBMStockTrader/execution-control"
     spec:
       containers:
       - name: execution-control
@@ -451,9 +499,12 @@ kubectl apply -f execution-control.yml -n stocktrader
 ```
 
 The probe paths and timings are the contract the StockTrader operator chart applies to its own
-services, reused here so this service behaves the same way under Kubernetes. The manifest carries
-no `prometheus.io/*` annotations: the requested feature set includes no `mpMetrics`, so there is no
-`/metrics` endpoint to advertise and the estate's annotation convention is deliberately not copied.
+services, reused here so this service behaves the same way under Kubernetes. The pod template
+carries no annotations at all, and two of the estate's conventions are deliberately not copied:
+there are no `prometheus.io/*` annotations, because the requested feature set includes no
+`mpMetrics` and so there is no `/metrics` endpoint to advertise; and there is no `git-repo`
+annotation, because this service has no repository of its own to name — it is tracked content of
+the parent aggregation, not a seventeenth microservice repository.
 
 The `Service` is `ClusterIP` — the minimal exposure — because nothing in the estate routes to this
 service: no trader page, no broker adapter, no Istio route. Substituting `type: NodePort` with the
@@ -603,8 +654,12 @@ here resolve from the token's `groups` claim (Liberty's `mpJwt` reads `groups` b
 the `basicRegistry` groups of `includes/none.xml` when `AUTH_TYPE=none`.
 
 The accepted consequence: a deployment using `AUTH_TYPE=oidc` with an identity provider whose
-tokens carry no `groups` claim **fails closed** — every request answers `403`, because neither role
-resolves. The single remedy is to configure the identity provider to emit a `groups` claim
+tokens carry no `groups` claim **fails closed** — every protected application request under
+`/execution-control` answers `403` to an authenticated caller, because neither role resolves for
+them. The runtime endpoints are unaffected: `/health/*` and `/openapi` sit outside the WAR's
+context root, so the `web.xml` constraints never gate them and they keep answering normally. That
+combination — all three probes `UP` while every API call returns `403` — is the signature of this
+misconfiguration. The single remedy is to configure the identity provider to emit a `groups` claim
 containing `StockTrader` or `StockViewer`. Re-adding the `ALL_AUTHENTICATED_USERS` binding is
 **not** offered as a remedy: it would grant every authenticated caller `StockTrader` and defeat the
 restriction of the mutating verbs that this service requires.
@@ -618,7 +673,8 @@ acceptance works out of the box:
 - `src/main/liberty/config/resources/security/trust.p12` — byte-identical to the broker's, holding
   the `jwtSigner` key. That byte-for-byte identity is precisely what lets this service accept the
   tokens the rest of the estate issues.
-- The literal keystore password `St0ckTr@der` in `server.xml`.
+- The hard-coded sample keystore password configured in `server.xml`, which both stores share. The
+  value is in that file and is deliberately not repeated here.
 - The plaintext development users in `includes/none.xml` (`stock:trader` in `StockTrader`,
   `read:only` in `StockViewer`).
 
@@ -629,10 +685,16 @@ accepts the hard-coded users above.
 
 ### In-memory storage, and data lost on restart
 
-All state — orders, executions, settlement exceptions, positions, client reference data and the
-audit timeline — is held in `ConcurrentHashMap`s owned solely by this service. It shares nothing
-with the Portfolio JDBC schema or the Account CouchDB documents, and it requires no datastore, no
-message broker and no credential of its own: there is nothing to provision before it runs.
+All state is held in in-memory data structures owned solely by this service, in two shapes. Orders
+with their executions, settlement exceptions, client reference data and positions live in
+`ConcurrentHashMap` stores, where every mutation is one atomic per-key operation. The audit
+timeline is not a map: it is an append-only list whose ordinals come from an `AtomicLong`, appended
+under a single monitor so that an event's ordinal, its timestamp and its place in the list can
+never disagree, and read out only as an unmodifiable copy.
+
+State shares nothing with the Portfolio JDBC schema or the Account CouchDB documents, and it
+requires no datastore, no message broker and no credential of its own: there is nothing to
+provision before the service runs.
 
 The corollary is that **all data is lost on restart**. Every order, execution, exception and audit
 event created through the API disappears, and the seed set described above is re-created from

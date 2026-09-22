@@ -151,6 +151,9 @@ class OrderSubmissionIT {
                 "Execution was not labelled simulated: " + result.body);
         assertNonBlank(execution, "executionId", "Execution");
         assertNonBlank(execution, "executedAt", "Execution");
+        //The nested fill is labelled in its own right rather than inheriting the order's labels,
+        //so a reader who quotes the execution alone still carries the disclaimer with it.
+        assertNonBlank(execution, "disclaimer", "Execution");
 
         /* All four controls are recorded whatever the verdict, in the fixed order MAX_ORDER_NOTIONAL,
            MAX_POSITION_NOTIONAL, RESTRICTED_SYMBOL, FAT_FINGER and never short-circuited, so an
@@ -174,6 +177,7 @@ class OrderSubmissionIT {
                     "Reference data was not labelled synthetic: " + position);
             Assertions.assertTrue(position.getBoolean("simulated"),
                     "Reference data was not labelled simulated: " + position);
+            assertNonBlank(position, "disclaimer", "Position");
         }
 
         /* A delta rather than an absolute quantity: the startup seed already moved this position,
@@ -262,6 +266,16 @@ class OrderSubmissionIT {
         assertBadRequest(orderBody(uniqueClientOrderId(), -5L, LIMIT_PRICE), "quantity");
         assertBadRequest(orderBody(uniqueClientOrderId(), 100L, "0"), "limitPrice");
         assertBadRequest(orderBody(uniqueClientOrderId(), 100L, "-1.00"), "limitPrice");
+    }
+
+    @Test
+    void testSubCentLimitPriceIsRejected() {
+        /* A sub-cent price passes a sign check and is then held in cents, so 0.001 would have been
+           stored as 0.00: the order's notional falls to zero, every configured notional ceiling
+           clears it and the simulated fill costs nothing. Over the wire it must answer 400 and name
+           limitPrice, like any other unusable field in the body. */
+        assertBadRequest(orderBody(uniqueClientOrderId(), 100L, "0.001"), "limitPrice");
+        assertBadRequest(orderBody(uniqueClientOrderId(), 100L, "100.005"), "limitPrice");
     }
 
     @Test

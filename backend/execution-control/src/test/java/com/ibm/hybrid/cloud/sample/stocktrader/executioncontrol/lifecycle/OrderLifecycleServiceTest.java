@@ -156,6 +156,8 @@ public class OrderLifecycleServiceTest {
         assertEquals(FIXED_INSTANT, execution.getExecutedAt(), "executedAt comes from the injected clock");
         assertEquals("SIMULATED", execution.getVenue(), "no exchange exists, so the venue is SIMULATED");
         assertTrue(execution.isSimulated(), "every execution labels itself simulated");
+        assertFalse(execution.getDisclaimer().isBlank(),
+                "every execution carries a non-blank disclaimer of its own, not only its order");
 
         List<ControlResult> results = order.getControlResults();
         assertEquals(CONTROL_COUNT, results.size(), "all four controls record a result on every order");
@@ -167,6 +169,13 @@ public class OrderLifecycleServiceTest {
         assertEquals(10100L, filled.getQuantity(), "the fill is applied to the client's position");
         assertAmount("1010000.00", filled.getPositionNotional(),
                 "the whole resulting quantity is marked at the fill price");
+        /* A position carries a third label the order and the execution do not: the holding itself
+           was invented, not merely the activity against it, so reference data is synthetic as well
+           as simulated. A fill rewrites the position, which is why the labels are asserted on the
+           filled object rather than only on the seeded one. */
+        assertTrue(filled.isSynthetic(), "every position labels itself synthetic");
+        assertTrue(filled.isSimulated(), "every position labels itself simulated");
+        assertFalse(filled.getDisclaimer().isBlank(), "every position carries a non-blank disclaimer");
         assertEquals(OrderStatus.EXECUTED, service.get(order.getOrderId()).getStatus(),
                 "the stored order is the one submit returned");
     }
@@ -342,6 +351,91 @@ public class OrderLifecycleServiceTest {
     }
 
     @Test
+    void testSubCentLimitPriceIsRefusedRatherThanRoundedToZero() {
+        /* A sub-cent price is positive, so a sign check alone admits it - and the value objects
+           hold money in cents, so 0.001 would have been stored as 0.00. That order carries a
+           notional of zero, which sits under every configured ceiling, and it fills at a price of
+           zero: the whole pre-trade control set is evaluated against an amount nobody submitted.
+           The price is therefore refused unless it is a whole number of cents. */
+        assertValidationMessage("limitPrice",
+                () -> service.submit(request("API-014", "INST-001", "SYNA", "BUY", 100L, "0.001"),
+                        ACTOR));
+        assertValidationMessage("limitPrice",
+                () -> service.submit(request("API-014", "INST-001", "SYNA", "BUY", 100L, "100.005"),
+                        ACTOR));
+        assertValidationMessage("limitPrice",
+                () -> service.submit(request("API-014", "INST-001", "SYNA", "BUY", 100L,
+                        "0.0000001"), ACTOR));
+
+        assertEquals(0, orderStore.count(), "a sub-cent price stores no order");
+        assertTrue(auditTimeline.all().isEmpty(), "a sub-cent price records no audit event");
+        assertEquals(10000L, referenceData.findPosition("INST-001", "SYNA").getQuantity(),
+                "a sub-cent price leaves the position untouched");
+
+        //A price already expressed in cents is untouched, including one written with a scale the
+        //caller chose rather than the scale the order stores.
+        Order executed = service.submit(
+                request("API-015", "INST-001", "SYNA", "BUY", 100L, "100.0000"), ACTOR);
+
+        assertEquals(OrderStatus.EXECUTED, executed.getStatus(),
+                "a price representable in cents is accepted whatever scale it was written with");
+        assertAmount("100.00", executed.getLimitPrice(), "stored limit price");
+        assertAmount("10000.00", executed.getNotional(), "derived notional");
+        assertAmount("100.00", executed.getExecution().getFillPrice(), "simulated fill price");
+
+        /* The three value objects refuse the same amount rather than rounding it, so the guard does
+           not depend on every future caller remembering to come through submit. */
+        BigDecimal subCent = new BigDecimal("0.001");
+        assertMonetaryGuard("limitPrice", () -> new Order("ORD-000001", "API-014", "INST-001",
+                "SYNA", "BUY", 100L, subCent, ACTOR, FIXED_INSTANT, RecordSource.API));
+        assertMonetaryGuard("fillPrice",
+                () -> new Execution("EXE-000001", subCent, 100L, FIXED_INSTANT));
+        assertMonetaryGuard("lastPrice", () -> new Position("INST-001", "SYNA", 100L, subCent));
+    }
+
+    @Test
+    void testResultingPositionBeyondTheLongShareRangeIsRefused() {
+        /* Reachable only where an operator has configured ceilings high enough to permit a position
+           no long can hold, which is exactly when the arithmetic used to wrap: the stored quantity
+           would have flipped sign and shrunk. The request is refused instead, and because the
+           refusal happens inside the store's compute step the holding is left as it was. */
+        ControlLimits permissive = new ControlLimits(new BigDecimal("1E+30"),
+                new BigDecimal("1E+30"), new BigDecimal("1E+30"), RESTRICTED_SYMBOLS,
+                EXCEPTION_SLA_HOURS);
+        OrderLifecycleService unbounded = new OrderLifecycleService(orderStore, referenceData,
+                new PreTradeControlService(permissive),
+                new PostTradeService(orderStore, new SettlementExceptionStore(), referenceData,
+                        auditTimeline, FIXED_CLOCK, permissive),
+                auditTimeline, FIXED_CLOCK);
+
+        referenceData.putPosition(new Position("INST-001", "SYNC", Long.MAX_VALUE,
+                new BigDecimal("0.01")));
+
+        ValidationException refused = assertThrows(ValidationException.class,
+                () -> unbounded.submit(request("API-016", "INST-001", "SYNC", "BUY", 5L, "0.01"),
+                        ACTOR),
+                "a resulting share count beyond the long range must be refused");
+        assertTrue(refused.getMessage().contains("SYNC"),
+                "the message must name the position it could not move: " + refused.getMessage());
+
+        assertEquals(Long.MAX_VALUE, referenceData.findPosition("INST-001", "SYNC").getQuantity(),
+                "the refused fill leaves the holding exactly as it was");
+        assertEquals(OrderStatus.SUBMITTED, orderStore.list().get(0).getStatus(),
+                "the order stops at SUBMITTED: no fill, no acceptance and no execution happened");
+
+        /* Math.abs(Long.MIN_VALUE) is itself negative, so a holding at that quantity used to derive
+           a negative notional - a figure below every positive ceiling however large the exposure.
+           The magnitude is now exact, and a short reports the same notional as the equivalent long. */
+        Position extremeShort = new Position("INST-001", "SYND", Long.MIN_VALUE,
+                new BigDecimal("0.01"));
+
+        assertAmount("92233720368547758.08", extremeShort.getPositionNotional(),
+                "a position at Long.MIN_VALUE must report its magnitude, not a negative notional");
+        assertTrue(extremeShort.getPositionNotional().signum() > 0,
+                "a notional is a magnitude and can never be negative");
+    }
+
+    @Test
     void testMissingRequiredFieldIsRefused() {
         assertValidationMessage("clientOrderId", () -> service.submit(null, ACTOR));
         assertValidationMessage("clientOrderId",
@@ -422,6 +516,34 @@ public class OrderLifecycleServiceTest {
         assertEquals(2, listed.size(), "both orders are listed, executed and rejected alike");
         assertEquals(first.getOrderId(), listed.get(0).getOrderId(), "list is ordered by order id");
         assertEquals(second.getOrderId(), listed.get(1).getOrderId(), "list is ordered by order id");
+    }
+
+    @Test
+    void testResultingPositionExactlyAtTheCeilingFillsAndStoresThatValue() {
+        /* The boundary the threshold rule turns on, taken all the way through to persistence: the
+           seeded 45000 plus a filled 5000 is 50000 marked at 100.00, which is 5,000,000.00 - the
+           configured ceiling to the cent. Equality passes rather than rejects, so this order fills,
+           and the fill is what proves the two figures cannot drift apart: the control values the
+           whole resulting quantity at the order's own limitPrice, which is exactly the price the
+           stored position then carries, so one number is evaluated and the same number is kept. */
+        Order order = service.submit(
+                request("API-014", "INST-002", "SYND", "BUY", 5000L, "100.00"), ACTOR);
+
+        assertEquals(OrderStatus.EXECUTED, order.getStatus(),
+                "a resulting position sitting exactly on MAX_POSITION_NOTIONAL is inside it");
+        ControlResult resultingPosition = control(order, CONTROL_MAX_POSITION_NOTIONAL);
+        assertTrue(resultingPosition.isPassed(),
+                "5000000.00 is not strictly greater than the limit: " + resultingPosition.getReason());
+        assertEquals("5000000.00", resultingPosition.getObservedValue(),
+                "the control marks the whole resulting 50000 at the order's 100.00");
+        assertEquals("5000000.00", resultingPosition.getConfiguredLimit(),
+                "the limit the control read is the configured ceiling");
+
+        Position filled = referenceData.findPosition("INST-002", "SYND");
+        assertEquals(50000L, filled.getQuantity(), "the seeded 45000 grows by the filled 5000");
+        assertAmount("100.00", filled.getLastPrice(), "the fill price becomes the position's mark");
+        assertAmount("5000000.00", filled.getPositionNotional(),
+                "the stored notional is the figure the control passed at, to the cent");
     }
 
     @Test
@@ -532,6 +654,14 @@ public class OrderLifecycleServiceTest {
     @Test
     void testConcurrentDuplicateSubmissionsLeaveExactlyOneOrder() throws InterruptedException {
         Queue<Throwable> failures = new ConcurrentLinkedQueue<>();
+        /* Two gates rather than one, because `execute` only queues the task: a release latch opened
+           as soon as the eight are submitted would let a worker that the pool had not yet scheduled
+           arrive at an already-open gate and submit on its own, which the reservation refuses for
+           the ordinary sequential reason and proves nothing about simultaneity. Each worker
+           therefore reports its arrival on `ready` and blocks on `release`, and the gate opens only
+           once all eight have arrived - so the eight submissions genuinely race for the one
+           clientOrderId instead of possibly running one after another. */
+        CountDownLatch ready = new CountDownLatch(DUPLICATE_SUBMITTERS);
         CountDownLatch release = new CountDownLatch(1);
         CountDownLatch finished = new CountDownLatch(DUPLICATE_SUBMITTERS);
         ExecutorService submitters = Executors.newFixedThreadPool(DUPLICATE_SUBMITTERS);
@@ -540,6 +670,7 @@ public class OrderLifecycleServiceTest {
             for (int submitter = 0; submitter < DUPLICATE_SUBMITTERS; submitter++) {
                 submitters.execute(() -> {
                     try {
+                        ready.countDown();
                         release.await();
                         service.submit(
                                 request("API-011", "INST-001", "SYNA", "BUY", 100L, "100.00"),
@@ -555,6 +686,10 @@ public class OrderLifecycleServiceTest {
                 });
             }
 
+            //Bounded like every other wait here: a pool that never scheduled all eight is a failed
+            //test rather than a hung one, and the gate is never opened on a partial field.
+            assertTrue(ready.await(LATCH_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+                    "every submitter must reach the gate before it opens");
             release.countDown();
             assertTrue(finished.await(LATCH_TIMEOUT_SECONDS, TimeUnit.SECONDS),
                     "every submitter must finish inside the timeout");
@@ -581,6 +716,30 @@ public class OrderLifecycleServiceTest {
         assertEquals(OrderStatus.EXECUTED, survivor.getStatus(), "the surviving order executed");
         assertEquals(10100L, referenceData.findPosition("INST-001", "SYNA").getQuantity(),
                 "the position is filled exactly once");
+    }
+
+    @Test
+    void testInsertRefusesAnOrderIdThatIsAlreadyStored() {
+        Order executed = service.submit(
+                request("API-014", "INST-001", "SYNA", "BUY", 100L, "100.00"), ACTOR);
+        int eventsBefore = auditTimeline.all().size();
+
+        /* insert is the creation write and nothing more. A second write under a live order id
+           would replace an audited order without passing assertLegal or appending an event, which
+           is exactly the gap that would make the audit trail a convention rather than a property
+           of the store - so the store refuses it and the stored order stands. */
+        Order replacement = new Order(executed.getOrderId(), "API-015", "INST-001", "SYNA", "SELL",
+                1L, new BigDecimal("1.00"), ACTOR, FIXED_INSTANT, RecordSource.API);
+        assertThrows(IllegalStateException.class, () -> orderStore.insert(replacement),
+                "a duplicate order id must be refused rather than overwrite the stored order");
+
+        Order stored = service.get(executed.getOrderId());
+        assertEquals(OrderStatus.EXECUTED, stored.getStatus(), "the stored order keeps its status");
+        assertEquals(100L, stored.getQuantity(), "the stored order keeps its quantity");
+        assertEquals("BUY", stored.getSide(), "the stored order keeps its side");
+        assertEquals(1, orderStore.count(), "the refused write adds no order");
+        assertEquals(eventsBefore, auditTimeline.all().size(),
+                "a refused write appends no audit event");
     }
 
     private static OrderLifecycleService lifecycleService(OrderStore orders,
@@ -644,6 +803,16 @@ public class OrderLifecycleServiceTest {
         assertEquals(stateMachine, event.getStateMachine(), edge + " state machine");
         assertEquals(fromState, event.getFromState(), edge + " fromState");
         assertEquals(toState, event.getToState(), edge + " toState");
+    }
+
+    //The value objects guard their own monetary invariant, so the failure is an illegal argument
+    //rather than a rejected request: reaching them with an unroundable amount means submit was
+    //bypassed, which is a defect in the caller and not something a client can provoke.
+    private static void assertMonetaryGuard(String field, Executable construction) {
+        IllegalArgumentException refused = assertThrows(IllegalArgumentException.class, construction,
+                "a sub-cent " + field + " must be refused rather than rounded away");
+        assertTrue(refused.getMessage().contains(field),
+                "the message must name " + field + ": " + refused.getMessage());
     }
 
     private static void assertValidationMessage(String field, Executable submission) {

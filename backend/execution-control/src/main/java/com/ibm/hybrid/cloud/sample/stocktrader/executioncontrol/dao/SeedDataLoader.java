@@ -100,17 +100,21 @@ public class SeedDataLoader {
     }
 
     private void loadReferenceData() {
-        SettlementInstruction northwindInstruction = new SettlementInstruction(
-                NORTHWIND_CUSTODIAN_BIC, NORTHWIND_SAFEKEEPING_ACCOUNT, NORTHWIND_CASH_ACCOUNT,
-                NORTHWIND_PLACE_OF_SETTLEMENT);
         referenceData.putClient(new ClientAccount(NORTHWIND_ID, NORTHWIND_NAME,
-                northwindInstruction, northwindInstruction));
+                new SettlementInstruction(NORTHWIND_CUSTODIAN_BIC,
+                        NORTHWIND_SAFEKEEPING_ACCOUNT, NORTHWIND_CASH_ACCOUNT,
+                        NORTHWIND_PLACE_OF_SETTLEMENT),
+                new SettlementInstruction(NORTHWIND_CUSTODIAN_BIC,
+                        NORTHWIND_SAFEKEEPING_ACCOUNT, NORTHWIND_CASH_ACCOUNT,
+                        NORTHWIND_PLACE_OF_SETTLEMENT)));
 
-        SettlementInstruction contosoInstruction = new SettlementInstruction(
-                CONTOSO_CUSTODIAN_BIC, CONTOSO_SAFEKEEPING_ACCOUNT, CONTOSO_CASH_ACCOUNT,
-                CONTOSO_PLACE_OF_SETTLEMENT);
-        referenceData.putClient(new ClientAccount(CONTOSO_ID, CONTOSO_NAME, contosoInstruction,
-                contosoInstruction));
+        referenceData.putClient(new ClientAccount(CONTOSO_ID, CONTOSO_NAME,
+                new SettlementInstruction(CONTOSO_CUSTODIAN_BIC,
+                        CONTOSO_SAFEKEEPING_ACCOUNT, CONTOSO_CASH_ACCOUNT,
+                        CONTOSO_PLACE_OF_SETTLEMENT),
+                new SettlementInstruction(CONTOSO_CUSTODIAN_BIC,
+                        CONTOSO_SAFEKEEPING_ACCOUNT, CONTOSO_CASH_ACCOUNT,
+                        CONTOSO_PLACE_OF_SETTLEMENT)));
 
         referenceData.putClient(new ClientAccount(FABRIKAM_ID, FABRIKAM_NAME,
                 new SettlementInstruction(FABRIKAM_CUSTODIAN_BIC,

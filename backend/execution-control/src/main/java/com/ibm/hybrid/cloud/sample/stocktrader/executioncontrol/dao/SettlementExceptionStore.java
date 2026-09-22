@@ -24,6 +24,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Locale;
 
 //Concurrency
 import java.util.concurrent.ConcurrentHashMap;
@@ -43,12 +44,23 @@ public class SettlementExceptionStore {
     private final ConcurrentHashMap<String, SettlementException> exceptions = new ConcurrentHashMap<>();
     private final AtomicLong exceptionIdSequence = new AtomicLong();
 
+    //Formatted under Locale.ROOT rather than the JVM's default: %d follows the default formatting
+    //locale, so under a non-Latin numbering system this id would come out in localized digits.
+    //EXC-000001 is an ASCII contract - the seeded exception is addressed by that literal over REST,
+    //quoted in the README and asserted by the tests - and must not vary by deployment.
     public String nextExceptionId() {
-        return String.format("EXC-%06d", exceptionIdSequence.incrementAndGet());
+        return String.format(Locale.ROOT, "EXC-%06d", exceptionIdSequence.incrementAndGet());
     }
 
+    //Creation only, never replacement, for the same reason as in OrderStore: an exception id is
+    //minted once by nextExceptionId, so a key that is already taken means this call would swap out
+    //a stored exception without passing through transition, the one path that asserts the edge is
+    //legal and appends the audit event.
     public void insert(SettlementException exception) {
-        exceptions.put(exception.getExceptionId(), exception);
+        if (exceptions.putIfAbsent(exception.getExceptionId(), exception) != null) {
+            throw new IllegalStateException(
+                    "A settlement exception already exists with id " + exception.getExceptionId());
+        }
     }
 
     //The operator's steps - assert the transition is legal, build the replacement exception,
@@ -71,22 +83,9 @@ public class SettlementExceptionStore {
         return (exceptionId == null) ? null : exceptions.get(exceptionId);
     }
 
-    //Scanned in id order so the answer is the exception opened first for the order, rather than
-    //whichever one the map's arbitrary iteration order happened to reach first.
-    public SettlementException findByOrderId(String orderId) {
-        if (orderId == null) {
-            return null;
-        }
-
-        for (SettlementException exception : list()) {
-            if (orderId.equals(exception.getOrderId())) {
-                return exception;
-            }
-        }
-
-        return null;
-    }
-
+    //This store owns the order of a full read, and it owns it alone: the copy is taken and sorted
+    //once here - the zero-padded id sorts naturally - and handed out unmodifiable, so a reader
+    //filtering it keeps that order instead of sorting the survivors again.
     public List<SettlementException> list() {
         List<SettlementException> snapshot = new ArrayList<>(exceptions.values());
         snapshot.sort(Comparator.comparing(SettlementException::getExceptionId));

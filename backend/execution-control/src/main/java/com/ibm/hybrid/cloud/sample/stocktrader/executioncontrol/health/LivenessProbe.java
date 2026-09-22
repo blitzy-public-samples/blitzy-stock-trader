@@ -46,6 +46,8 @@ import org.eclipse.microprofile.health.Liveness;
 public class LivenessProbe implements HealthCheck {
     private static Logger logger = Logger.getLogger(LivenessProbe.class.getName());
 
+    private static final String LIVE_MESSAGE = "Live";
+
     private @Inject OrderStore orderStore;
     private @Inject SettlementExceptionStore settlementExceptionStore;
     private @Inject ReferenceDataStore referenceDataStore;
@@ -55,7 +57,6 @@ public class LivenessProbe implements HealthCheck {
     @Override
     public HealthCheckResponse call() {
         HealthCheckResponse response = null;
-        String message = "Live";
         try {
             HealthCheckResponseBuilder builder = HealthCheckResponse.named("ExecutionControl");
 
@@ -64,22 +65,16 @@ public class LivenessProbe implements HealthCheck {
             int clients = referenceDataStore.clientCount();
             int positions = referenceDataStore.positionCount();
 
-            //Only absent reference data is fatal: no order could resolve its client, whereas zero
-            //orders or exceptions is merely an idle service and must not provoke a restart.
-            if ((clients == 0) || (positions == 0)) {
-                builder = builder.down();
-                message = "Reference data store is empty";
-                logger.warning("Returning NOT healthy!");
-            } else {
-                builder = builder.up();
-                logger.fine("Returning healthy!");
-            }
+            //Liveness asks only whether this process and its injected stores still answer: empty stores
+            //are an idle or seeding service for startup and readiness to gate, never a restart signal.
+            builder = builder.up();
+            logger.fine("Returning healthy!");
 
             builder = builder.withData("orders", orders);
             builder = builder.withData("exceptions", exceptions);
             builder = builder.withData("clients", clients);
             builder = builder.withData("positions", positions);
-            builder = builder.withData("message", message);
+            builder = builder.withData("message", LIVE_MESSAGE);
 
             response = builder.build();
         } catch (Throwable t) {

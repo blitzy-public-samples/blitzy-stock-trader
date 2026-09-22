@@ -26,6 +26,8 @@ import java.util.List;
 
 /** An immutable simulated institutional order and its control, execution and post-trade state */
 public class Order {
+    private static final int AMOUNT_SCALE = 2;
+
     //No setter of any kind exists here, and that is the audit guarantee: a status can only change
     //by replacing the stored object through OrderStore.transition, whose operator asserts the
     //transition is legal and appends the audit event in the same compute step. An in-place mutator
@@ -65,14 +67,13 @@ public class Order {
         //100.00 even though compareTo returns 0 - so a fixed scale is what makes the rendered
         //amount and every value assertion on it deterministic
         BigDecimal normalizedLimitPrice =
-                (limitPrice == null) ? null : limitPrice.setScale(2, RoundingMode.HALF_UP);
+                (limitPrice == null) ? null : cents(limitPrice, "limitPrice");
         this.limitPrice = normalizedLimitPrice;
         //notional is derived, never a parameter, so no caller can store an order whose notional
         //contradicts its own quantity and limit price
         this.notional = (normalizedLimitPrice == null)
                 ? null
-                : normalizedLimitPrice.multiply(BigDecimal.valueOf(quantity))
-                        .setScale(2, RoundingMode.HALF_UP);
+                : cents(normalizedLimitPrice.multiply(BigDecimal.valueOf(quantity)), "notional");
         this.status = status;
         this.postTradeStatus = postTradeStatus;
         this.controlResults = (controlResults == null)
@@ -118,6 +119,21 @@ public class Order {
         return new Order(orderId, clientOrderId, clientId, symbol, side, quantity, limitPrice,
                 status, postTradeStatus, controlResults, rejectionReason, execution, submittedBy,
                 submittedAt, updatedAt, source);
+    }
+
+    /* Pinning the scale must never change the amount. A limit price of 0.001 rounded to 0.00 here
+       would give the order a notional of zero, which clears every configured notional ceiling and
+       fills at no cost, so a price that cannot be held in cents is refused rather than rounded
+       away. The derived notional is exact at this scale - a cent price times a whole share count -
+       so the guard fires only on the price a caller supplied. */
+    private static BigDecimal cents(BigDecimal value, String field) {
+        BigDecimal atCents = value.setScale(AMOUNT_SCALE, RoundingMode.DOWN);
+        if (atCents.compareTo(value) != 0) {
+            throw new IllegalArgumentException(
+                    field + " must be a whole number of cents, not " + value.toPlainString());
+        }
+
+        return atCents;
     }
 
     public String getOrderId() {

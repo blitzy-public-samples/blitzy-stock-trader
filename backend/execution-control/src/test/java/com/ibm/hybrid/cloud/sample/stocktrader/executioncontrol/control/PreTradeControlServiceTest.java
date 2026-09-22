@@ -31,6 +31,7 @@ import java.time.Instant;
 //Collections
 import java.util.Arrays;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 
 //JUnit 5 Jupiter
@@ -345,6 +346,84 @@ class PreTradeControlServiceTest {
     }
 
     @Test
+    void testResultingQuantityBeyondLongRangeIsMeasuredRatherThanWrapped() {
+        /* Long.MAX_VALUE + 1 is the arithmetic that used to wrap to Long.MIN_VALUE, whose Math.abs
+           is still negative: the control observed a negative notional, found it under a positive
+           ceiling and passed the largest position the service could be asked to take. The true
+           magnitude is 9223372036854775808 shares, so at 0.01 the exposure is 92233720368547758.08
+           and the only correct verdict is a breach. */
+        List<ControlResult> overflowingBuy = defaultService().evaluate(
+                order("INST-001", "BUY", "SYNA", 1, "0.01"),
+                position("INST-001", "SYNA", Long.MAX_VALUE, "0.01"));
+
+        ControlResult positionNotional = control(overflowingBuy, MAX_POSITION_NOTIONAL);
+        assertFalse(positionNotional.isPassed(),
+                MAX_POSITION_NOTIONAL + " must breach rather than wrap to a negative notional");
+        assertEquals("92233720368547758.08", positionNotional.getObservedValue(),
+                MAX_POSITION_NOTIONAL + " observed the exact resulting magnitude");
+        assertEquals("Resulting position notional 92233720368547758.08 "
+                + "(9223372036854775808 \u00D7 0.01) exceeds MAX_POSITION_NOTIONAL 5000000.00",
+                positionNotional.getReason(),
+                MAX_POSITION_NOTIONAL + " rejection reason names the exact share count");
+
+        //A short taken past Long.MIN_VALUE is the same hazard in the other direction: the magnitude
+        //is what the control measures, so the sign of the resulting quantity cannot hide it.
+        List<ControlResult> overflowingSell = defaultService().evaluate(
+                order("INST-001", "SELL", "SYNA", 2, "0.01"),
+                position("INST-001", "SYNA", Long.MIN_VALUE + 1, "0.01"));
+
+        ControlResult shortNotional = control(overflowingSell, MAX_POSITION_NOTIONAL);
+        assertFalse(shortNotional.isPassed(),
+                MAX_POSITION_NOTIONAL + " must breach on a short beyond the long range");
+        //(Long.MIN_VALUE + 1) - 2 is -9223372036854775809, one share past what a long holds.
+        assertEquals("92233720368547758.09", shortNotional.getObservedValue(),
+                MAX_POSITION_NOTIONAL + " observed the exact resulting short magnitude");
+    }
+
+    @Test
+    void testUnexpectedSideFailsFastRatherThanBeingMeasuredAsABuy() {
+        /* OrderLifecycleService.submit refuses anything but BUY or SELL, so this order cannot arise
+           from a request; what it proves is that the fallback which used to treat every non-SELL
+           side as a buy is gone. Against the short below that fallback moved the resulting quantity
+           towards zero and reported 4000000.00 - less exposure than the trade carries - so guessing
+           the side is the one thing this control must not do. */
+        IllegalArgumentException refused = assertThrows(IllegalArgumentException.class,
+                () -> defaultService().evaluate(order("INST-002", "SHORT", "SYND", 5000, "100.00"),
+                        position("INST-002", "SYND", -45000, "100.00")),
+                "an unrecognised side must fail rather than be measured as a buy");
+        assertTrue(refused.getMessage().contains("SHORT"),
+                "the message must name the rejected side: " + refused.getMessage());
+
+        //Both validated sides remain measurable, so failing fast costs the legal path nothing.
+        assertNotNull(defaultService().evaluate(order("INST-002", "BUY", "SYND", 1, "100.00"), null),
+                "BUY must still be measured");
+        assertNotNull(defaultService().evaluate(order("INST-002", "SELL", "SYND", 1, "100.00"), null),
+                "SELL must still be measured");
+    }
+
+    @Test
+    void testRestrictedSymbolConsumesTheCanonicalSymbolWithoutRenormalizingIt() {
+        /* Canonicalization happens once, in OrderLifecycleService.submit, before any lookup,
+           control or position key sees the symbol. This control therefore reports the symbol the
+           order carries and matches it as-is: a raw ticker reaching it directly is evidence that
+           the submit path was bypassed, not something to quietly repair here. */
+        List<ControlResult> raw = defaultService().evaluate(
+                orderWithRawSymbol("INST-001", "BUY", "rstra", 10, "10.00"), null);
+
+        ControlResult restricted = control(raw, RESTRICTED_SYMBOL);
+        assertEquals("rstra", restricted.getObservedValue(),
+                RESTRICTED_SYMBOL + " reports the symbol exactly as the order carries it");
+        assertTrue(restricted.isPassed(),
+                "no second canonicalization happens here, so a raw ticker matches nothing");
+
+        //The canonical spelling the submit path produces is the one the restricted list holds.
+        ControlResult canonical = control(defaultService().evaluate(
+                orderWithRawSymbol("INST-001", "BUY", "RSTRA", 10, "10.00"), null),
+                RESTRICTED_SYMBOL);
+        assertFalse(canonical.isPassed(), "the canonical RSTRA is on the restricted list");
+    }
+
+    @Test
     void testNullExistingPositionTreatsExistingQuantityAsZero() {
         //A client's first order in a symbol has no position to add to, which must read as a holding
         //of zero rather than fail the evaluation.
@@ -407,15 +486,25 @@ class PreTradeControlServiceTest {
         assertNotRestricted(new PreTradeControlService(nothingRestricted).evaluate(
                 order("INST-001", "BUY", "RSTRA", 10, "10.00"), null), "RSTRA");
 
-        /* A limit that was never read is the one value this service must not guess at: producing
-           limits without configuration fails loudly here instead of handing every order a null
-           ceiling to compare against. This is the producer's whole contract - it declares no in-code
-           fallback precisely so a deleted or misspelled key cannot become a silent limit. */
-        NullPointerException unconfigured = assertThrows(NullPointerException.class,
-                () -> new ControlLimitsProducer().controlLimits(),
-                "limits produced from unread configuration must fail rather than carry nulls");
-        assertEquals("maxOrderNotional is required", unconfigured.getMessage(),
-                "the unread property must be named");
+        //The restricted list as configuration delivers it, rather than as a caller spells it: the
+        //raw text, the expanded value and the declaring source are the three facts MicroProfile
+        //Config reports, and the rule the control evaluates has to come out the same for every
+        //well-formed spelling, drop a trailing comma, treat a declared-but-empty setting as
+        //"nothing is restricted", and refuse a key no source declares at all.
+        assertEquals(Set.of("RSTRA", "RSTRB"),
+                ControlLimits.restrictedSymbolsFrom("RSTRA,RSTRB,", null, "properties"),
+                "a trailing comma must not add a symbol");
+        assertEquals(Set.of("SYNA"), ControlLimits.restrictedSymbolsFrom(null, " syna ", "env"),
+                "the expanded value is read when the source reports no raw text");
+        assertTrue(ControlLimits.restrictedSymbolsFrom("", "", "properties").isEmpty(),
+                "a declared but empty setting must restrict nothing");
+        assertTrue(ControlLimits.restrictedSymbolsFrom(null, null, "properties").isEmpty(),
+                "a source that declares the key with no text must restrict nothing");
+        IllegalStateException undeclared = assertThrows(IllegalStateException.class,
+                () -> ControlLimits.restrictedSymbolsFrom(null, null, null),
+                "a key no configuration source declares must stop start-up");
+        assertTrue(undeclared.getMessage().startsWith("RESTRICTED_SYMBOLS is not declared"),
+                "the undeclared key must be named");
     }
 
 
@@ -425,8 +514,22 @@ class PreTradeControlServiceTest {
                 DEFAULT_RESTRICTED_SYMBOLS, DEFAULT_EXCEPTION_SLA_HOURS));
     }
 
+
     private static Order order(String clientId, String side, String symbol, long quantity,
             String limitPrice) {
+        /* The symbol argument is spelled as a caller would post it and is canonicalized here,
+           exactly as OrderLifecycleService.submit canonicalizes it before any control runs. That
+           keeps the case- and padding-insensitivity these tests assert a property of the pipeline
+           while leaving the single canonicalization where the service contract puts it: the
+           evaluator consumes the canonical symbol and normalizes nothing itself. */
+        return orderWithRawSymbol(clientId, side, symbol.trim().toUpperCase(Locale.ROOT), quantity,
+                limitPrice);
+    }
+
+    //Bypasses the canonicalization above, for the one test that has to hand the evaluator a symbol
+    //the submit path would never produce.
+    private static Order orderWithRawSymbol(String clientId, String side, String symbol,
+            long quantity, String limitPrice) {
         //The submitted state is all evaluate needs: it reads the request fields and the derived
         //notional, and never the status, the control results or the execution.
         return new Order("ORD-000001", "C1", clientId, symbol, side, quantity,
@@ -471,4 +574,3 @@ class PreTradeControlServiceTest {
                 RESTRICTED_SYMBOL + " observed canonical symbol");
     }
 }
-

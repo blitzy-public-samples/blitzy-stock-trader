@@ -19,9 +19,10 @@ package com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json;
 
 /** JSON-B POJO class representing an exception resolution request */
 public class ResolveRequest {
-    //Optional, and its absence is meaningful: null selects the single-event
-    //ASSIGNED -> RESOLVED path, while a supplied owner selects the composite
-    //OPEN -> ASSIGNED -> RESOLVED path, so it is never defaulted here
+    //Optional because the exception's stored status selects the path, not this field: resolving an
+    //OPEN exception requires an owner and records OPEN -> ASSIGNED before ASSIGNED -> RESOLVED,
+    //while an owner sent for an already-ASSIGNED exception is ignored - re-assignment is the assign
+    //endpoint's own edge - so it is never defaulted here
     private String owner;
     private String resolutionNote;
 

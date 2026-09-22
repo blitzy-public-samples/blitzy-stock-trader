@@ -460,11 +460,19 @@ class SettlementExceptionIT {
             assertNonBlank(client, "clientName", "Client");
             assertNonBlank(client, "disclaimer", "Client");
 
+            /* Both instructions are checked on all three labels, not just the synthetic one: a
+               settlement instruction is the deepest nested entity the reference-data surface
+               returns, and it is read on its own - quoted into an exception's mismatch context -
+               so it has to say for itself that it is synthetic, simulated and disclaimed. */
             for (String instruction : new String[] {FIRM_INSTRUCTION, COUNTERPARTY_INSTRUCTION}) {
                 Assertions.assertTrue(client.containsKey(instruction),
                         "Client carried no " + instruction + ": " + client);
-                Assertions.assertTrue(client.getJsonObject(instruction).getBoolean("synthetic"),
+                JsonObject settlementInstruction = client.getJsonObject(instruction);
+                Assertions.assertTrue(settlementInstruction.getBoolean("synthetic"),
                         instruction + " was not labelled synthetic: " + client);
+                Assertions.assertTrue(settlementInstruction.getBoolean("simulated"),
+                        instruction + " was not labelled simulated: " + client);
+                assertNonBlank(settlementInstruction, "disclaimer", instruction);
             }
         }
 

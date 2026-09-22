@@ -36,8 +36,10 @@ import jakarta.ws.rs.core.MediaType;
 
 
 //No role annotation here: GET is granted to both StockViewer and StockTrader declaratively in
-//web.xml, which is the estate's enforcement point, and every other verb is refused there by
-//deny-uncovered-http-methods - so a read is all this class can ever be reached for.
+//web.xml, which is the estate's enforcement point. Authorization and dispatch are two stages:
+//POST, PUT and DELETE are covered there for StockTrader on every path, so an attempt at one clears
+//security and is then answered 405 by this GET-only resource, while HEAD, OPTIONS, PATCH and TRACE
+//are covered nowhere and get 403 from deny-uncovered-http-methods.
 @Path("/audit")
 @Produces(MediaType.APPLICATION_JSON)
 @ApplicationScoped

@@ -24,6 +24,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Locale;
 
 //Concurrency
 import java.util.concurrent.ConcurrentHashMap;
@@ -45,12 +46,16 @@ public class OrderStore {
     private final AtomicLong orderIdSequence = new AtomicLong();
     private final AtomicLong executionIdSequence = new AtomicLong();
 
+    //Formatted under Locale.ROOT rather than the JVM's default: %d follows the default formatting
+    //locale, so under a non-Latin numbering system these ids would come out in localized digits.
+    //ORD-000001 and EXE-000001 are an ASCII contract - they are read back through the REST paths,
+    //quoted in the README and asserted literally by the tests - and must not vary by deployment.
     public String nextOrderId() {
-        return String.format("ORD-%06d", orderIdSequence.incrementAndGet());
+        return String.format(Locale.ROOT, "ORD-%06d", orderIdSequence.incrementAndGet());
     }
 
     public String nextExecutionId() {
-        return String.format("EXE-%06d", executionIdSequence.incrementAndGet());
+        return String.format(Locale.ROOT, "EXE-%06d", executionIdSequence.incrementAndGet());
     }
 
     //Duplicate submission is settled here, in one atomic step, before any order object exists, so
@@ -61,8 +66,15 @@ public class OrderStore {
         return orderIdsByClientOrderId.putIfAbsent(clientOrderId, orderId) == null;
     }
 
+    //Creation only, never replacement. An order id is minted once by nextOrderId, so a key that is
+    //already taken means this call would swap out a stored order without passing through
+    //transition - the one path that asserts the edge is legal and appends the audit event. Refusing
+    //it keeps "no status changes outside an audited transition" a property of the store itself
+    //rather than a habit its callers have to keep.
     public void insert(Order order) {
-        orders.put(order.getOrderId(), order);
+        if (orders.putIfAbsent(order.getOrderId(), order) != null) {
+            throw new IllegalStateException("An order already exists with id " + order.getOrderId());
+        }
     }
 
     //The operator's three steps - assert the transition is legal, build the replacement order,
@@ -84,6 +96,9 @@ public class OrderStore {
         return (orderId == null) ? null : orders.get(orderId);
     }
 
+    //This store owns the order of a full read, and it owns it alone: the copy is taken and sorted
+    //once here - the zero-padded id sorts naturally - and handed out unmodifiable, so a reader
+    //returns this snapshot as it received it instead of copying and sorting it a second time.
     public List<Order> list() {
         List<Order> snapshot = new ArrayList<>(orders.values());
         snapshot.sort(Comparator.comparing(Order::getOrderId));

@@ -22,6 +22,7 @@ import java.math.BigDecimal;
 import java.math.RoundingMode;
 
 //Collections
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.LinkedHashSet;
@@ -29,9 +30,17 @@ import java.util.Locale;
 import java.util.Objects;
 import java.util.Set;
 
+//CDI 4.0
+import jakarta.enterprise.inject.Vetoed;
 
+
+//Vetoed because beans.xml discovers every class: without this, the no-arg constructor below would
+//also make ControlLimits a managed bean, and Weld would reject every injection point as ambiguous
+//between that bean and the producer (WELD-001409). ControlLimitsProducer is the only legitimate
+//source of limits - a managed-bean instance would carry that constructor's zeroes, not configuration.
 /** Immutable holder of the effective pre-trade control limits and the settlement-exception SLA */
-public final class ControlLimits {
+@Vetoed
+public class ControlLimits {
     private static final int AMOUNT_SCALE = 2;
 
     private final BigDecimal maxOrderNotional;
@@ -57,7 +66,13 @@ public final class ControlLimits {
         this.exceptionSlaHours = exceptionSlaHours;
     }
 
-    //Canonicalized here rather than only in the producer because unit tests construct this object
+    //Exists only so CDI can generate the @ApplicationScoped client proxy, which requires a
+    //non-private no-arg constructor; no application code calls it and the proxy reads no field.
+    protected ControlLimits() {
+        this(BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, Collections.emptySet(), 0);
+    }
+
+    //Canonicalized here rather than at the configuration boundary because unit tests construct this object
     //directly, and the invariant "the stored set is trimmed and upper-cased" has to hold for every
     //caller: the control evaluation matches an already-canonical order symbol against this set with
     //no further normalization. LinkedHashSet preserves the configured order, which is what lets
@@ -76,6 +91,27 @@ public final class ControlLimits {
         }
 
         return Collections.unmodifiableSet(canonical);
+    }
+
+    //MicroProfile Config reports three facts about a configured key: the raw text the winning source
+    //holds, the expanded value, and the name of that source. A source that declares the key names
+    //itself even when the text is empty, which is an operator saying "nothing is restricted"; a key
+    //no source declares reports none of the three, and that alone is a misconfiguration - it stops
+    //start-up rather than let the service trade against a restricted list nobody set. The decision
+    //lives beside the canonicalization it feeds so the two cannot drift apart, and so the pre-trade
+    //rule it produces is testable without standing up a configuration container.
+    static Set<String> restrictedSymbolsFrom(String rawValue, String expandedValue, String sourceName) {
+        String declared = rawValue != null ? rawValue : expandedValue;
+        if (declared == null) {
+            if (sourceName == null) {
+                throw new IllegalStateException("RESTRICTED_SYMBOLS is not declared by any"
+                        + " configuration source; it must be declared in"
+                        + " META-INF/microprofile-config.properties");
+            }
+            declared = "";
+        }
+
+        return canonicalize(Arrays.asList(declared.split(",")));
     }
 
     public BigDecimal getMaxOrderNotional() {
