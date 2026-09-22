@@ -34,13 +34,25 @@ import org.springframework.data.repository.query.Param;
 /** Data access for {@code cash_reservation}: replay lookups, the outstanding-hold test and the expiry sweep. */
 public interface CashReservationRepository extends JpaRepository<CashReservation, UUID> {
 
-    Optional<CashReservation> findByOwnerAndIdempotencyKey(String owner, String idempotencyKey);
+    // Owner-scoped ON PURPOSE, which is the opposite of the method below and its whole reason for existing: the
+    // point is to see the rows the incarnation-scoped lookup cannot. ReservationService.holdOnce consults this
+    // after that lookup misses, so a match here can only be a retained row of an earlier incarnation - the
+    // 422 IDEMPOTENCY_KEY_REUSED case the UNIQUE (incarnation_id, idempotency_key) guard cannot catch, because
+    // the new incarnation makes the pair unique again (AAP 0.6.3 cash_reservation, AAP 0.11.1).
+    //
+    // A List rather than an Optional because the rows are legitimately plural: cash_reservation carries no
+    // foreign key and survives a retail DELETE, so every incarnation an owner has had may have left one row
+    // under the same key. An Optional-returning derived query would answer that with
+    // IncorrectResultSizeDataAccessException - a 500 - instead of the question that was asked.
+    List<CashReservation> findByOwnerAndIdempotencyKey(String owner, String idempotencyKey);
 
     // Scoped by the account's incarnation rather than by its owner, which is the whole point of the method:
     // incarnation_id is renewed on every create, so an Idempotency-Key presented against an owner that was deleted
-    // and recreated matches nothing here and is answered as a fresh hold or as 422 IDEMPOTENCY_KEY_REUSED - never
-    // as a replay of a reservation that reserved funds in an account life that no longer exists. The same pair is
-    // UNIQUE (schema/cash-account-schema.sql:L69), so at most one row can ever match and the Optional is safe by
+    // and recreated matches nothing here - never a replay of a reservation that reserved funds in an account life
+    // that no longer exists. What such a key IS answered with is decided by the owner-scoped query above, which
+    // holdOnce consults next: 422 IDEMPOTENCY_KEY_REUSED when an earlier life of the owner already spent the key,
+    // and a fresh hold only when no life of it ever did. The pair read here is UNIQUE
+    // (schema/cash-account-schema.sql:L69), so at most one row can ever match and the Optional is safe by
     // construction rather than by convention.
     //
     // Called from a FRESH transaction, never from the one that lost the race. The losing INSERT's unique violation
@@ -50,8 +62,6 @@ public interface CashReservationRepository extends JpaRepository<CashReservation
     Optional<CashReservation> findByIncarnationIdAndIdempotencyKey(UUID incarnationId, String idempotencyKey);
 
     boolean existsByOwnerAndState(String owner, ReservationState state);
-
-    List<CashReservation> findByStateAndExpiresAtBefore(ReservationState state, OffsetDateTime cutoff);
 
     // Deliberately UNLOCKED, and no @Lock may be added here. Every balance mutation in this module locks the
     // cash_account row first and the reservation row second; a lock taken on reservation rows by this read would
@@ -94,10 +104,13 @@ public interface CashReservationRepository extends JpaRepository<CashReservation
     // context start-up, whereas a declared query pre-empts derivation under the default CREATE_IF_NOT_FOUND lookup
     // strategy.
     //
-    // PESSIMISTIC_WRITE reaches PostgreSQL as FOR NO KEY UPDATE, the rendering Hibernate's dialect gives every
-    // write lock, so the logged SQL reads weaker than it is: that mode conflicts with itself, with FOR SHARE and
-    // FOR UPDATE, and with any UPDATE or DELETE of the row, leaving only the FOR KEY SHARE a foreign-key check
-    // takes - and no table references cash_reservation.
+    // PESSIMISTIC_WRITE reaches PostgreSQL as "for no key update", unqualified by any alias - the clause observed
+    // in the emitted SQL, and rendered by PostgreSQLSqlAstTranslator.getForUpdate() in hibernate-core
+    // 6.5.3.Final. Reading it off PostgreSQLDialect.getWriteLockString instead answers " for update", the pre-6
+    // lock-string path this query does not take; the emitted clause is the one that decides. It sounds weaker
+    // than it locks: FOR NO KEY UPDATE conflicts with itself, with FOR SHARE and FOR UPDATE, and with any UPDATE
+    // or DELETE of the row, leaving only the FOR KEY SHARE a foreign-key check takes - and no table references
+    // cash_reservation.
     //
     // No lock-timeout hint accompanies it: PostgreSQL's row locks express only NOWAIT and SKIP LOCKED, so a
     // positive wait would be silently ignored. Blocking is therefore the server's to arbitrate, and its deadlock
@@ -107,9 +120,10 @@ public interface CashReservationRepository extends JpaRepository<CashReservation
     @Query("select r from CashReservation r where r.reservationId = :reservationId")
     Optional<CashReservation> findByReservationIdForUpdate(@Param("reservationId") UUID reservationId);
 
-    // -2 is Hibernate's LockOptions.SKIP_LOCKED sentinel (0 is NO_WAIT, -1 WAIT_FOREVER), which the PostgreSQL
-    // dialect appends to the write lock above - the emitted clause is "for no key update skip locked" - so a
-    // contended row is passed over rather than waited on.
+    // -2 is Hibernate's LockOptions.SKIP_LOCKED sentinel (0 is NO_WAIT, -1 WAIT_FOREVER), which the SQL AST
+    // translator appends to the write lock above through AbstractSqlAstTranslator.getSkipLocked() - the emitted
+    // clause, observed in the log, is "for no key update skip locked" - so a contended row is passed over rather
+    // than waited on.
     //
     // An EMPTY Optional is therefore an ordinary outcome, not a failure: another sweeper holds the row, or it is
     // already gone. The sweep must skip such a candidate silently - reporting it would turn routine contention into

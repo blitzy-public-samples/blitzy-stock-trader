@@ -22,10 +22,14 @@ import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
 import jakarta.persistence.IdClass;
+import jakarta.persistence.PostLoad;
+import jakarta.persistence.PostPersist;
 import jakarta.persistence.Table;
+import jakarta.persistence.Transient;
 
 import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.type.SqlTypes;
+import org.springframework.data.domain.Persistable;
 
 import java.io.Serializable;
 import java.math.BigDecimal;
@@ -59,6 +63,15 @@ import java.util.UUID;
  * and migration/shadow/ShadowComparator; never touched on the request path, and the only data it is ever
  * proven against is src/test/resources/fixtures/** — the real SYSD.STOCK.HISTORY is out of reach by
  * design, and producing the export from it is a runbook step this module does not execute.
+ *
+ * Why this entity declares its own newness (Persistable): the key below is assigned by the caller rather
+ * than generated, so Spring Data's default test — "is the identifier null?" — reports every staged row as
+ * already existing and its save path merges, which costs one existence SELECT per row before that row's
+ * INSERT on a staging pass whose input is a whole VSAM history. Declaring newness explicitly makes save()
+ * persist, so the write stays on the repository path while issuing no SELECT. A row read back from the
+ * database reports itself as not new, so an update can never be mistaken for an insert; a repeated key then
+ * fails on the primary key, which is the outcome this table needs — the key IS the legacy record's identity
+ * and staging is run-scoped, so a repeat means a malformed export, never a row to absorb.
  */
 
 /** Run-scoped staging row for one exported legacy VSAM HISTORY record, read only by the migration tooling. */
@@ -66,14 +79,15 @@ import java.util.UUID;
 @Table(name = "legacy_history")
 /*
  * @IdClass rather than @EmbeddedId, and a plain class rather than a record, are both forced choices.
- * @EmbeddedId would nest the key attributes behind a path (`key.runId`), which stops
- * LegacyHistoryRepository's derived queries — findByRunId(UUID), findByRunIdAndOwnerKey(UUID, String),
- * countByRunId(UUID), countByRunIdAndRequestCodeIn(UUID, Collection<String>) — from resolving against
- * top-level attribute names; and a Java record has no no-argument constructor, which an @IdClass is
- * required to provide.
+ * @EmbeddedId would nest the key attributes behind a path (`key.runId`), which stops the derived queries
+ * declared over this entity — findByRunId(UUID), findByRunIdAndOwnerKey(UUID, String), countByRunId(UUID),
+ * countByRunIdAndRequestCodeIn(UUID, Collection<String>), all test-only readers on the test tree's
+ * LegacyHistoryTestQueries; the production LegacyHistoryRepository declares no finder of its own — from
+ * resolving against top-level attribute names; and a Java record has no no-argument constructor, which an
+ * @IdClass is required to provide.
  */
 @IdClass(LegacyHistory.Key.class)
-public class LegacyHistory {
+public class LegacyHistory implements Persistable<LegacyHistory.Key> {
 
     /*
      * The primary key is the raw 29-byte VSAM key (CASH00.cbl:L47-L50; DEFKSDS.jcl:L14 KEYS(29 0))
@@ -168,6 +182,12 @@ public class LegacyHistory {
      */
     @Column(name = "event_at")
     private OffsetDateTime eventAt;
+
+    // Not a column: it records whether this instance has reached the database yet, which is the one thing an
+    // assigned key cannot tell Spring Data. False on a staged(...) instance and set by the lifecycle
+    // callbacks below, so newness is a fact about the instance rather than a guess about the key.
+    @Transient
+    private boolean persisted;
 
     /** JPA requires a no-argument constructor; {@link #staged} is the only construction path for callers. */
     protected LegacyHistory() {
@@ -294,6 +314,25 @@ public class LegacyHistory {
                 + ", eventTime=" + eventTime
                 + ", requestCode=" + requestCode
                 + "]";
+    }
+
+    @Override
+    public Key getId() {
+        return new Key(runId, name, eventDate, eventTime);
+    }
+
+    @Override
+    public boolean isNew() {
+        return !persisted;
+    }
+
+    // Both callbacks, deliberately: @PostLoad covers a row the reconciler or the comparator read back, and
+    // @PostPersist covers the row this staging pass has just inserted, so neither can be offered to save()
+    // a second time as an insert.
+    @PostLoad
+    @PostPersist
+    void markPersisted() {
+        this.persisted = true;
     }
 
     /**

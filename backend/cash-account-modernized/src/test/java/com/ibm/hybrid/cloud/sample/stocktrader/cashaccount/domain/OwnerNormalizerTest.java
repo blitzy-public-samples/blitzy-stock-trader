@@ -19,6 +19,8 @@ package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.domain;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.catchThrowableOfType;
 
+import java.util.Locale;
+
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.error.CashAccountErrorCode;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.error.CashAccountException;
 import org.junit.jupiter.api.Test;
@@ -92,6 +94,38 @@ class OwnerNormalizerTest {
         // Built by repetition so the input is one character past the bound by construction rather than by a
         // hand-counted literal.
         assertThat(rejectionCodeFor("A".repeat(OwnerNormalizer.MAX_LENGTH + 1)))
+                .isEqualTo(CashAccountErrorCode.INVALID_OWNER);
+
+        // The bound is applied to the canonical form, after the case fold, because folding is one-to-many: 31
+        // "a" followed by U+00DF (sharp s) is exactly 32 characters as sent and 33 once folded, since sharp s
+        // upper-cases to "SS". Measured before the fold this input passed, so normalize returned a 33-character
+        // owner - one the VARCHAR(32) column cannot hold and, worse, one normalize itself rejects, which made
+        // the fold non-idempotent. Every consumer re-normalizes (CashAccount.create, LedgerEntry, LedgerService,
+        // the loader, the reconciler), so the escape surfaced late: whichever call normalized second raised the
+        // 400 and echoed the folded value instead of the caller's input, while a path that re-normalized only
+        // after using the value carried an over-length account and join key. Rejecting up front restores the
+        // idempotence the case-insensitive identity assertions above depend on.
+        // The intermediate assertions pin why this input is interesting, so the rejection below cannot be
+        // misread as contradicting the full-width acceptance above.
+        String expandsWhenFolded = "a".repeat(OwnerNormalizer.MAX_LENGTH - 1) + "\u00DF";
+        assertThat(expandsWhenFolded).hasSize(OwnerNormalizer.MAX_LENGTH);
+        assertThat(expandsWhenFolded.toUpperCase(Locale.ROOT)).hasSize(OwnerNormalizer.MAX_LENGTH + 1);
+        assertThat(rejectionCodeFor(expandsWhenFolded)).isEqualTo(CashAccountErrorCode.INVALID_OWNER);
+
+        // Counted in code points, not UTF-16 units, because code points are the unit the destination column
+        // bounds: PostgreSQL measures character varying in characters. U+1D400 is one character costing two
+        // UTF-16 units, so 32 of them are 64 units - counting units refused an owner that VARCHAR(32) stores
+        // without complaint (verified on postgres 12.22: 32 insert, 33 are refused "value too long"). It is an
+        // uppercase letter that folds to itself, so the canonical form is the input.
+        String oneCharacterTwoUnits = "\uD835\uDC00";
+        String fullWidthInCodePoints = oneCharacterTwoUnits.repeat(OwnerNormalizer.MAX_LENGTH);
+        assertThat(fullWidthInCodePoints).hasSize(OwnerNormalizer.MAX_LENGTH * 2);
+        String normalized = OwnerNormalizer.normalize(fullWidthInCodePoints);
+        assertThat(normalized).isEqualTo(fullWidthInCodePoints);
+        assertThat(normalized.codePointCount(0, normalized.length())).isEqualTo(OwnerNormalizer.MAX_LENGTH);
+
+        // One code point past the bound is still refused, so widening the unit did not weaken the ceiling.
+        assertThat(rejectionCodeFor(oneCharacterTwoUnits.repeat(OwnerNormalizer.MAX_LENGTH + 1)))
                 .isEqualTo(CashAccountErrorCode.INVALID_OWNER);
     }
 

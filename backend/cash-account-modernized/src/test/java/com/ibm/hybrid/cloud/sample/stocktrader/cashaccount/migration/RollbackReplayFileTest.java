@@ -68,7 +68,7 @@ import org.junit.jupiter.api.Test;
  * Why the derivation is a private method of this test and not a main-code class: AAP 0.6.1 declares no
  * deriver under src/main - Step 3 assigns the derivation to the operator - and domain/LedgerEntry could
  * not supply the input even if one existed, because its entry_id is IDENTITY-generated and every column
- * is mapped @Column(updatable = false) with no setters, so rows bearing assigned ids 101-108 cannot be
+ * is mapped @Column(updatable = false) with no setters, so rows bearing assigned ids 101-114 cannot be
  * constructed. The row model below is therefore test-local, while the column contract
  * (LegacyExportFormat.ROLLBACK_REPLAY_COLUMNS, MONEY_SCALE, DECIMAL_TEXT, isNull) and the event
  * vocabulary (LedgerEventType) are the real ones, so no literal of the file format is written twice.
@@ -94,7 +94,7 @@ class RollbackReplayFileTest {
 
     private static final BigDecimal NO_RESERVED_FUNDS = new BigDecimal("0.00");
 
-    // The five incarnation ids of the range, as canonical version-4 UUID literals. They are literals
+    // The eight incarnation ids of the range, as canonical version-4 UUID literals. They are literals
     // rather than UUID.randomUUID() values because the assertion is text equality with a committed
     // file: a generated id would differ on every run, and these round-trip through UUID.toString()
     // unchanged (fixtures/shadow/MANIFEST.md section 5).
@@ -107,6 +107,17 @@ class RollbackReplayFileTest {
     private static final UUID NEWCUST_INCARNATION = UUID.fromString("44444444-4444-4444-8444-444444444444");
 
     private static final UUID RAUNAK_INCARNATION = UUID.fromString("55555555-5555-4555-8555-555555555555");
+
+    // RYAN is deleted and created again inside the range, so its rows carry two incarnation ids. Both
+    // are needed: the derivation must emit one line for the owner and carry the *second* id, because a
+    // line applied to the incarnation that no longer exists would hand the money back to a dead account
+    // life. Two lines - X for the old life, U for the new - would replay as "delete, then update what is
+    // no longer there" and leave legacy with no row at all.
+    private static final UUID RYAN_FIRST_INCARNATION = UUID.fromString("66666666-6666-4666-8666-666666666666");
+
+    private static final UUID RYAN_SECOND_INCARNATION = UUID.fromString("77777777-7777-4777-8777-777777777777");
+
+    private static final UUID ERIC_INCARNATION = UUID.fromString("88888888-8888-4888-8888-888888888888");
 
     /**
      * One row of the ledger range being rolled back.
@@ -160,8 +171,9 @@ class RollbackReplayFileTest {
 
         List<String> dataLines = lines.subList(1, lines.size());
         assertThat(dataLines)
-                .as("one line per owner touched after the watermark: JOHN, KARRI, GREG, NEWCUST, RAUNAK")
-                .hasSize(5);
+                .as("one line per owner touched after the watermark: JOHN, KARRI, GREG, NEWCUST, RAUNAK,"
+                        + " RYAN (deleted and created again) and ERIC (funds held, then released and settled)")
+                .hasSize(7);
 
         long previousLastEntryId = 0L;
         for (int position = 0; position < dataLines.size(); position++) {
@@ -198,17 +210,71 @@ class RollbackReplayFileTest {
                     .doesNotStartWith("#");
         }
 
-        // The precondition, asserted on the same derivation rather than in a second test method: AAP
-        // 0.3.3 requires every HELD reservation to be released before rollback begins, because a replay
-        // line carries only an available balance and legacy has no reservation concept - held funds
-        // would simply vanish from the hand-back. A violation must stop the derivation, not be papered
-        // over with a line that understates the owner's money.
-        List<LedgerRow> rangeWithFundsStillHeld = withReservedAfter(range, 107L, new BigDecimal("25.00"));
+        // One line per owner is the contract (AAP 0.12.1), and RYAN is the case that can break it: its
+        // rows span two account incarnations, so a derivation keyed on (owner, incarnation) emits two
+        // lines - X for the deleted life, U for the recreated one. Replayed in that order legacy deletes
+        // its row and then finds nothing to update, ending with no RYAN at all while the target has one.
+        // The single line therefore carries the *final* incarnation, the account life the balance
+        // belongs to, so a hand-back can never be applied to a life that no longer exists.
+        assertThat(dataLines.stream().map(line -> line.split(",", -1)[1]).toList())
+                .as("the owner column must be unique: an owner deleted and created again above the"
+                        + " watermark still hands back exactly one final state")
+                .doesNotHaveDuplicates();
+
+        List<String> ryan = fieldsFor(dataLines, "RYAN");
+        assertThat(ryan.get(2))
+                .as("RYAN's last row in the range is ACCOUNT_CREATED, and RYAN is in the final legacy"
+                        + " export, so the absolute overwrite U reproduces its end state")
+                .isEqualTo(UPDATE_OP);
+        assertThat(ryan.get(7))
+                .as("RYAN's line must carry the incarnation its balance belongs to - the recreated life,"
+                        + " never the deleted one")
+                .isEqualTo(RYAN_SECOND_INCARNATION.toString());
+        assertThat(List.of(ryan.get(5), ryan.get(6)))
+                .as("the summarized range spans both incarnations' rows, 109 through 110")
+                .containsExactly("109", "110");
+
+        // AAP 0.3.3 requires no HELD reservation when the hand-back begins, and that is a statement
+        // about the owner's *end* state: ERIC held funds twice inside the range and released the first
+        // hold and settled the second, so nothing is held at its last row. The immutable ledger keeps
+        // the two rows that recorded the holds forever, so a rule read over the whole range rather than
+        // over the end state would make rollback unavailable to every owner that ever had a hold.
+        List<String> eric = fieldsFor(dataLines, "ERIC");
+        assertThat(eric.get(3))
+                .as("ERIC's balance is its last row's available_after, after the release and the"
+                        + " settlement: 1234567.89 - 200.00 settled")
+                .isEqualTo("1234367.89");
+
+        List<LedgerRow> rangeWithFundsHeldThenReleased =
+                withReservedAfter(range, 101L, new BigDecimal("75.00"));
+        assertThat(deriveReplayFile(rangeWithFundsHeldThenReleased, legacyOwners))
+                .as("funds held at an intermediate row and gone by the owner's last row must not block"
+                        + " the hand-back: JOHN's end state at entry 102 holds nothing")
+                .isEqualTo(golden);
+
+        // The converse, and the whole reason the guard exists: funds still held on the owner's *last*
+        // row are funds the replay file cannot express, because it carries one available balance per
+        // owner and legacy has no reservation concept. That must stop the derivation - naming the owner
+        // and the entry - rather than emit a line that understates the owner's money.
+        List<LedgerRow> rangeWithFundsStillHeld = withReservedAfter(range, 114L, new BigDecimal("25.00"));
         assertThatThrownBy(() -> deriveReplayFile(rangeWithFundsStillHeld, legacyOwners))
-                .as("a non-zero reserved_after must fail the derivation, naming the owner and entry id")
+                .as("a non-zero reserved_after on an owner's last row must fail the derivation, naming"
+                        + " the owner and entry id")
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("RAUNAK")
-                .hasMessageContaining("107");
+                .hasMessageContaining("ERIC")
+                .hasMessageContaining("114");
+    }
+
+    /** Splits the one emitted line of an owner into its fields, failing when the owner is absent. */
+    private static List<String> fieldsFor(List<String> dataLines, String owner) {
+        for (String line : dataLines) {
+            List<String> fields = List.of(line.split(",", -1));
+            if (fields.get(1).equals(owner)) {
+                return fields;
+            }
+        }
+        return fail(("no replay line was emitted for owner %s, and a dropped owner is an owner whose money"
+                + " is never handed back").formatted(owner));
     }
 
     /**
@@ -224,17 +290,13 @@ class RollbackReplayFileTest {
                     + " range; the closed range above the cutover watermark is the derivation's only input");
         }
 
+        // Grouped by owner alone, never by (owner, incarnation_id): the contract is one line per owner
+        // touched (AAP 0.12.1), and an owner deleted and created again inside the range has rows under
+        // two incarnations. Keyed on the pair it would emit two lines for that owner - X for the deleted
+        // life and U for the recreated one - which replay as "delete the legacy row, then update what is
+        // no longer there" and leave legacy holding nothing for an owner the target still has.
         Map<String, List<LedgerRow>> rowsByOwner = new LinkedHashMap<>();
         for (LedgerRow row : range) {
-            // Checked before any grouping so the guard cannot be escaped by an owner whose held row is
-            // not its last: the whole range must be free of reserved funds, not merely its end states.
-            if (row.reservedAfter().signum() != 0) {
-                throw new IllegalStateException(("owner %s still has %s reserved at ledger entry %d, so the"
-                                + " rollback precondition was violated: every HELD reservation must be"
-                                + " released before the replay file is derived, because the file carries"
-                                + " only an available balance and legacy has no reservation concept")
-                        .formatted(row.owner(), row.reservedAfter().toPlainString(), row.entryId()));
-            }
             rowsByOwner.computeIfAbsent(row.owner(), owner -> new ArrayList<>()).add(row);
         }
 
@@ -266,20 +328,10 @@ class RollbackReplayFileTest {
 
     /** Collapses one owner's rows in the range into the single line that hands its end state back. */
     private static ReplayLine deriveLine(String owner, List<LedgerRow> rows, Set<String> legacyOwners) {
-        UUID incarnationId = rows.get(0).incarnationId();
         long firstEntryId = Long.MAX_VALUE;
         long lastEntryId = Long.MIN_VALUE;
         LedgerRow lastRow = null;
         for (LedgerRow row : rows) {
-            // One line describes one account life. Rows of two incarnations under the same owner name
-            // cannot be summarized into a single line without risking a replay applied to the wrong
-            // account, so this is a derivation failure rather than something to pick a winner for.
-            if (!incarnationId.equals(row.incarnationId())) {
-                throw new IllegalStateException(("owner %s has ledger rows from two account incarnations in"
-                                + " the range (%s at entry %d, %s earlier), which cannot be summarized into"
-                                + " one replay line")
-                        .formatted(owner, row.incarnationId(), row.entryId(), incarnationId));
-            }
             firstEntryId = Math.min(firstEntryId, row.entryId());
             if (row.entryId() > lastEntryId) {
                 lastEntryId = row.entryId();
@@ -287,8 +339,27 @@ class RollbackReplayFileTest {
             }
         }
 
+        // The rollback precondition is read off the owner's last row, not off the range: AAP 0.3.3
+        // requires every HELD reservation released before the hand-back, which is a claim about the end
+        // state. Rows that recorded an earlier hold stay in the ledger forever - it is append-only - so
+        // a rule applied to every row would deny rollback to any owner that ever held funds, however
+        // long ago they were released or settled. Funds still held on the last row are different: the
+        // file carries one available balance per owner and legacy has no reservation concept, so they
+        // would vanish from the hand-back, and that stops the derivation instead of understating money.
+        if (lastRow.reservedAfter().signum() != 0) {
+            throw new IllegalStateException(("owner %s still has %s reserved at ledger entry %d, its last"
+                            + " row in the range, so the rollback precondition was violated: every HELD"
+                            + " reservation must be released before the replay file is derived, because the"
+                            + " file carries only an available balance and legacy has no reservation concept")
+                    .formatted(owner, lastRow.reservedAfter().toPlainString(), lastRow.entryId()));
+        }
+
         // The last row by entry_id supplies the absolute end state - never a sum of the amounts and
-        // never an intermediate balance - which is what collapses a multi-row range into one line.
+        // never an intermediate balance - which is what collapses a multi-row range into one line. It
+        // also supplies the incarnation the line carries, because an owner deleted and created again
+        // inside the range ends the range in its newest account life and that is the life the balance
+        // describes; a line stamped with the deleted incarnation would hand the money back to it.
+        UUID incarnationId = lastRow.incarnationId();
         String op = resolveOp(owner, lastRow, legacyOwners);
         String currency = LegacyExportFormat.trimPadding(lastRow.currency());
         if (LegacyExportFormat.isNull(owner) || LegacyExportFormat.isNull(currency)) {
@@ -338,9 +409,12 @@ class RollbackReplayFileTest {
     /**
      * The ledger range above the cutover watermark, exactly as fixtures/shadow/MANIFEST.md records it.
      *
-     * <p>Watermark {@code W = 100}, so the closed range is entry ids 101-108. JOHN, NEWCUST and RAUNAK
+     * <p>Watermark {@code W = 100}, so the closed range is entry ids 101-114. JOHN, NEWCUST and RAUNAK
      * each contribute two rows on purpose: that is what exercises the "last row wins" rule and the
      * collapse of a closed multi-row range into one line, which a range of single-row owners could not.
+     * RYAN spans two account incarnations (deleted at 109, created again at 110) and ERIC holds funds
+     * twice (released at 112, settled at 114): those two owners are the cases a rollback derivation gets
+     * wrong by grouping on the incarnation or by reading the reservation rule over the whole range.
      */
     private static List<LedgerRow> postWatermarkLedgerRange() {
         return List.of(
@@ -354,13 +428,33 @@ class RollbackReplayFileTest {
                         NEWCUST_INCARNATION),
                 ledgerRow(107L, "RAUNAK", LedgerEventType.CREDIT, "50.00", "USD", "150.00", RAUNAK_INCARNATION),
                 ledgerRow(108L, "RAUNAK", LedgerEventType.ACCOUNT_DELETED, "150.00", "USD", "0.00",
-                        RAUNAK_INCARNATION));
+                        RAUNAK_INCARNATION),
+                ledgerRow(109L, "RYAN", LedgerEventType.ACCOUNT_DELETED, "23456.78", "USD", "0.00",
+                        RYAN_FIRST_INCARNATION),
+                ledgerRow(110L, "RYAN", LedgerEventType.ACCOUNT_CREATED, "750.00", "USD", "750.00",
+                        RYAN_SECOND_INCARNATION),
+                heldLedgerRow(111L, "ERIC", LedgerEventType.HOLD, "500.00", "EUR", "1234067.89", "500.00",
+                        ERIC_INCARNATION),
+                heldLedgerRow(112L, "ERIC", LedgerEventType.RELEASE, "500.00", "EUR", "1234567.89", "0.00",
+                        ERIC_INCARNATION),
+                heldLedgerRow(113L, "ERIC", LedgerEventType.HOLD, "200.00", "EUR", "1234367.89", "200.00",
+                        ERIC_INCARNATION),
+                heldLedgerRow(114L, "ERIC", LedgerEventType.SETTLEMENT, "200.00", "EUR", "1234367.89", "0.00",
+                        ERIC_INCARNATION));
     }
 
     private static LedgerRow ledgerRow(long entryId, String owner, LedgerEventType eventType, String amount,
             String currency, String availableAfter, UUID incarnationId) {
         return new LedgerRow(entryId, owner, eventType, new BigDecimal(amount), currency,
                 new BigDecimal(availableAfter), NO_RESERVED_FUNDS, incarnationId);
+    }
+
+    /** A row of an owner whose institutional activity moved money between available and reserved. */
+    private static LedgerRow heldLedgerRow(long entryId, String owner, LedgerEventType eventType,
+            String amount, String currency, String availableAfter, String reservedAfter,
+            UUID incarnationId) {
+        return new LedgerRow(entryId, owner, eventType, new BigDecimal(amount), currency,
+                new BigDecimal(availableAfter), new BigDecimal(reservedAfter), incarnationId);
     }
 
     /** Returns the range with one row's reserved balance replaced, to exercise the rollback precondition. */

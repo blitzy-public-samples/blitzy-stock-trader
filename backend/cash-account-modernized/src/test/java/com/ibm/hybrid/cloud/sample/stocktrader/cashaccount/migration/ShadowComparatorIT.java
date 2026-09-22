@@ -36,8 +36,10 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.DefaultApplicationArguments;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Primary;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -47,13 +49,17 @@ import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.fx.LegacyRateTableSou
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.migration.load.LegacyLoader;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.migration.reconcile.MigrationReconciliation;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.migration.reconcile.MigrationRun;
+import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.migration.reconcile.ReconciliationService;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.migration.reconcile.ReconciliationStatus;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.migration.reconcile.VarianceKind;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.migration.shadow.ShadowComparator;
+import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.migration.shadow.ShadowLegacyResponse;
+import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.migration.shadow.ShadowTransaction;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.persistence.CashAccountRepository;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.persistence.LegacyRateTableRepository;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.persistence.MigrationReconciliationRepository;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.persistence.MigrationRunRepository;
+import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.support.MigrationReconciliationTestQueries;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.support.PostgresTestSupport;
 
 /*
@@ -73,9 +79,12 @@ import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.support.PostgresTestS
  *
  * WHY EXACTLY TWO TESTS. AAP 0.7.6 caps the reconciliation-against-characterization group at six tests across four
  * classes and allocates this file two of them: matched -> zero rows, seeded -> exactly the seeded rows. Exploratory
- * cases, parameterized matrices and redundant variants are not to be generated.
+ * cases, parameterized matrices and redundant variants are not to be generated. Two evidence-integrity regressions
+ * found in code review are asserted as further phases INSIDE the seeded scenario rather than as tests of their own,
+ * because neither is reachable from a committed fixture - the fixture contract requires every success line to carry
+ * a balance, and no fixture can make a window fail while recording a finding - and the allocation is frozen.
  */
-/** Proves the dual-run comparator on the committed shadow captures: zero rows for matched, exactly three for seeded. */
+/** Proves the dual-run comparator on the committed shadow captures, and that its evidence survives a lost window. */
 // NONE, not MOCK: the comparator replays through the service layer and never over HTTP (AAP 0.8.2), so a servlet
 // context and a mock dispatcher would add moving parts to a comparison that does not involve them.
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE,
@@ -99,6 +108,12 @@ class ShadowComparatorIT extends PostgresTestSupport {
 
     private static final int CORPUS_RATES = 3;
 
+    /** A zero return code, which is what the legacy status channel rendered for a successful request. */
+    private static final String SUCCESS_RETCODE = "000000000";
+
+    /** {@code migration_run.source_path} for the one window built in memory rather than read from a fixture. */
+    private static final String IN_MEMORY_WINDOW = "in-memory capture (no fixture shape carries it)";
+
     @Autowired
     private ShadowComparator shadowComparator;
 
@@ -108,14 +123,28 @@ class ShadowComparatorIT extends PostgresTestSupport {
     @Autowired
     private MigrationRunRepository migrationRuns;
 
+    // Two views of one table: the production repository is what the runner is built with, because its failure
+    // accounting reads the rows a command left behind; the test-only finders below are how this class asserts
+    // over them, so no query that exists only for a test sits on the production interface.
     @Autowired
-    private MigrationReconciliationRepository reconciliations;
+    private MigrationReconciliationRepository reconciliationRepository;
+
+    @Autowired
+    private MigrationReconciliationTestQueries reconciliations;
 
     @Autowired
     private CashAccountRepository accounts;
 
     @Autowired
     private LegacyRateTableRepository legacyRates;
+
+    @Autowired
+    private ReconciliationService reconciliationService;
+
+    // The context the runner is handed. It uses it only in run(...), which this class never calls, but the
+    // constructor requires it - and a @SpringBootTest context IS a ConfigurableApplicationContext.
+    @Autowired
+    private ConfigurableApplicationContext applicationContext;
 
     @Autowired
     private JdbcTemplate jdbcTemplate;
@@ -233,6 +262,13 @@ class ShadowComparatorIT extends PostgresTestSupport {
         assertThat(currencyOf("ERIC")).isEqualTo("EUR");
     }
 
+    /**
+     * The seeded window's evidence, in three phases: the three seeded rows and nothing else, then the two
+     * conditions a committed fixture cannot express - a capture line with no balance on the legacy side, and a
+     * window lost while recording a finding.
+     */
+    // Phases rather than separate tests because AAP 0.7.6 allocates this file two, and each phase takes its own
+    // fresh run id, so no phase's row set can disturb another's.
     @Test
     void seededStreamProducesExactlyTheThreeSeededRows() {
         Path window = fixtureDirectory(SEEDED_SHADOW_FIXTURES);
@@ -333,6 +369,160 @@ class ShadowComparatorIT extends PostgresTestSupport {
         assertThat(closed.varianceCount()).isEqualTo(2);
         assertThat(reconciliations.countByRunIdAndStatus(runId, ReconciliationStatus.ACCEPTED_EXCEPTION))
                 .isEqualTo(1);
+
+        malformedCaptureIsRecordedWithAnExplicitAbsenceToken();
+        lostWindowKeepsItsProgressAndItsCommittedFindings();
+    }
+
+    /**
+     * A success reply that carried no balance: the row must name the absent side rather than leave it blank.
+     */
+    // Part of the seeded scenario rather than a test of its own, because AAP 0.7.6 allocates this file two tests
+    // and this shape cannot come from a fixture: the fixture contract requires every success line to carry a
+    // balance, so the capture is built in memory through the comparator's own in-memory entry point. Its run id is
+    // fresh, so the row set asserted above is unaffected.
+    private void malformedCaptureIsRecordedWithAnExplicitAbsenceToken() {
+        UUID runId = UUID.randomUUID();
+        MigrationRun run = migrationRuns.save(MigrationRun.start(runId, UUID.randomUUID(),
+                MigrationRun.Mode.SHADOW, IN_MEMORY_WINDOW, MigrationRun.CharacterizationStatus.DRAFT));
+
+        // A Q read of an owner the corpus holds, paired with a reply that claims success (a zero retcode,
+        // CASH00.cbl:L104) and states no balance at all - so the target answers with the account's balance and the
+        // legacy side offers nothing to compare it against.
+        BigDecimal targetBalance = balanceOf("JOHN");
+        int variances = shadowComparator.compare(run,
+                List.of(new ShadowTransaction(1L, "JOHN", "Q", null, null)),
+                List.of(new ShadowLegacyResponse(1L, "JOHN", SUCCESS_RETCODE, null)));
+
+        assertThat(variances)
+                .as("a comparison with nothing on the legacy side fails closed as one outstanding variance")
+                .isEqualTo(1);
+
+        List<MigrationReconciliation> rows = reconciliations.findByRunIdOrderByReconciliationIdAsc(runId);
+        assertThat(rows)
+                .as("one row for the malformed line, and no TRANSACTION_COUNT row: Q changed no state, so it is"
+                        + " counted on neither side")
+                .hasSize(1);
+
+        MigrationReconciliation absent = row(rows, "JOHN", VarianceKind.BALANCE);
+        assertThat(absent.status()).isEqualTo(ReconciliationStatus.VARIANCE);
+        // The point of the row: an absent side is NAMED. Without the token the finding would carry a null
+        // legacy_value beside a null legacy_balance and a null variance, which is indistinguishable from a
+        // comparison the tooling failed to complete - and an operator reviewing the window's rows could neither
+        // triage it nor trace it back to the capture that is malformed.
+        assertThat(absent.legacyValue()).isEqualTo(MigrationReconciliation.ABSENT_IN_CAPTURE);
+        assertThat(absent.legacyBalance())
+                .as("no balance may be invented for a side that stated none")
+                .isNull();
+        assertThat(absent.migratedValue()).isEqualTo(targetBalance.toPlainString());
+        assertThat(absent.migratedBalance()).isEqualByComparingTo(targetBalance);
+        assertThat(absent.variance())
+                .as("the difference from a balance that was never stated is unknown, not zero")
+                .isNull();
+    }
+
+    /**
+     * A window lost while recording a finding: the FAILED row must state the progress and the findings that stand.
+     */
+    // DRIVEN THROUGH MigrationToolRunner.execute, the production recovery path, rather than by reproducing it here:
+    // the row's closure is the runner's own logic, and asserting a hand-rolled copy of it would leave the real path
+    // unexercised. execute(...) is the package-private entry point that returns the exit code instead of forcing
+    // it; run(...) - the one that ends in System.exit - is never called, which is why the tool profile can stay off
+    // (see the class note) while the runner is still exercised. @Profile("tool") is not evaluated for an instance
+    // constructed explicitly, the same reason the staged rate source below can reuse LegacyRateTableSource.
+    //
+    // The injected failure is on the REJECTED_BY_TARGET insert, which the seeded window writes at seq 2 (RAUNAK)
+    // AFTER seq 1 (JOHN) has been replayed and its BALANCE finding has committed, and at the moment seq 2's own
+    // target refusal has already happened. That one fault point covers both halves of the accounting: a finding
+    // that committed must be counted, and a line whose evidence insert failed must still appear in the progress.
+    private void lostWindowKeepsItsProgressAndItsCommittedFindings() {
+        Path window = fixtureDirectory(SEEDED_SHADOW_FIXTURES);
+        UUID batchId = UUID.randomUUID();
+
+        int exitCode;
+        injectRejectionRowInsertFailure();
+        try {
+            exitCode = shadowCompareRunner(window, batchId).execute(new DefaultApplicationArguments());
+        } finally {
+            // Dropped whatever happened above: the PostgreSQL container is JVM-wide and shared with the sibling
+            // ITs, so a trigger left behind would fail an unrelated class.
+            removeRejectionRowInsertFailure();
+        }
+
+        assertThat(exitCode)
+                .as("a datastore failure while recording a finding is an error (1), never a completed run that"
+                        + " recorded variances (2)")
+                .isEqualTo(1);
+
+        MigrationRun lost = onlyRunOfBatch(batchId);
+        // A FAILED row that states what the attempt actually did. Closed with zeroed counters it would tell the
+        // operator who signs off runbook Step 2 that the window found nothing, with its finding sitting under the
+        // same run id; left RUNNING it could not be signed off at all.
+        assertThat(lost.status()).isEqualTo(MigrationRun.Status.FAILED);
+        assertThat(lost.legacyRecordCount())
+                .as("all seven captured replies were read and joined before the window was lost")
+                .isEqualTo(7);
+        assertThat(lost.migratedRecordCount())
+                .as("two lines were taken up: seq 1, whose finding committed, and seq 2, whose target refusal"
+                        + " happened and whose finding insert then failed")
+                .isEqualTo(2);
+        assertThat(lost.varianceCount())
+                .as("read back from the finding that committed, not from the instance that died")
+                .isEqualTo(1);
+        assertThat(lost.finishedAt())
+                .as("a closed run is stamped, whatever its verdict")
+                .isNotNull();
+
+        assertThat(reconciliations.findByRunIdOrderByReconciliationIdAsc(lost.runId()))
+                .as("the finding that reached the table survives the failure that followed it")
+                .extracting(MigrationReconciliation::owner, MigrationReconciliation::varianceKind,
+                        MigrationReconciliation::status)
+                .containsExactly(tuple("JOHN", VarianceKind.BALANCE, ReconciliationStatus.VARIANCE));
+    }
+
+    /**
+     * The runner as the runbook's Step 2 command line configures it, for one shadow window.
+     */
+    private MigrationToolRunner shadowCompareRunner(Path window, UUID batchId) {
+        return new MigrationToolRunner(legacyLoader, reconciliationService, shadowComparator, migrationRuns,
+                reconciliationRepository, applicationContext, "shadow-compare", window.toString(), batchId.toString(),
+                "legacy-table", LegacyExportFormat.DEFAULT_LEGACY_CHARSET, "UTC", null);
+    }
+
+    /** The one run the runner opened for a batch, failing rather than guessing when the batch holds another. */
+    private MigrationRun onlyRunOfBatch(UUID batchId) {
+        List<MigrationRun> runsOfBatch = migrationRuns.findByBatchIdOrderByStartedAtAsc(batchId);
+        if (runsOfBatch.size() != 1) {
+            return fail("the runner must open exactly one run for batch %s, but the batch holds %s"
+                    .formatted(batchId, runsOfBatch));
+        }
+        return runsOfBatch.get(0);
+    }
+
+    /**
+     * Makes the next {@code REJECTED_BY_TARGET} insert fail, so a window dies while recording a finding.
+     */
+    // plpgsql with a WHEN condition, both available on the PostgreSQL 12 floor this module is written to, so the
+    // injection is as narrow as the scenario: no other row kind, table or test is affected. Nothing in the
+    // comparator, the runner, the fixtures or the schema is altered - the trigger is created and dropped here.
+    private void injectRejectionRowInsertFailure() {
+        jdbcTemplate.execute("""
+                CREATE FUNCTION shadow_it_reject_rejection_row() RETURNS trigger AS $fn$
+                BEGIN
+                    RAISE EXCEPTION 'ShadowComparatorIT fault injection: the window is lost while recording a finding';
+                END
+                $fn$ LANGUAGE plpgsql""");
+        jdbcTemplate.execute("""
+                CREATE TRIGGER shadow_it_reject_rejection_row
+                BEFORE INSERT ON migration_reconciliation
+                FOR EACH ROW WHEN (NEW.variance_kind = 'REJECTED_BY_TARGET')
+                EXECUTE FUNCTION shadow_it_reject_rejection_row()""");
+    }
+
+    private void removeRejectionRowInsertFailure() {
+        jdbcTemplate.execute("DROP TRIGGER IF EXISTS shadow_it_reject_rejection_row"
+                + " ON migration_reconciliation");
+        jdbcTemplate.execute("DROP FUNCTION IF EXISTS shadow_it_reject_rejection_row()");
     }
 
     private MigrationRun requireRun(UUID runId) {

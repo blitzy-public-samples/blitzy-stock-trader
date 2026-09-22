@@ -45,18 +45,26 @@ import org.junit.jupiter.api.Test;
  * "WS-CALC PIC 9(7)V99" (L17), which carries neither ROUNDED nor ON SIZE ERROR. Lose any one of those
  * citations and the document no longer evidences the formula the tooling implements.
  *
+ * Why the section-1 headings are asserted beside the citations: the document declares those headings
+ * load-bearing because LegacyCharacterization's Javadoc quotes one of them per constant, and a claim
+ * that nothing checks is a claim that decays - a rename or a merge would leave every one of those
+ * references pointing at a section that no longer exists, silently and only for a later reader.
+ *
  * Why the filesystem rather than the classpath: docs/ is not a resource root, so
  * getResource("/docs/legacy-characterization.md") is always null and the document has to be resolved
  * from the module directory. Why this fails and never skips: a missing or uncited document is exactly
  * the condition the checkpoint exists to catch, so nothing here is conditional on an assumption and
  * nothing here may be disabled.
  *
- * Why the helpers are package-visible and side-effect free: the sibling reconciliation integration
- * tests call them from their @BeforeAll drift guards, so these three signatures are a contract inside
- * this package - they may be extended, never narrowed or moved to a helper class of their own.
+ * Why the guard is package-visible and side-effect free: the sibling reconciliation integration tests
+ * call requireCharacterizationDocument() from their @BeforeAll drift guards, so that one signature is a
+ * contract inside this package - it may be extended, never narrowed, renamed or moved to a helper class
+ * of its own. The two resolution helpers beside it share that visibility rather than hiding behind it,
+ * so a later guard in this package resolves the document by this search order instead of a second copy
+ * of it.
  */
 
-/** Asserts the legacy characterization document exists and still carries its arithmetic citations. */
+/** Asserts the characterization document exists and still carries its citations and section headings. */
 class CharacterizationDocPresentTest {
 
     /** Module-relative location of the document; written by another module file, never by this test. */
@@ -67,10 +75,25 @@ class CharacterizationDocPresentTest {
 
     /**
      * Citations of the characterized credit/debit arithmetic that the document must carry. Stated once
-     * here so the set has a single definition; the two test methods and the sibling guards share it.
+     * here so the set has a single definition and the failing assertion can name every member of it.
      */
     private static final List<String> REQUIRED_CITATIONS =
             List.of("L221", "L222", "L255", "L256", "FRANKFURT1.AMOUNT", "RoundingMode.DOWN");
+
+    /**
+     * The section-1 subsection headings {@code LegacyCharacterization}'s Javadoc quotes, one per
+     * constant, written exactly as the document writes them - leading {@code ###} and inline code
+     * backticks included - so a renamed, reworded or merged heading fails rather than orphaning a
+     * reference nothing checks. The em dashes of 1.5 and 1.6 are the compiler escape {@code \u005Cu2014}
+     * rather than the literal character, so the comparison is an exact match under any source encoding
+     * this file is compiled with.
+     */
+    private static final List<String> REQUIRED_SECTION_HEADINGS = List.of(
+            "### 1.3 Constant: decimal scale 2",
+            "### 1.4 Constant: rounding is `RoundingMode.DOWN`",
+            "### 1.5 Constant: unsigned result \u2014 where the sign is dropped",
+            "### 1.6 Constant: modulus 10^7 \u2014 high-order digit loss on overflow",
+            "### 1.7 Constant: rate key length 5");
 
     /**
      * System properties that may carry the module directory, in the order they are trusted: the pom
@@ -122,11 +145,46 @@ class CharacterizationDocPresentTest {
     }
 
     /**
-     * Asserts the legacy characterization document is present and readable, and returns its content.
+     * Asserts the legacy characterization document is present, readable and still carries the
+     * section-1 headings the constants quote, and returns its content. This is the guard the sibling
+     * reconciliation integration tests call, so the heading check lives here rather than only in the
+     * test method below: a renamed heading then fails those classes too.
      *
      * @return the document's UTF-8 content, never blank
      */
     static String requireCharacterizationDocument() {
+        String content = readCharacterizationDocument();
+        assertLoadBearingSectionHeadings(content);
+        return content;
+    }
+
+    @Test
+    void characterizationDocumentExists() {
+        assertThat(readCharacterizationDocument())
+                .as("content of %s", characterizationDocument().toAbsolutePath())
+                .isNotBlank();
+    }
+
+    @Test
+    void characterizationDocumentCitesTheLegacyArithmetic() {
+        assertThat(readCharacterizationDocument())
+                .as("%s must cite the characterized credit/debit arithmetic it derives: %s",
+                        characterizationDocument().toAbsolutePath(), REQUIRED_CITATIONS)
+                .contains(REQUIRED_CITATIONS);
+    }
+
+    @Test
+    void characterizationDocumentCarriesTheHeadingsTheConstantsQuote() {
+        assertLoadBearingSectionHeadings(readCharacterizationDocument());
+    }
+
+    /**
+     * Reads the document, asserting only that it is present, readable and non-blank, so a missing
+     * citation or a renamed heading fails its own test and not this precondition.
+     *
+     * @return the document's UTF-8 content, never blank
+     */
+    private static String readCharacterizationDocument() {
         Path document = characterizationDocument();
         String absolutePath = document.toAbsolutePath().toString();
 
@@ -152,19 +210,12 @@ class CharacterizationDocPresentTest {
         return content;
     }
 
-    @Test
-    void characterizationDocumentExists() {
-        assertThat(requireCharacterizationDocument())
-                .as("content of %s", characterizationDocument().toAbsolutePath())
-                .isNotBlank();
-    }
-
-    @Test
-    void characterizationDocumentCitesTheLegacyArithmetic() {
-        assertThat(requireCharacterizationDocument())
-                .as("%s must cite the characterized credit/debit arithmetic it derives: %s",
-                        characterizationDocument().toAbsolutePath(), REQUIRED_CITATIONS)
-                .contains(REQUIRED_CITATIONS);
+    private static void assertLoadBearingSectionHeadings(String content) {
+        assertThat(content)
+                .as("%s must carry the section-1 headings LegacyCharacterization's Javadoc quotes "
+                                + "verbatim, one per characterized constant: %s",
+                        characterizationDocument().toAbsolutePath(), REQUIRED_SECTION_HEADINGS)
+                .contains(REQUIRED_SECTION_HEADINGS);
     }
 
     private static Path directoryOf(String value) {

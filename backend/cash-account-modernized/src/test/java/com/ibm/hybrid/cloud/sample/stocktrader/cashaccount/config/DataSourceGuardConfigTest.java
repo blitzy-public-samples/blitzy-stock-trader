@@ -52,7 +52,7 @@ class DataSourceGuardConfigTest {
             "-----END CERTIFICATE-----");
 
     @Test
-    void rejectsStartupUnlessJdbcKindIsPostgres() {
+    void rejectsStartupUnlessKindHostAndDatabaseAreConfiguredAndTheSslFlagIsParsable() {
         // No JdbcConnectionDetails bean is contributed here on purpose: the guard's own bean stands down whenever one
         // is already present, so a context that supplied one would deactivate half of what is under test and still
         // report green. Host, port and database are supplied because the guard's bean assembles the URL eagerly, and
@@ -81,6 +81,44 @@ class DataSourceGuardConfigTest {
         assertThatThrownBy(() -> DataSourceGuardConfig.requirePostgres("   "))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("postgres");
+
+        // The empty string is exactly what application.yml's ${JDBC_HOST:} and ${JDBC_DB:} resolve to when the
+        // release configMap is absent, so these two assert on a present-but-empty property rather than on a bare
+        // environment: that is what fails if anyone re-adds a localhost or trader convenience default, which would
+        // let a misconfigured process write the ledger to a local database with its probes still passing.
+        assertThatThrownBy(() -> new DataSourceGuardConfig(new CashAccountProperties(), new MockEnvironment()
+                .withProperty("cashaccount.jdbc.host", "")
+                .withProperty("JDBC_PORT", PORT)
+                .withProperty("JDBC_DB", DATABASE)).resolveJdbcUrl())
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("JDBC_HOST")
+                .hasMessageContaining("cashaccount.jdbc.host");
+
+        assertThatThrownBy(() -> new DataSourceGuardConfig(new CashAccountProperties(), new MockEnvironment()
+                .withProperty("JDBC_HOST", HOST)
+                .withProperty("JDBC_PORT", PORT)
+                .withProperty("cashaccount.jdbc.database", "")).resolveJdbcUrl())
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("JDBC_DB")
+                .hasMessageContaining("cashaccount.jdbc.database");
+
+        // Only absence means "no TLS", matching portfolio's <variable name="JDBC_SSL" defaultValue="false"/>
+        // [backend/portfolio/src/main/liberty/config/includes/postgres.xml:L2]. "yes" is refused rather than read
+        // as false, because a typo read as false silently strips sslmode=verify-ca from the URL and the ledger's
+        // database connection would run without server-certificate verification.
+        assertThat(DataSourceGuardConfig.sslEnabled("true")).isTrue();
+        assertThat(DataSourceGuardConfig.sslEnabled("TRUE")).isTrue();
+        assertThat(DataSourceGuardConfig.sslEnabled(" true ")).isTrue();
+        assertThat(DataSourceGuardConfig.sslEnabled("false")).isFalse();
+        assertThat(DataSourceGuardConfig.sslEnabled("FALSE")).isFalse();
+        assertThat(DataSourceGuardConfig.sslEnabled(null)).isFalse();
+        assertThat(DataSourceGuardConfig.sslEnabled("   ")).isFalse();
+
+        assertThatThrownBy(() -> DataSourceGuardConfig.sslEnabled("yes"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("JDBC_SSL")
+                .hasMessageContaining("cashaccount.jdbc.ssl")
+                .hasMessageContaining("yes");
     }
 
     @Test

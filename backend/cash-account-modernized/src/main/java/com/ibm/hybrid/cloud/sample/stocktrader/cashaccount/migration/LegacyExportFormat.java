@@ -382,6 +382,32 @@ public final class LegacyExportFormat {
         return b == (byte) 0x40 || b == (byte) 0x00;
     }
 
+    /**
+     * The first index in {@code [from, toExclusive)} that is not padding, or {@code -1} when every byte is.
+     *
+     * @throws IllegalArgumentException when the range does not lie inside {@code data}
+     */
+    // The byte-range form of isPaddingByte, here rather than in the decoder so the accepted shape of a padded
+    // record keeps one home: what a tail may hold is part of the export's format, exactly as the record length
+    // and the field offsets above are. It returns the offending index rather than a boolean because the caller
+    // has to tell the operator WHERE the frame broke - a tail that is neither EBCDIC blank nor zero means the
+    // file was not framed at the declared length, and the one number that locates that is the offset.
+    public static int paddingViolationOffset(byte[] data, int from, int toExclusive) {
+        if (data == null) {
+            throw new IllegalArgumentException("A record buffer is required to inspect a padded tail");
+        }
+        if (from < 0 || toExclusive > data.length || from > toExclusive) {
+            throw new IllegalArgumentException("The padded tail [" + from + ", " + toExclusive
+                    + ") does not lie inside a buffer of " + data.length + " bytes");
+        }
+        for (int index = from; index < toExclusive; index++) {
+            if (!isPaddingByte(data[index])) {
+                return index;
+            }
+        }
+        return -1;
+    }
+
     // ------------------------------------------------------------------------------------------
     // Shared value conventions
 

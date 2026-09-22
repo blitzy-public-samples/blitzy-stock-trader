@@ -20,7 +20,9 @@ This module is a **plain tracked directory in the umbrella checkout — not a gi
 edited: the umbrella repository carries these files directly so the new service can be built and reviewed in the same
 checkout as the seam it has to satisfy and the chart it has to conform to.
 
-The module carries its own `.gitignore` (`target/`) because the umbrella repository has none of its own.
+The module tracks no `.gitignore`: the frozen file inventory (AAP 0.6.1) contains none, and the umbrella repository
+has none of its own, so a build leaves `target/` showing as untracked unless the checkout excludes it locally
+(`.git/info/exclude`).
 
 ## What is in here
 
@@ -60,6 +62,10 @@ dual-run, the controlled cutover and decommission — is written up in
 [Prohibitions](#prohibitions).
 
 ## Build and run
+
+Everything below runs from the module directory with the wrapper it ships; the only host requirements are
+a JDK 21, a Docker daemon for the integration suite and a PostgreSQL instance for anything that is not a
+test.
 
 ### Prerequisites
 
@@ -118,16 +124,35 @@ genuinely standalone checkout with no broker sources to compare against — neve
 java -jar target/cash-account-modernized-1.0.0-SNAPSHOT.jar
 ```
 
-with, at minimum, `JDBC_KIND=postgres`, `JDBC_HOST`, `JDBC_PORT`, `JDBC_DB`, `JDBC_ID`, `JDBC_PASSWORD` and
-`AUTH_TYPE` from the [configuration map](#configuration) — for example:
+with `JDBC_KIND=postgres`, `JDBC_HOST`, `JDBC_DB`, `JDBC_ID`, `JDBC_PASSWORD` and `AUTH_TYPE` from the
+[configuration map](#configuration). `JDBC_HOST` and `JDBC_DB` have **no default**: supply the wrong one and you
+get a connection error, supply neither and start-up stops with a message naming the variable and its property.
+`JDBC_PORT` may be omitted only because `5432` is PostgreSQL's own port. For example:
 
 ```bash
-JDBC_KIND=postgres JDBC_HOST=localhost JDBC_PORT=5432 JDBC_DB=trader \
-JDBC_ID=<local-db-user> JDBC_PASSWORD=<local-db-password> AUTH_TYPE=basic \
+# The password is prompted for and written to a 0600 file, never typed into the command line: argv is
+# readable by every process on the host (`ps -o args=`) and an interactive shell keeps it in HISTFILE.
+# `printf` is a shell builtin, so the value never becomes another process's argv.
+umask 077
+IFS= read -rsp 'JDBC_PASSWORD: ' CA_PW; echo
+printf 'JDBC_KIND=postgres\nJDBC_HOST=localhost\nJDBC_PORT=5432\nJDBC_DB=trader\nJDBC_ID=<local-db-user>\nAUTH_TYPE=basic\nJDBC_PASSWORD=%s\n' "$CA_PW" > ca-db.env
+unset CA_PW
+
+# Load it without letting the shell interpret any value - `set -a; . ca-db.env` would execute a
+# password containing ';' or '$' instead of loading it.
+while IFS='=' read -r k v; do [ -n "$k" ] && export "$k=$v"; done < ca-db.env
 java -jar target/cash-account-modernized-1.0.0-SNAPSHOT.jar
+
+# Afterwards
+unset JDBC_PASSWORD
+shred -u ca-db.env 2>/dev/null || rm -f ca-db.env
 ```
 
-The schema is applied at start-up (see [Schema application](#schema-application)), so an empty database is enough.
+The schema is applied at start-up (see [Schema application](#schema-application)), so an empty database is enough —
+and so the store this run reaches gains the seven tables, the `ledger_entry_reject()` function and the
+`ledger_entry_immutable` trigger. **Point it at a local throwaway database**, never at a shared or production store;
+that is the same rule `docs/operational-runbook.md` Step 0 states for its own memory-fit check.
+
 Once the log reports the port, these all answer `200`:
 
 ```bash
@@ -158,9 +183,9 @@ variables and adds none. `src/main/resources/application.yml` is the declared so
 | --- | --- | --- |
 | `CURRENCY_API_URL` ← `cashAccount.exchangeRateUrl` | `cashaccount.fx.url` | `https://api.frankfurter.app/latest` |
 | `JDBC_KIND` ← `database.kind` | `cashaccount.jdbc.kind` | `postgres` — **and nothing else starts** (below) |
-| `JDBC_HOST` ← `database.host` | `cashaccount.jdbc.host` | `localhost` |
+| `JDBC_HOST` ← `database.host` | `cashaccount.jdbc.host` | **none** — start-up fails naming `JDBC_HOST` and `cashaccount.jdbc.host` |
 | `JDBC_PORT` ← `database.port` | `cashaccount.jdbc.port` | `5432` |
-| `JDBC_DB` ← `database.db` | `cashaccount.jdbc.database` | `trader` |
+| `JDBC_DB` ← `database.db` | `cashaccount.jdbc.database` | **none** — start-up fails naming `JDBC_DB` and `cashaccount.jdbc.database` |
 | `JDBC_SSL` ← `database.ssl` | `cashaccount.jdbc.ssl` | `false` |
 | `cert_defaultTrustStore` ← configMap key `ssl.certs`, injected only when `global.specifyCerts` is on | `cashaccount.jdbc.trust-store-pem` | empty |
 | `JDBC_ID` ← `database.id` (chart secret) | `spring.datasource.username` | empty |
@@ -209,7 +234,7 @@ These have internal defaults; nothing in the chart supplies them, and nothing ne
 | `cashaccount.security.all-authenticated-hold-stocktrader` | `true` | Parity with the siblings' `ALL_AUTHENTICATED_USERS → StockTrader` binding; `false` is the strict mode (see [Security](#security)) |
 | `cashaccount.fx.base-currency` | `USD` | Broker's default account currency, so a same-currency account short-circuits to a rate of exactly `1` with no network call |
 | `cashaccount.fx.timeout` | `PT2S` | Connect and read budget; a slow rate provider must surface as `503`, not as a request that outlives its caller |
-| `cashaccount.fx.accepted-currencies` | The 31 ISO codes `AUD BGN BRL CAD CHF CNY CZK DKK EUR GBP HKD HUF IDR ILS INR ISK JPY KRW MXN MYR NOK NZD PHP PLN RON SEK SGD THB TRY USD ZAR` | Adopted verbatim from the `allowed_currencies` CHECK the estate's PostgreSQL init template already enforces, which is also the set the exchange-rate API serves |
+| `cashaccount.fx.accepted-currencies` | The 31 ISO codes `AUD BGN BRL CAD CHF CNY CZK DKK EUR GBP HKD HUF IDR ILS INR ISK JPY KRW MXN MYR NOK NZD PHP PLN RON SEK SGD THB TRY USD ZAR` | The **estate allowlist**, adopted verbatim from the `allowed_currencies` CHECK the estate's PostgreSQL init template already enforces — **not** the set the exchange-rate API serves, which is a 30-code subset of it: as of 2026-09-22 the configured provider's `/v1/currencies` omits `BGN` and `GET /latest?from=USD&to=BGN` answers `404`. Acceptance is therefore not a promise of convertibility — a `BGN` account is created and read normally, and only a cross-currency `credit`/`debit` for it fails, with `503 EXCHANGE_RATE_UNAVAILABLE`, the balance unchanged and no ledger row. `BGN` is kept rather than dropped because this list also decides what a legacy export may be **loaded** with (an out-of-set currency is recorded as `CURRENCY` / `INVALID_IN_LEGACY` and the account is not migrated), so dropping it would silently strand a `BGN`-denominated legacy account. A deployment whose accounts must all be convertible narrows the list — `CASHACCOUNT_FX_ACCEPTED_CURRENCIES=USD,EUR,…`, no chart change — and `application.yml` is the single authority every consumer binds |
 | `cashaccount.reservation.default-ttl` | `PT24H` | A hold nobody settles or releases must not strand funds indefinitely |
 | `cashaccount.reservation.expiry-sweep-interval` | `PT60S` | Bounds how long an overdue hold keeps money out of the available balance |
 
@@ -271,6 +296,39 @@ The service is deployed by the chart that already exists at
 | `global.specifyCerts` | `false` | Gates the `cert_defaultTrustStore` injection |
 | `vault.enabled` | `false` | **Must remain `false`** (below) |
 
+### Replica count is the operator's to choose
+
+The chart already carries the scaling keys, consumed as they are and edited by nothing here:
+`cashAccount.replicas` (`1`), `cashAccount.autoscale` (`false`), `cashAccount.maxReplicas` (`10`) and
+`cashAccount.cpuThreshold` (`75`). `templates/cash-account.yaml` lines 26-27 render `replicas` only while
+`autoscale` is false, and lines 233-271 render an `autoscaling/v2` HorizontalPodAutoscaler with
+`minReplicas` = `replicas`, `maxReplicas` = `maxReplicas` and a CPU-utilization target of `cpuThreshold`
+when it is true. Turning autoscaling on is therefore a values change, and the service is safe under it for
+four specific reasons:
+
+- **No request state lives in a pod.** Every account, reservation and ledger row is in PostgreSQL, and
+  `config/SecurityConfig` runs `SessionCreationPolicy.STATELESS` with CSRF disabled because the API is
+  bearer-token JSON (lines 143-144), so there is no session to pin a caller to a pod: no sticky routing, no
+  shared session store, and any replica can answer any request.
+- **The one file a pod writes is its own.** With `JDBC_SSL=true` and `cert_defaultTrustStore` injected,
+  `config/DataSourceGuardConfig` writes that PEM to a private temporary file in the pod's own filesystem —
+  owner-only permissions, deleted on exit — and points `sslrootcert` at that path, so each replica
+  materializes its own copy and no path is shared between pods.
+- **Start-up serializes instead of racing.** The schema initializer takes `pg_advisory_lock(724300101)` on
+  its single connection before the first statement and releases it after the last, and every statement is
+  re-runnable, so the Nth pod's pass changes nothing and never drops the immutability guard — the
+  mechanism described under [Schema application](#schema-application).
+- **N expiry sweepers produce one outcome per hold.** `ReservationService.sweepExpiredReservations()` runs
+  on every replica at `cashaccount.reservation.expiry-sweep-interval`. One pass collects at most 200
+  candidate identifiers with an unlocked projection query, then gives each candidate its own transaction
+  that locks the owner's `cash_account` row first (`findByOwnerForUpdate`), claims the reservation row
+  under a `SKIP LOCKED` write lock, and only then re-checks that it is still `HELD` and still overdue. A
+  second sweeper — or a settle or release that won the race — finds the row already terminal under the
+  account lock and writes nothing, so exactly one terminal state and exactly one ledger row result
+  whatever the replica count. The account row is locked first on every path, request and sweep alike:
+  one fixed lock order is what keeps the wait-for graph acyclic, and contention then surfaces as
+  `409 CONCURRENT_MODIFICATION` rather than as a lost update.
+
 ### Deployment-shape conformance
 
 A reviewer can see by inspection that the existing template already reaches this service:
@@ -304,6 +362,10 @@ evidence and its sign-offs are `docs/operational-runbook.md` Step 3. This delive
 
 ## Endpoints
 
+The service exposes two path spaces and one error payload: the retail contract broker already calls, which
+is fixed by that caller and reproduced exactly, and the additive institutional reservation surface, which no
+caller in this repository reaches yet. Every failure in either is rendered by the closed error model below.
+
 ### Retail contract — the seam
 
 Reproduced exactly as `CashAccountClient` issues it. Every success is `200` with the body
@@ -313,11 +375,21 @@ plain decimal text, never exponent notation, because the caller and the contract
 | Legacy code | Verb and path | Request | Errors |
 | --- | --- | --- | --- |
 | `Q` | `GET /cash-account/{owner}` | — | `404` ACCOUNT_NOT_FOUND |
-| `A` | `POST /cash-account/{owner}` | body `{owner, balance, currency}`; a null `currency` defaults to `USD` | `409` ACCOUNT_ALREADY_EXISTS, `400` INVALID_OWNER / INVALID_AMOUNT / INVALID_CURRENCY, `422` AMOUNT_OUT_OF_RANGE |
-| `U` | `PUT /cash-account/{owner}` | body `{owner, balance, currency}` — an absolute overwrite of the available balance and the currency | `404`, `400`, `422`, `409` RESERVATIONS_OUTSTANDING |
+| `A` | `POST /cash-account/{owner}` | body `{owner, balance, currency}`, **required**; the body's `owner` is ignored and the path decides; an absent or null `balance` is `0.00`; an absent, null or blank `currency` is the configured base currency, `USD` | `409` ACCOUNT_ALREADY_EXISTS, `400` INVALID_OWNER / INVALID_AMOUNT / INVALID_CURRENCY, `422` AMOUNT_OUT_OF_RANGE |
+| `U` | `PUT /cash-account/{owner}` | body `{owner, balance, currency}`, **required** — an absolute overwrite of the available balance and the currency, with the same three field rules as `POST` | `404`, `400`, `422`, `409` RESERVATIONS_OUTSTANDING |
 | `X` | `DELETE /cash-account/{owner}` | — (returns the deleted account) | `404`, `409` RESERVATIONS_OUTSTANDING |
 | `D` | `PUT /cash-account/{owner}/debit?amount=<decimal>` | `amount` bound from its string form to `BigDecimal`, then scaled to 2 decimals `DOWN` | `404`, `400` INVALID_AMOUNT, `422` INSUFFICIENT_FUNDS, `422` AMOUNT_OUT_OF_RANGE, `503` EXCHANGE_RATE_UNAVAILABLE |
 | `C` | `PUT /cash-account/{owner}/credit?amount=<decimal>` | as debit | `404`, `400`, `422` AMOUNT_OUT_OF_RANGE, `503` EXCHANGE_RATE_UNAVAILABLE |
+
+**Both writes need a body, and `PUT` overwrites rather than patches.** A `POST` or `PUT` carrying no body — or a literal
+JSON `null` — is rejected with `400` INVALID_AMOUNT and is never read as a request for `0.00`. Inside the body, the
+`owner` component is ignored, because the path variable is authoritative and the two agree in every call broker makes;
+an absent or null `balance` is `0.00`; an absent, null or blank `currency` is `cashaccount.fx.base-currency`, `USD` as
+shipped. Both defaults are legacy behaviour rather than convenience: the COMMAREA field `WS-BALANCE PIC 9(7)V99`
+[`CASH00.cbl:L56`](../cash-account-cobol/COBOL/CASH00.cbl) could not be null, so an unset field arrived as zeros, and
+broker substitutes `USD` before it calls. The consequence is worth stating plainly, because `PUT` is an absolute
+overwrite of both columns: `PUT /cash-account/JOHN` with the body `{}` sets that account to `0.00 USD` and writes an
+`ACCOUNT_UPDATED` ledger row saying so. Send the full `{owner, balance, currency}` object on every write.
 
 Retail `balance` is the **available** balance. With no reservation outstanding it equals the total, which is the only
 state the legacy single-balance program could ever be in, so parity is exact; with funds held it is the spendable
@@ -365,7 +437,7 @@ return channel, which dropped the sign in a `X(10)` field and reported only the 
 | `ACCOUNT_NOT_FOUND` | 404 | No such owner (legacy `SQLCODE 100` on `Q/U/X/C/D`) |
 | `ACCOUNT_ALREADY_EXISTS` | 409 | Create on an existing owner (legacy `-803`) |
 | `INVALID_OWNER` | 400 | Blank, or longer than 32 characters (legacy truncated silently to 15) |
-| `INVALID_AMOUNT` | 400 | Missing, negative or non-numeric `amount`; a hold of `≤ 0`; a settlement above the held amount |
+| `INVALID_AMOUNT` | 400 | Missing, non-numeric or negative `amount` — the sign is judged before the value is scaled, so a sub-cent negative such as `-0.001` is rejected rather than normalized to `0.00`; a hold of `≤ 0`; a settlement above the held amount |
 | `INVALID_CURRENCY` | 400 | Not a three-letter code in the accepted set, after trim and uppercase |
 | `CURRENCY_MISMATCH` | 400 | Hold currency ≠ account currency |
 | `INSUFFICIENT_FUNDS` | 422 | The operation would drive the available balance negative (legacy stored the absolute value) |
@@ -449,14 +521,24 @@ and the currency-conversion test asserts the recorded FX request carries none.
 shared Liberty trust store with:
 
 ```bash
+IFS= read -rsp 'trust store password: ' TRUST_STORE_PASSWORD; echo
+export TRUST_STORE_PASSWORD
 keytool -exportcert -rfc -alias jwtsigner \
   -keystore ../broker/src/main/liberty/config/resources/security/trust.p12 \
-  -storetype PKCS12 -storepass "$TRUST_STORE_PASSWORD" \
+  -storetype PKCS12 -storepass:env TRUST_STORE_PASSWORD \
   > src/main/resources/security/jwtsigner.pem
+unset TRUST_STORE_PASSWORD
 ```
 
 Supply the trust store's configured password (see broker's `server.xml`) through the environment as shown; it is not
-reproduced here. `keytool -exportcert -rfc` emits a `-----BEGIN CERTIFICATE-----` PEM, which
+reproduced here. **`-storepass:env` names the variable; plain `-storepass "$TRUST_STORE_PASSWORD"` would not do.** The
+shell expands the latter before `keytool` runs, so the password itself lands in `keytool`'s `argv`, where `ps -o args=`
+shows it to every process on the host for the life of the command — the non-echoing prompt prevents terminal echo and a
+history entry, and does nothing about `argv`. With `:env`, `keytool` reads the variable itself and only the variable's
+*name* is ever an argument. `-storepass:file <0600-file>` is the equivalent when a prompt is impractical; delete the
+file afterwards. Both forms are accepted by the JDK 21 `keytool` this module builds with.
+
+`keytool -exportcert -rfc` emits a `-----BEGIN CERTIFICATE-----` PEM, which
 `config/JwtDecoderConfig` reads through a `CertificateFactory`; it also accepts a `-----BEGIN PUBLIC KEY-----` PEM,
 which is what the tests' ephemeral keys produce.
 
@@ -483,7 +565,8 @@ java -jar target/cash-account-modernized-1.0.0-SNAPSHOT.jar \
      --spring.profiles.active=tool \
      --tool.command=load \
      --tool.input=src/test/resources/fixtures/legacy-export/matched \
-     --tool.batch-id="$BATCH_ID"
+     --tool.batch-id="$BATCH_ID" \
+     --tool.history-record-length=100
 
 java -jar target/cash-account-modernized-1.0.0-SNAPSHOT.jar \
      --spring.profiles.active=tool \
@@ -500,6 +583,14 @@ java -jar target/cash-account-modernized-1.0.0-SNAPSHOT.jar \
 
 The tool profile needs the same `JDBC_*` environment as a normal run. Each invocation is its own `migration_run` row;
 the shared `--tool.batch-id` is how a `reconcile` names the `load` it judges.
+
+`--tool.history-record-length=100` appears on the `load` alone, and it is not optional there: that fixture directory
+carries a binary `history.cp037.bin`, and for binary history the record length is **declared, never inferred** — the
+runner refuses the invocation without it before reading a row. `100` is the length that directory's fixture uses (eight
+padded records, 800 bytes; `57` would be rejected because 800 is not a multiple of it). The `reconcile` and
+`shadow-compare` commands carry no such argument because neither opens a history file: `reconcile` reads the account
+and rate exports and `shadow-compare` reads the two captured streams, so requiring it of them would reject a valid
+invocation over a file it never touches.
 
 | Exit code | Meaning |
 | --- | --- |
@@ -603,29 +694,104 @@ docker push <registry>/cash-account:<version>
 docker inspect --format '{{index .RepoDigests 0}}' <registry>/cash-account:<version>
 ```
 
-The captured **digest** — not the tag — is the immutable reference the runbook's cutover value set uses for
-`cashAccount.image.repository` / `cashAccount.image.tag`. A tag can be re-pointed after the fact; a digest cannot, which
-is what makes "the image we validated" and "the image the pod runs" the same statement. Step 5 only answers after
-step 4: a locally built image carries no `RepoDigests` entry until it has been pushed to a registry.
+The captured **digest** — not the tag — is the immutable reference the runbook's cutover value set uses. A tag can be
+re-pointed after the fact; a digest cannot, which is what makes "the image we validated" and "the image the pod runs"
+the same statement. Step 5 only answers after step 4: a locally built image carries no `RepoDigests` entry until it has
+been pushed to a registry.
+
+### Carrying the digest through the chart's fixed `repository:tag` rendering
+
+The chart renders the container image as one expression and always joins the two values with a colon —
+`image: "{{ .Values.cashAccount.image.repository }}:{{ .Values.cashAccount.image.tag }}"`
+(`infra/stocktrader-operator/helm-charts/stocktrader/templates/cash-account.yaml:L65`) — and that template is **not
+edited**: changing it is a [stop-and-flag](#stop-and-flag) condition. A digest reference is `<name>@sha256:<hex>`, so it
+survives that rendering by being split at its **final colon**, with the `@sha256` algorithm prefix carried on the
+repository value and the hex on the tag value:
+
+| Value | Set to |
+| --- | --- |
+| `cashAccount.image.repository` | `<registry>/cash-account@sha256` |
+| `cashAccount.image.tag` | the 64-character hex digest, with **no** `sha256:` prefix |
+
+Rendered, the pair produces `<registry>/cash-account@sha256:<hex>` — a digest-pinned reference. Nothing constrains the
+split: both fields are plain strings in `values.yaml` and in the operator CRD alike, where
+`cashAccount.image.repository` and `.tag` are declared `type: string` with no pattern
+(`infra/stocktrader-operator/config/crd/bases/operators.ibm.com_stocktraders.yaml`). Derive both from the captured
+reference rather than retyping either:
+
+```bash
+REF=$(docker inspect --format '{{index .RepoDigests 0}}' <registry>/cash-account:<version>)
+echo "cashAccount.image.repository: ${REF%:*}"   # <registry>/cash-account@sha256
+echo "cashAccount.image.tag:        ${REF##*:}"  # the 64-character hex digest
+```
+
+**The obvious mapping is invalid and must not be attempted.** Putting the whole `sha256:<hex>` into `tag` renders
+`<registry>/cash-account:sha256:<hex>`, which is not a reference at all: a container runtime answers `invalid reference
+format` for that form and a kubelet rejects it the same way, so the pod never starts and the failure surfaces as an
+image-pull error during the change window rather than as a values mistake. The two forms are one typo apart, which is
+why the runbook verifies the **rendered** result and not the values it came from: at
+[cutover gate (e)](docs/operational-runbook.md#step-3--controlled-cutover), `helm template` — or, once applied,
+`kubectl get deployment <release>-cash-account -o jsonpath='{.spec.template.spec.containers[0].image}'` — must print
+the `@sha256:` form before routing is confirmed.
 
 ### Memory-fit check (manual, and it has to be)
 
+**Run it against a disposable database, never against a shared or production store.** Start-up applies
+`schema/cash-account-schema.sql` (`spring.sql.init.mode=always`), so the store this check reaches gains the seven
+tables, the `ledger_entry_reject()` function and the `ledger_entry_immutable` trigger. Turning the initializer off is
+not the alternative — `spring.jpa.hibernate.ddl-auto=validate` then fails start-up, and readiness includes the `db`
+indicator, so the check needs a real database that is genuinely expendable.
+
 ```bash
-docker run --rm --memory=2g --cpus=1 \
-  -e JDBC_KIND=postgres -e JDBC_HOST=<host> -e JDBC_PORT=5432 -e JDBC_DB=trader \
-  -e JDBC_ID=<id> -e JDBC_PASSWORD=<password> -e AUTH_TYPE=basic \
-  -p 8080:8080 <registry>/cash-account:<version>
-# then, from another shell:
-curl -s http://localhost:8080/actuator/health/readiness   # must answer 200 {"status":"UP"}
+# A throwaway instance and a throwaway credential, both destroyed at the end. --env-file keeps the
+# credential out of every argv: docker parses KEY=VALUE literally, with no shell parsing or expansion.
+umask 077
+{ printf 'POSTGRES_USER=memfit\nPOSTGRES_DB=memfit\nPOSTGRES_PASSWORD='; openssl rand -hex 24; } > memfit-db.env
+{ printf 'JDBC_KIND=postgres\nJDBC_HOST=ca-memfit-db\nJDBC_PORT=5432\nJDBC_DB=memfit\nJDBC_ID=memfit\nAUTH_TYPE=basic\nJDBC_PASSWORD='
+  sed -n 's/^POSTGRES_PASSWORD=//p' memfit-db.env; } > memfit-app.env
+
+docker network create ca-memfit-net
+docker run -d --name ca-memfit-db --network ca-memfit-net --env-file ./memfit-db.env \
+  -v ca-memfit-data:/var/lib/postgresql/data postgres:12.22-alpine
+docker run -d --name ca-memfit-app --network ca-memfit-net --memory=2g --cpus=1 \
+  --env-file ./memfit-app.env -p 8080:8080 <registry>/cash-account:<version>
+
+# Poll: `docker run -d` returns when the process started, not when the application answers, and this
+# one applies the schema first. A single immediate curl measures nothing.
+code=000
+for i in $(seq 1 30); do
+  code=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' \
+              http://localhost:8080/actuator/health/readiness) || code=000
+  [ "$code" = 200 ] && break
+  sleep 2
+done
+printf 'readiness=%s after %ss\n' "$code" "$((i * 2))"
+[ "$code" = 200 ] && docker logs ca-memfit-app 2>&1 | grep -iE 'MaxRAM|Started CashAccountApplication' \
+                  || { echo 'MEMORY-FIT CHECK FAILED'; docker logs --tail 50 ca-memfit-app; }
+
+# Teardown runs on success and on failure alike, and removes the data volume by name: postgres declares
+# /var/lib/postgresql/data as a VOLUME, so removing the container alone leaves the cluster on the host.
+docker rm -fv ca-memfit-app ca-memfit-db; docker network rm ca-memfit-net
+docker volume rm ca-memfit-data
+shred -u memfit-db.env memfit-app.env 2>/dev/null || rm -f memfit-db.env memfit-app.env
+
+# Each of these must print nothing.
+docker ps -a --filter name=ca-memfit --format '{{.Names}}'; docker volume ls -q --filter name=ca-memfit-data
 ```
 
 The container must reach readiness inside the chart's envelope (limits cpu `1000m` / memory `2Gi`). The check is manual
 because **no in-repo test asserts memory fit**: the base image's `run-java.sh` derives the heap from the container
 memory limit (`JAVA_MAX_MEM_RATIO`, emitting `-XX:MaxRAMPercentage`), so the answer depends on the runtime limit rather
 than on anything a unit or integration test can see. Record the result as a `docs/operational-runbook.md` Step 0
-evidence item, alongside the image digest.
+evidence item, alongside the image digest — that step carries the executed form of this check, its prohibition and its
+gate, and `postgres:12.22-alpine` is used here because it is the estate's provisioned major version and the floor this
+schema is written against.
 
 ## Local development notes
+
+Three things surprise a developer running this module outside the chart, and each is recorded because the
+surprise is by design and the remedy is never an edit to another module: broker's local-dev URL default,
+what the fail-closed error model does to a broker request, and how the schema reaches an empty database.
 
 ### Broker's local-dev default URL ends in `/account`, and stays that way
 
@@ -696,7 +862,7 @@ migration tool or a hand-written `ALTER` step appended to this file, applied in 
 
 | Document | What it is |
 | --- | --- |
-| [`docs/legacy-characterization.md`](docs/legacy-characterization.md) | The behaviour of the CICS/COBOL program, read from its source with an inline `file:line` citation behind every claim: what `amount` resolves to in the credit/debit computation, owner casing, the missing dispatch catch-all, the write-only audit file, the acceptance baseline, and the disposition of every legacy behaviour (preserved, deliberately changed, or not replicated). It ends with an **Acceptance** section carrying `Status: DRAFT | ACCEPTED`, the named reviewer and the date. The tooling copies that status into every `migration_run`, and a `DRAFT` characterization can exercise fixtures but can never be signed off against a real export |
+| [`docs/legacy-characterization.md`](docs/legacy-characterization.md) | The behaviour of the CICS/COBOL program, read from its source with an inline `file:line` citation behind every claim: what `amount` resolves to in the credit/debit computation, owner casing, the missing dispatch catch-all, the write-only audit file, the acceptance baseline, and the disposition of every legacy behaviour (preserved, deliberately changed, or not replicated). It ends with an **Acceptance** section carrying `Status: DRAFT \| ACCEPTED`, the named reviewer and the date. The tooling copies that status into every `migration_run`, and a `DRAFT` characterization can exercise fixtures but can never be signed off against a real export |
 | [`docs/operational-runbook.md`](docs/operational-runbook.md) | Step 0 prerequisites and Steps 1–4 — bulk migration rehearsal and reconciliation, shadow-mode dual-run, controlled cutover, decommission — each with preconditions, actions, evidence, sign-offs and a rollback criterion. **Every step is documented here and executed by the platform operator and the mainframe team, never by this deliverable** |
 
 ## Open items
@@ -709,6 +875,7 @@ for those that came from the legacy source.
 | **Data-retention requirement for decommission.** This repository contains no retention policy, audit-control matrix or compliance artifact | An explicit **written** answer from the requesting organization before runbook Step 4 runs. **Defaulting a retention period is prohibited** |
 | VSAM record length: the program writes 57 bytes into a cluster defined `RECSZ(100 100)` | The CICS FILE/FCT definition (`RECORDFORMAT`, `RECORDSIZE`), or a real `REPRO`/`PRINT` sample. Meanwhile `tool.history-record-length` accepts either length and the decoder tolerates both |
 | The CICS region's code page and time zone (assumed `IBM037` and `UTC`) | Confirmation from the mainframe team. Both are `tool.*` properties, not constants, precisely so the answer is configuration rather than a code change |
+| Whether a deadlock or timeout reached the legacy caller as `-911` (unit of work already rolled back) or as `-913` (left open) | The `DROLLBACK` attribute of the region's `DB2CONN`/`DB2ENTRY` definition, which no file in the legacy module declares. Nothing here depends on the answer: this service runs one transaction per request and maps both codes' conditions to `503 DATASTORE_UNAVAILABLE` |
 | The rate-table column spelled `cyrrnbase` in the shipped DDL and `CURRNBASE` in the copybook and the program's `SELECT` | The column name in the real DB2 catalog. The export reader accepts either header meanwhile |
 | Spring Boot 3.3.x reached open-source end of life with 3.3.13 (June 2025), and 3.3 is the mandated line | A decision to stay on 3.3.13, adopt commercial support, or authorize a later minor line before production |
 | The estate's Azure module provisions PostgreSQL **12**, which is past community end of life; the schema is written to that floor and tested on `postgres:12.22-alpine` | The platform owners decide whether to raise the server version. Nothing in this module requires it |

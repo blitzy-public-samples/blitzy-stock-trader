@@ -24,6 +24,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.regex.Pattern;
 
+import org.hibernate.exception.ConstraintViolationException;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.context.properties.bind.Bindable;
@@ -53,19 +54,26 @@ import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.persistence.CashReser
 @Service
 public class RetailCashAccountService {
 
+    // The single authority for which codes this service accepts, declared once in application.yml and bound from
+    // there - never restated as a literal in this class. What it encodes is the ESTATE allowlist: the
+    // allowed_currencies CHECK the estate's own PostgreSQL initialization already enforces
+    // (infra/stocktrader-setup/azure/modules/postgres_init/init_schema.sql.tmpl:L7). Acceptance is deliberately not
+    // a promise of convertibility - the exchange-rate provider publishes a subset of it, and a code it does not
+    // publish surfaces as 503 EXCHANGE_RATE_UNAVAILABLE from the credit/debit path with the balance untouched,
+    // which is the loud failure the missing-rate row used to hide (CASH00.cbl:L214-L231). See application.yml.
     private static final String ACCEPTED_CURRENCIES_PROPERTY = "cashaccount.fx.accepted-currencies";
 
     private static final Pattern ISO_4217_CODE = Pattern.compile("^[A-Z]{3}$");
 
-    // The accepted set as shipped, so a context that binds no property sequence still refuses a code this service
-    // could never convert rather than storing it and discovering that later. Same 31 codes the estate already
-    // enforces through its allowed_currencies CHECK
-    // (infra/stocktrader-setup/azure/modules/postgres_init/init_schema.sql.tmpl:L7), which is also the set the rate
-    // provider serves.
-    private static final Set<String> DEFAULT_ACCEPTED_CURRENCIES = Set.of(
-            "AUD", "BGN", "BRL", "CAD", "CHF", "CNY", "CZK", "DKK", "EUR", "GBP", "HKD", "HUF", "IDR", "ILS", "INR",
-            "ISK", "JPY", "KRW", "MXN", "MYR", "NOK", "NZD", "PHP", "PLN", "RON", "SEK", "SGD", "THB", "TRY", "USD",
-            "ZAR");
+    /** The owner primary key as {@code schema/cash-account-schema.sql} names it, lower case for comparison. */
+    private static final String OWNER_PRIMARY_KEY = "pk_cash_account";
+
+    /** The name PostgreSQL generates for the same key when a schema is applied without naming the constraint. */
+    private static final String OWNER_PRIMARY_KEY_GENERATED_NAME = "cash_account_pkey";
+
+    // A bound rather than a while(true): an exception chain is finite in practice, and a cycle in one must not
+    // turn a rejected create into a hung request thread.
+    private static final int MAX_CAUSE_DEPTH = 10;
 
     private final CashAccountRepository accounts;
     private final CashReservationRepository reservations;
@@ -88,29 +96,29 @@ public class RetailCashAccountService {
      *                           property is written as a YAML sequence, which {@code @Value} cannot bind
      * @param self               this bean through its proxy, needed because {@code credit} and {@code debit} resolve
      *                           an exchange rate before their transaction opens and then call into it
+     * @throws IllegalStateException when {@code cashaccount.fx.accepted-currencies} names no usable code - no set
+     *                               is compiled into this class to stand in for it - or when {@code baseCurrency}
+     *                               is not one of the codes it names
      */
+    // THE ONLY CONSTRUCTOR, and deliberately so. A second, collaborator-assembling one used to sit beside this
+    // and accepted a null self, falling back to this - which quietly replaced the transactional proxy with the raw
+    // instance, so applyRateChangeLocked's @Transactional would never be applied and LedgerService's
+    // Propagation.MANDATORY append would throw on every credit and debit. Nothing in the module ever assembled
+    // this service by hand (the migration shadow comparator injects the bean like every other caller), so the
+    // safest shape is the one that cannot be misassembled: container injection only, with self required.
     @Autowired
     public RetailCashAccountService(CashAccountRepository accounts, CashReservationRepository reservations,
             LedgerService ledgerService, ExchangeRateSource exchangeRateSource,
             @Value("${cashaccount.fx.base-currency:USD}") String baseCurrency, Environment environment,
             @Lazy RetailCashAccountService self) {
 
-        this(accounts, reservations, ledgerService, exchangeRateSource, baseCurrency,
-                acceptedCurrenciesFrom(environment), self);
-    }
-
-    /** For a caller that assembles the collaborators itself and holds no {@link Environment}. */
-    public RetailCashAccountService(CashAccountRepository accounts, CashReservationRepository reservations,
-            LedgerService ledgerService, ExchangeRateSource exchangeRateSource, String baseCurrency,
-            Collection<String> acceptedCurrencies, RetailCashAccountService self) {
-
         this.accounts = requireCollaborator(accounts, "CashAccountRepository");
         this.reservations = requireCollaborator(reservations, "CashReservationRepository");
         this.ledgerService = requireCollaborator(ledgerService, "LedgerService");
         this.exchangeRateSource = requireCollaborator(exchangeRateSource, "ExchangeRateSource");
         this.baseCurrency = normalizeCode(baseCurrency);
-        this.acceptedCurrencies = normalizedCodes(acceptedCurrencies);
-        this.self = self == null ? this : self;
+        this.acceptedCurrencies = normalizedCodes(acceptedCurrenciesFrom(environment));
+        this.self = requireCollaborator(self, "RetailCashAccountService proxy");
 
         // A base currency outside the accepted set would make every cross-currency conversion unserviceable while
         // leaving same-currency traffic working, which is the kind of half-broken deployment that reaches production
@@ -186,9 +194,24 @@ public class RetailCashAccountService {
         // owner can both pass it. Flushing here turns the loser's primary-key collision into a
         // DataIntegrityViolationException at this line - the modern equivalent of the legacy INSERT's -803
         // (AAP 0.12.3) - instead of an opaque failure at commit, after this method has already returned 200.
+        // That collision only ever happens because domain/CashAccount declares a nullable @Version, which is what
+        // makes Spring Data INSERT a fresh account rather than merge it; a merge would have found the winner's row
+        // and overwritten it. The returned instance is the one the ledger row below describes, so the audit row
+        // can never describe a copy the database did not take.
         try {
-            accounts.saveAndFlush(account);
+            account = accounts.saveAndFlush(account);
         } catch (DataIntegrityViolationException cause) {
+            // Only the owner primary key is a duplicate account. cash_account also carries
+            // uq_cash_account_incarnation and three CHECK constraints
+            // (src/main/resources/schema/cash-account-schema.sql), and every one of those describes a defect in
+            // this service rather than a caller sending an owner that already exists - reporting one as
+            // 409 ACCOUNT_ALREADY_EXISTS would hand the caller a plausible, wrong explanation and hide it from
+            // whoever has to fix it. Anything else is therefore rethrown, and error/ApiExceptionHandler's
+            // catch-all renders it as 500 INTERNAL, which is what AAP 0.12.3 assigns to "any other negative
+            // SQLCODE".
+            if (!isOwnerPrimaryKeyCollision(cause)) {
+                throw cause;
+            }
             throw CashAccountException.forOwner(CashAccountErrorCode.ACCOUNT_ALREADY_EXISTS, normalizedOwner, null,
                     cause);
         }
@@ -357,6 +380,15 @@ public class RetailCashAccountService {
         // exception rolls the transaction back, so the balance is unchanged and no ledger row exists.
         Money after = Money.applyRateChecked(before, sign, rate, amount);
 
+        // A third refusal a caller can see on a credit, from the write below rather than from the arithmetic
+        // above: 422 AMOUNT_OUT_OF_RANGE when this new available balance PLUS the funds an institutional hold
+        // already reserved would leave the representable range, even though the new available balance is
+        // in range on its own. The ceiling has to bound the pair, because reserved funds must keep room to
+        // return when the reservation settles, releases or expires - see CashAccount.overwriteAvailableBalance
+        // for the full reasoning. The decision is not pre-checked here on purpose: it belongs to the entity
+        // every balance write funnels through, so retail, institutional and migration writes cannot disagree
+        // about it. The transaction rolls back exactly as above, leaving the balance and the ledger untouched.
+
         // The currency is deliberately untouched: the legacy credit and debit UPDATEs set BALANCE alone (L229,
         // L262), unlike the update paragraph which set both columns (L176-L177).
         account.overwriteAvailableBalance(after);
@@ -421,9 +453,9 @@ public class RetailCashAccountService {
     // because the legacy performed its rate SELECT unconditionally inside the SQLCODE = 0 branch (L214-L219,
     // L248-L253) and uniform 503 semantics are worth more than a saved call.
     //
-    // WHY THIS TRANSLATION LIVES HERE. ExchangeRateUnavailableException is deliberately not a CashAccountException
-    // and the fx package carries no HTTP taxonomy, so ApiExceptionHandler does not import it - the service layer
-    // owns the mapping. The legacy alternative is the defect being removed: a missing FRANKFURT1 row left SQLCODE
+    // WHY THIS TRANSLATION LIVES HERE. ExchangeRateUnavailableException is deliberately not a CashAccountException:
+    // it states that a rate could not be obtained, and which status that deserves is a decision about the request
+    // being served, so ApiExceptionHandler does not import it - the service layer owns the mapping. The legacy alternative is the defect being removed: a missing FRANKFURT1 row left SQLCODE
     // 100 on the inner SELECT, the following UPDATE reset it to 0, and the balance was committed using an
     // uninitialized RATES host variable, so the caller saw success over undefined arithmetic
     // (CASH00.cbl:L214-L231; backend/cash-account-cobol/COBOL/DCLFRANK.cpy:L22 declares RATES with no VALUE
@@ -515,39 +547,76 @@ public class RetailCashAccountService {
         }
     }
 
+    // WHICH INTEGRITY VIOLATION IS A DUPLICATE ACCOUNT, AND HOW THAT IS DECIDED. The violated constraint is taken
+    // from the Hibernate ConstraintViolationException inside the translated exception, because that is the only
+    // place the name survives as data rather than as prose; the translated message is read as a fallback for a
+    // provider that reports no name at all, where it is the single remaining piece of evidence. Both accepted
+    // spellings denote one constraint: pk_cash_account is what src/main/resources/schema/cash-account-schema.sql
+    // declares, and cash_account_pkey is the name PostgreSQL generates for an unnamed primary key, which a schema
+    // applied by some other tool would carry. Refusing to guess is the point - an unrecognized violation is
+    // rethrown, never dressed up as a condition the caller can act on.
+    private static boolean isOwnerPrimaryKeyCollision(DataIntegrityViolationException violation) {
+        Throwable cause = violation;
+        for (int depth = 0; cause != null && depth < MAX_CAUSE_DEPTH; depth++) {
+            if (cause instanceof ConstraintViolationException constraintViolation
+                    && namesOwnerPrimaryKey(constraintViolation.getConstraintName())) {
+                return true;
+            }
+            cause = cause.getCause() == cause ? null : cause.getCause();
+        }
+        return namesOwnerPrimaryKey(violation.getMessage());
+    }
+
+    private static boolean namesOwnerPrimaryKey(String constraintNameOrMessage) {
+        if (constraintNameOrMessage == null) {
+            return false;
+        }
+        String candidate = constraintNameOrMessage.toLowerCase(Locale.ROOT);
+        return candidate.contains(OWNER_PRIMARY_KEY) || candidate.contains(OWNER_PRIMARY_KEY_GENERATED_NAME);
+    }
+
     // Locale.ROOT, never the default locale: a Turkish-locale uppercase turns the "i" of ILS into a dotted capital
     // and silently corrupts the code.
     private static String normalizeCode(String code) {
         return code == null ? "" : code.trim().toUpperCase(Locale.ROOT);
     }
 
+    // No shipped copy of the set to fall back to, deliberately. application.yml is its single authority
+    // (cashaccount.fx.accepted-currencies, AAP 0.7.2's estate allowlist), and a second copy compiled in here
+    // would be the one actually enforced wherever the property failed to bind - so a deployment that narrowed
+    // the set would keep accepting the codes it had just excluded, with nothing to announce it. An absent or
+    // empty value is therefore a start-up failure naming the property, the same posture this constructor already
+    // takes to a base currency outside the set and DataSourceGuardConfig takes to JDBC_KIND.
     private static Set<String> normalizedCodes(Collection<String> codes) {
-        if (codes == null || codes.isEmpty()) {
-            return DEFAULT_ACCEPTED_CURRENCIES;
-        }
         Set<String> normalized = new LinkedHashSet<>();
-        for (String code : codes) {
-            String candidate = normalizeCode(code);
-            if (!candidate.isEmpty()) {
-                normalized.add(candidate);
+        if (codes != null) {
+            for (String code : codes) {
+                String candidate = normalizeCode(code);
+                if (!candidate.isEmpty()) {
+                    normalized.add(candidate);
+                }
             }
         }
-        return normalized.isEmpty() ? DEFAULT_ACCEPTED_CURRENCIES : Set.copyOf(normalized);
+        if (normalized.isEmpty()) {
+            throw new IllegalStateException(
+                    ACCEPTED_CURRENCIES_PROPERTY + " must name at least one currency code");
+        }
+        return Set.copyOf(normalized);
     }
 
     // Binder rather than @Value because the property is a YAML sequence, which @Value cannot bind; Binder also
     // accepts the comma-separated scalar form, so relaxed binding through an environment variable keeps working.
     // Reading it from the Environment rather than injecting the typed properties object is what keeps this package
     // free of the config package, which wires everything and is depended on by nothing (AAP 0.8.2) - the same
-    // approach FrankfurterExchangeRateClient takes to the same property. A non-configurable Environment cannot
-    // expose property sources at all, so that case takes the shipped set instead of failing start-up.
+    // approach FrankfurterExchangeRateClient takes to the same property.
     private static Set<String> acceptedCurrenciesFrom(Environment environment) {
         if (!(environment instanceof ConfigurableEnvironment)) {
-            return DEFAULT_ACCEPTED_CURRENCIES;
+            throw new IllegalStateException(ACCEPTED_CURRENCIES_PROPERTY
+                    + " cannot be read from a non-configurable Environment");
         }
-        return Binder.get(environment)
+        return normalizedCodes(Binder.get(environment)
                 .bind(ACCEPTED_CURRENCIES_PROPERTY, Bindable.setOf(String.class))
-                .orElse(DEFAULT_ACCEPTED_CURRENCIES);
+                .orElse(null));
     }
 
     private static <T> T requireCollaborator(T collaborator, String name) {

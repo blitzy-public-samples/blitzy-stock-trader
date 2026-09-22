@@ -211,6 +211,7 @@ public class MigrationToolRunner implements ApplicationRunner {
     record ToolInvocation(String command,
                           Path input,
                           UUID batchId,
+                          MigrationRun.RateSource rateSource,
                           Charset legacyCharset,
                           ZoneId legacyTimeZone,
                           Integer historyRecordLength) {
@@ -262,10 +263,12 @@ public class MigrationToolRunner implements ApplicationRunner {
         MigrationRun.Mode mode = modeOf(invocation.command());
         MigrationRun.CharacterizationStatus characterization = characterizationStatus();
 
+        // The canonical token rather than the raw property value, so a captured transcript names the source
+        // that was actually applied: the same canonicalization picked the delegate that prices the replay.
         LOGGER.info("Migration tooling command '{}' starting: mode={}, run={}, batch={}, input={},"
                         + " characterization={}, {}={}",
                 invocation.command(), mode, runId, invocation.batchId(), invocation.input(),
-                characterization, RATE_SOURCE_PROPERTY, rateSource);
+                characterization, RATE_SOURCE_PROPERTY, invocation.rateSource().token());
 
         MigrationRun run = MigrationRun.start(runId, invocation.batchId(), mode,
                 invocation.input().toString(), characterization);
@@ -288,7 +291,7 @@ public class MigrationToolRunner implements ApplicationRunner {
         } catch (RuntimeException e) {
             LOGGER.error("Migration tooling command '{}' failed for run {}; recording the run FAILED",
                     invocation.command(), runId, e);
-            recordFailure(runId);
+            recordFailure(run);
             return EXIT_ERROR;
         }
 
@@ -303,7 +306,7 @@ public class MigrationToolRunner implements ApplicationRunner {
                     reconciliations.countByRunIdAndStatus(runId, ReconciliationStatus.VARIANCE));
         } catch (RuntimeException e) {
             LOGGER.error("Could not read the variance rows of run {}; its verdict cannot be established", runId, e);
-            recordFailure(runId);
+            recordFailure(run);
             return EXIT_ERROR;
         }
 
@@ -316,9 +319,19 @@ public class MigrationToolRunner implements ApplicationRunner {
             run.finish(finalStatus, legacyRecordCount, migratedRecordCount, varianceCount);
             runs.save(run);
         } catch (RuntimeException e) {
+            // A RUN THAT CANNOT BE CLOSED IS CLOSED FAILED, NEVER LEFT RUNNING. The work and its findings
+            // committed, but nothing recorded that the invocation ended, and a RUNNING row is unsignable: the
+            // step's gate reads status and counts, so the row would sit in the batch looking like an
+            // invocation still in flight and a retry would be indistinguishable from a second concurrent one.
+            // FAILED with the counts and the evidence-derived variance count is the true statement - the
+            // command ran, its verdict could not be written - and the exit code stays 1 rather than 2, because
+            // 2 asserts a completed run whose verdict IS recorded. The findings stay readable under this
+            // run_id, and the retry is a new run_id under the same batch_id (AAP 0.6.3).
             LOGGER.error("Run {} completed with {} variance rows but its migration_run row could not be"
-                    + " closed; the row remains RUNNING and the step cannot be signed off", runId,
-                    varianceCount, e);
+                    + " closed; recording the run FAILED so the step is not left with an open row. The"
+                    + " findings of run {} remain readable and a retry is a new run under batch {}", runId,
+                    varianceCount, runId, invocation.batchId(), e);
+            recordFailure(run);
             return EXIT_ERROR;
         }
 
@@ -357,18 +370,45 @@ public class MigrationToolRunner implements ApplicationRunner {
         }
     }
 
-    /** Re-reads the run row and closes it {@code FAILED}, so a lost command still leaves its evidence. */
-    private void recordFailure(UUID runId) {
-        // A FRESH READ IN A NEW TRANSACTION. The command's own transaction has rolled back, so the instance
-        // this class holds may carry counts that never reached the database; the row must describe what
-        // actually committed. The counts already on the row are preserved rather than zeroed, because a
-        // partially reported run is evidence and a zeroed one is a claim.
+    /**
+     * Re-reads the run row and closes it {@code FAILED} with the progress and the findings that survived, so
+     * a lost command still leaves usable evidence.
+     *
+     * @param attempted the instance the lost command was mutating; its counts are the only statement of how
+     *                  far the command got
+     */
+    private void recordFailure(MigrationRun attempted) {
+        UUID runId = attempted.runId();
+
+        // THE FINDINGS DECIDE THE FAILED ROW'S VARIANCE COUNT, NOT THE INSTANCE THAT DIED. What survives a
+        // failure differs by mode, and reading the rows is correct in both. A shadow window suspends any
+        // ambient transaction (ShadowComparator.compare is Propagation.NOT_SUPPORTED), so each of its findings
+        // commits on its own and a window that dies late leaves them in the table while the counts it had not
+        // yet assigned are still zero; closing the row with that zero would tell the operator who signs off
+        // runbook Step 2 that the attempt found nothing, with its findings sitting under the same run_id - the
+        // one reading of the evidence that the evidence itself contradicts (AAP 0.6.5). A load and a reconcile
+        // are each a single transaction (LegacyLoader.load, ReconciliationService.reconcile), so their
+        // findings roll back with the work and the same read then yields zero, which is equally the truth.
+        Integer varianceCountFromEvidence = persistedVarianceCount(runId);
+
+        // A FRESH READ IN A NEW TRANSACTION. The command's own transaction has rolled back, so the row is what
+        // describes the state that committed; the progress the lost instance reported is then merged in rather
+        // than replacing it, and recordProgress only ever raises a count (a partially reported run is
+        // evidence, a zeroed one is a claim).
         try {
             runs.findById(runId).ifPresentOrElse(failed -> {
-                failed.finish(MigrationRun.Status.FAILED, failed.legacyRecordCount(),
-                        failed.migratedRecordCount(), failed.varianceCount());
+                failed.recordProgress(attempted.legacyRecordCount(), attempted.migratedRecordCount());
+                failed.fail(varianceCountFromEvidence != null
+                        ? varianceCountFromEvidence
+                        // Only when the findings could not be read at all: the greater of the two recorded
+                        // counts, which is the most the run is known to have reported.
+                        : Math.max(failed.varianceCount(), attempted.varianceCount()));
                 runs.save(failed);
-                LOGGER.info("Migration tooling run {} recorded FAILED", runId);
+                LOGGER.info("Migration tooling run {} recorded FAILED: legacy={}/migrated={}/variances={}"
+                                + " (variance count {})", runId, failed.legacyRecordCount(),
+                        failed.migratedRecordCount(), failed.varianceCount(),
+                        varianceCountFromEvidence != null ? "read back from the persisted findings"
+                                : "carried over; the findings could not be read");
             }, () -> LOGGER.error("Migration tooling run {} failed and its migration_run row is absent;"
                     + " the attempt has no recorded evidence", runId));
         } catch (RuntimeException e) {
@@ -376,6 +416,25 @@ public class MigrationToolRunner implements ApplicationRunner {
             // datastore that cannot accept this update is exactly the case where the original failure - which
             // has been logged with its stack - is the one an operator has to act on.
             LOGGER.error("Could not record migration tooling run {} as FAILED", runId, e);
+        }
+    }
+
+    /**
+     * The number of {@code VARIANCE} rows persisted under {@code runId}, or {@code null} when they cannot be
+     * read.
+     */
+    // Separated from the close above, and null-returning rather than throwing, because this runs on a path
+    // that is ALREADY handling a failure - including the one case where the same query has just failed. A
+    // second exception here would replace the original, logged failure with a less informative one and would
+    // cost the row its FAILED status as well.
+    private Integer persistedVarianceCount(UUID runId) {
+        try {
+            return Math.toIntExact(
+                    reconciliations.countByRunIdAndStatus(runId, ReconciliationStatus.VARIANCE));
+        } catch (RuntimeException e) {
+            LOGGER.warn("Could not read the persisted findings of run {} while recording it FAILED; its"
+                    + " variance count is carried over instead of derived: {}", runId, e.getMessage());
+            return null;
         }
     }
 
@@ -409,6 +468,7 @@ public class MigrationToolRunner implements ApplicationRunner {
         return new ToolInvocation(requestedCommand,
                 inputDirectory,
                 requireBatchId(),
+                requireRateSource(),
                 requireLegacyCharset(),
                 requireLegacyTimeZone(),
                 requireHistoryRecordLength(requestedCommand, inputDirectory));
@@ -513,6 +573,22 @@ public class MigrationToolRunner implements ApplicationRunner {
                     + " be recorded as '" + parsed + "', which no longer matches the value you passed");
         }
         return parsed;
+    }
+
+    private MigrationRun.RateSource requireRateSource() {
+        // VALIDATED HERE TOO, AND CANONICALIZED ONLY ONCE. MigrationRun.RateSource.of is the single reading of
+        // tool.rate-source in this module: the two classifiers that decide whether a difference may be
+        // attributed to the exchange rate hold the same type, and the delegate that prices the replay is
+        // selected from it, so no part of a run can be operating on a different understanding of the value
+        // than the log line records. Checking it among the arguments is what turns a misspelling into this
+        // class's ordinary argument error with the accepted tokens named, alongside the charset and time-zone
+        // checks; the tool profile's own rate-source bean refuses to start on the same value, so in practice
+        // whichever fires first refuses the same invocation.
+        try {
+            return MigrationRun.RateSource.of(rateSource);
+        } catch (IllegalStateException e) {
+            throw argumentError(e.getMessage());
+        }
     }
 
     private Charset requireLegacyCharset() {

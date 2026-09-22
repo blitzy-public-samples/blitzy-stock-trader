@@ -115,4 +115,48 @@ public record ReservationResponse(
                 reservation.createdAt(),
                 reservation.updatedAt());
     }
+
+    /*
+     * WHY A REPLAY IS NOT RENDERED BY from(...) ABOVE. A replayed hold must answer with the body the original
+     * call answered (AAP 0.6.2, 0.7.3): the caller is retrying one request and is owed one answer, whatever has
+     * happened to the reservation since. from(...) projects the row as it stands, so once the hold has been
+     * settled, released or expired it would report a terminal state, a settled amount and a later updatedAt -
+     * a different answer to the same request, and one a retrying client could read as its hold having been
+     * created in that state. Current state has its own endpoint, GET /cash-account/institutional/reservations/
+     * {reservationId}, and that is where a caller asking "what is it now" is served.
+     *
+     * WHY RECONSTRUCTING IS EXACT RATHER THAN APPROXIMATE, AND WHY NO SNAPSHOT COLUMN EXISTS. Of the ten
+     * components, only three can differ from their creation values, because cash_reservation has exactly three
+     * mutable columns: state, settled_amount and updated_at (domain/CashReservation declares every other
+     * column updatable = false, and expires_at is assigned in newHold and nowhere else). Their creation values
+     * are not guesses: newHold sets state HELD, leaves settled_amount null, and stamps created_at and
+     * updated_at from one normalized instant, so updated_at at creation IS created_at. The remaining seven
+     * components are read from columns no code path can change. Storing a serialized copy of the first
+     * response would add a column AAP 0.6.3 does not enumerate - and ddl-auto=validate makes the entity and
+     * schema/cash-account-schema.sql one contract - to hold values the row already determines.
+     */
+    /**
+     * Renders {@code reservation} as the body its creating hold returned, whatever state it has reached since.
+     *
+     * @param reservation the stored reservation a repeated {@code Idempotency-Key} resolved to
+     * @return that reservation as it was first reported: state {@code HELD}, no settled amount
+     * @throws IllegalArgumentException if {@code reservation} is null, which is a wiring defect rather than a
+     *         request condition and so carries no {@code CashAccountErrorCode}
+     */
+    public static ReservationResponse originalHold(CashReservation reservation) {
+        if (reservation == null) {
+            throw new IllegalArgumentException("reservation is required");
+        }
+        return new ReservationResponse(
+                reservation.reservationId(),
+                reservation.owner(),
+                reservation.orderReference(),
+                reservation.amount().amount(),
+                null,
+                reservation.currency(),
+                ReservationState.HELD,
+                reservation.expiresAt(),
+                reservation.createdAt(),
+                reservation.createdAt());
+    }
 }

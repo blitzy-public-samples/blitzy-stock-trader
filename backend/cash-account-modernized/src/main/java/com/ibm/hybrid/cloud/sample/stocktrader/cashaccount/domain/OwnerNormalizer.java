@@ -29,6 +29,11 @@ public final class OwnerNormalizer {
     // [backend/cash-account-cobol/DB2-DDL/DB2DDL.jcl:L47] - and it is the width of every owner column in
     // schema/cash-account-schema.sql. Stating the bound once here means the entities' @Column(length = 32)
     // can be reviewed against a single constant rather than four independent literals.
+    //
+    // The unit is Unicode code points, because that is the unit the destination column counts in: PostgreSQL
+    // measures character varying in characters, so an owner of 32 supplementary code points (64 UTF-16 units,
+    // 128 UTF-8 bytes) fits VARCHAR(32) and 33 of them do not. Counting anything else here would put this
+    // class and the column into disagreement in one direction or the other.
     public static final int MAX_LENGTH = 32;
 
     private OwnerNormalizer() {
@@ -38,9 +43,10 @@ public final class OwnerNormalizer {
      * Returns the canonical stored form of {@code raw}: stripped and upper-cased.
      *
      * @param raw the owner exactly as it arrived from a caller, an export row or a replay stream
-     * @return the canonical owner, 1 to {@value #MAX_LENGTH} characters, upper case
+     * @return the canonical owner, 1 to {@value #MAX_LENGTH} Unicode code points, upper case
      * @throws CashAccountException with {@link CashAccountErrorCode#INVALID_OWNER} (HTTP 400) when
-     *         {@code raw} is null, blank, or longer than {@value #MAX_LENGTH} characters once stripped
+     *         {@code raw} is null, blank, or whose canonical form exceeds {@value #MAX_LENGTH} Unicode
+     *         code points once stripped and upper-cased
      */
     public static String normalize(String raw) {
         // Null carries no value worth echoing back, so the code travels without an owner field; the
@@ -58,16 +64,6 @@ public final class OwnerNormalizer {
             throw CashAccountException.forOwner(CashAccountErrorCode.INVALID_OWNER, raw);
         }
 
-        // Rejecting instead of truncating is a deliberate change from the legacy program: the 15-character
-        // limit was purely a COMMAREA artifact - WS-NAME was PIC X(15) [CASH00.cbl:L55] while the host variable
-        // it fed was PIC X(32) [CASH00.cbl:L36] and the column was CHAR(32) - so a longer name was silently cut
-        // at the interface boundary and two owners sharing a 15-character prefix collapsed into one account with
-        // nothing reporting it. Silent truncation is data loss; 400 INVALID_OWNER makes it visible. The length is
-        // measured after stripping so that a full-width owner padded with spaces is accepted rather than refused.
-        if (stripped.length() > MAX_LENGTH) {
-            throw CashAccountException.forOwner(CashAccountErrorCode.INVALID_OWNER, raw);
-        }
-
         // Upper case is the legacy storage form, not an invention: the insert stored UPPER(:CUST-NAME-TEXT)
         // [CASH00.cbl:L155] and every lookup folded case - LOWER(Owner) = LOWER(:CUST-NAME-TEXT) on read and
         // delete [CASH00.cbl:L141], UPPER(Owner) = UPPER(:CUST-NAME-TEXT) on update [CASH00.cbl:L178]. Folding
@@ -80,6 +76,37 @@ public final class OwnerNormalizer {
         // Locale.ROOT, never the no-argument toUpperCase(): under a Turkish default locale that maps "i" to
         // U+0130 (dotted capital I), which would put a non-ASCII character into a primary key and make identity
         // depend on the JVM's locale - the same owner normalizing two ways in two pods.
-        return stripped.toUpperCase(Locale.ROOT);
+        String canonical = stripped.toUpperCase(Locale.ROOT);
+
+        // Rejecting instead of truncating is a deliberate change from the legacy program: the 15-character
+        // limit was purely a COMMAREA artifact - WS-NAME was PIC X(15) [CASH00.cbl:L55] while the host variable
+        // it fed was PIC X(32) [CASH00.cbl:L36] and the column was CHAR(32) - so a longer name was silently cut
+        // at the interface boundary and two owners sharing a 15-character prefix collapsed into one account with
+        // nothing reporting it. Silent truncation is data loss; 400 INVALID_OWNER makes it visible.
+        //
+        // What is measured is the canonical form - after the strip AND after the case fold - counted in code
+        // points. Each of those three details changes the outcome for inputs that actually occur.
+        //
+        // After the fold, because folding is one-to-many: "a" x31 followed by U+00DF folds to 33 characters,
+        // U+FB01 folds to two and U+0390 to three. Bounding the pre-fold value returns an owner longer than the
+        // VARCHAR(32) column holds and, worse, one this very method rejects - a non-idempotent fold, which every
+        // caller that re-normalizes an already-normalized owner (CashAccount.create, LedgerEntry, LedgerService,
+        // the loader, the reconciler) then trips over, rejecting late and reporting the folded value rather than
+        // what the caller actually sent.
+        //
+        // In code points, because that is the destination column's unit: a supplementary code point costs two
+        // UTF-16 units but one character, so counting units refuses an owner of 32 characters that the column
+        // stores without complaint.
+        //
+        // After the strip, which is what keeps a full-width owner still carrying the blank padding of a CHAR(32)
+        // export column acceptable rather than refused for the width of its padding.
+        //
+        // One check suffices, and it is deliberately the post-fold one: case folding never lowers the code-point
+        // count, so any input the pre-fold value would have failed on fails here too.
+        if (canonical.codePointCount(0, canonical.length()) > MAX_LENGTH) {
+            throw CashAccountException.forOwner(CashAccountErrorCode.INVALID_OWNER, raw);
+        }
+
+        return canonical;
     }
 }

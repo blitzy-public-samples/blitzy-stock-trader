@@ -19,11 +19,19 @@ package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.fx;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
 
+import java.io.IOException;
 import java.math.BigDecimal;
 import java.net.URI;
+import java.util.List;
+import java.util.Set;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.springframework.boot.context.properties.bind.Bindable;
+import org.springframework.boot.context.properties.bind.Binder;
+import org.springframework.boot.context.properties.source.ConfigurationPropertySources;
+import org.springframework.boot.env.YamlPropertySourceLoader;
+import org.springframework.core.env.PropertySource;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
@@ -86,6 +94,30 @@ class CurrencyConversionTest {
         server = MockRestServiceServer.bindTo(builder).bufferContent().build();
         client = new FrankfurterExchangeRateClient(builder.build(), FX_URL,
                 properties.getFx().getAcceptedCurrencies());
+    }
+
+    @Test
+    void shippedAcceptedCurrencySetMatchesTheConfiguredAuthority() {
+        // cashaccount.fx.accepted-currencies in application.yml is the single authority every consumer binds;
+        // config/CashAccountProperties keeps a compiled-in copy only so that a context binding no property source
+        // still yields a fully populated, validated object. A copy nobody compares is a copy that drifts, and the
+        // drift would be invisible: the deployment would enforce the file while every such context enforced the
+        // literal. Binder is used exactly as the consumers use it, so this also pins the property's SHAPE - a
+        // YAML sequence that only Binder can aggregate, which is why no consumer may bind it with @Value.
+        Set<String> configured = new Binder(ConfigurationPropertySources.from(applicationYamlPropertySource()))
+                .bind("cashaccount.fx.accepted-currencies", Bindable.setOf(String.class))
+                .orElseThrow(() -> new AssertionError(
+                        "application.yml declares no cashaccount.fx.accepted-currencies"));
+
+        assertThat(new CashAccountProperties().getFx().getAcceptedCurrencies())
+                .as("the compiled-in default and application.yml's list are one policy or they are a defect")
+                .containsExactlyInAnyOrderElementsOf(configured);
+
+        // The estate allowlist of AAP 0.7.2, whose provenance is the allowed_currencies CHECK at
+        // infra/stocktrader-setup/azure/modules/postgres_init/init_schema.sql.tmpl:L7 - and NOT the set the rate
+        // provider serves, which omits BGN. BGN is named here so that removing it from the shipped policy has to
+        // be a deliberate act with this test's reasoning in front of whoever does it.
+        assertThat(configured).hasSize(31).contains("BGN", "USD", "EUR", "GBP");
     }
 
     @Test
@@ -241,6 +273,23 @@ class CurrencyConversionTest {
             URI uri = request.getURI();
             assertThat(uri.getScheme() + "://" + uri.getAuthority() + uri.getPath()).isEqualTo(FX_URL);
         };
+    }
+
+    // The shipped application.yml itself, loaded with Spring Boot's own YAML loader rather than re-typed here:
+    // a hand-written copy of the list would be a third declaration of the very policy this test exists to keep
+    // single. It FAILS and never skips when the file or the key is absent, because either would mean the
+    // authority the running service binds does not exist.
+    private static PropertySource<?> applicationYamlPropertySource() {
+        ClassPathResource applicationYaml = new ClassPathResource("application.yml");
+        assertThat(applicationYaml.exists()).as("src/main/resources/application.yml on the test classpath").isTrue();
+        try {
+            List<PropertySource<?>> sources =
+                    new YamlPropertySourceLoader().load("application.yml", applicationYaml);
+            assertThat(sources).as("YAML documents in application.yml").hasSize(1);
+            return sources.get(0);
+        } catch (IOException unreadable) {
+            throw new AssertionError("application.yml could not be read", unreadable);
+        }
     }
 
     // Served straight from the classpath resource: the recorded body is replayed byte for byte, so no string

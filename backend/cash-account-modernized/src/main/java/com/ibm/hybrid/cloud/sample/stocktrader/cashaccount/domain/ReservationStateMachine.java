@@ -179,10 +179,14 @@ public final class ReservationStateMachine {
         // Lazy expiry first, so an overdue hold is resolved by the request that touched it rather than waiting
         // for the sweep. Evaluation then continues from EXPIRED, which rejects a settle.
         //
-        // The consequence is deliberate and must not be worked around: CashAccountException is unchecked, so
-        // the service's @Transactional rolls back and this expiry write is discarded together with the 409.
-        // That is correct - the caller is told its settle failed, and nothing half-applied survives - and it is
-        // self-healing, because the @Scheduled sweep expires the row on its next pass.
+        // The expiry write is NOT lost to that rejection, and the arrangement that saves it lives in
+        // institutional/ReservationService: it applies the expiry under the account lock, commits it together
+        // with its EXPIRY ledger row, and raises the 409 only after that transaction has committed - so the
+        // row every transition is required to leave behind survives the refusal. Because the service expires
+        // a lapsed hold before it ever calls this method, the branch below is unreachable from the request
+        // path; it stays because this class must answer correctly for any caller, including a unit test, and
+        // because a caller that has not committed the expiry itself must still be refused rather than allowed
+        // to commit funds a lapsed hold has already handed back.
         if (!expire(account, reservation, now).idempotentNoOp()) {
             throw CashAccountException.forReservation(CashAccountErrorCode.INVALID_TRANSITION,
                     reservation.reservationId());
@@ -219,8 +223,9 @@ public final class ReservationStateMachine {
         // Lazy expiry first, as for a settle - but here the expiry is the answer rather than a rejection, so
         // its Effect is returned intact and its EXPIRY row is appended and committed. The asymmetry is the
         // whole point: a release and an expiry move the money the same way, so the caller's intent is already
-        // satisfied and there is nothing to refuse. A settle cannot say that, which is why its expiry is lost
-        // to the rollback that carries its 409.
+        // satisfied and there is nothing to refuse, whereas a settle cannot commit funds a lapsed hold has
+        // already handed back. Both outcomes commit either way - the service holds them in the one
+        // transaction it locked the account in, and only the settle's refusal is raised after it.
         Effect expiry = expire(account, reservation, now);
         if (!expiry.idempotentNoOp()) {
             return expiry;
@@ -271,12 +276,86 @@ public final class ReservationStateMachine {
 
         Money amount = reservation.amount();
         Money newReserved = reservedAfterReleasing(account, amount);
-        Money newAvailable = account.availableBalance().plus(amount);
+        Money newAvailable = availableAfterCrediting(account, amount);
 
         account.moveBalances(newAvailable, newReserved);
         reservation.applyTransition(ReservationState.EXPIRED, null);
         return new Effect(ReservationState.EXPIRED, newAvailable, newReserved,
                 List.of(new LedgerEffect(LedgerEventType.EXPIRY, amount)), false);
+    }
+
+    /*
+     * WHY THE TWO METHODS BELOW TAKE NO ACCOUNT. cash_reservation carries no foreign key and its rows are
+     * retained after a retail DELETE (AAP 0.11.1), so a settled, released or expired reservation legitimately
+     * outlives the account row it names - and its outcome moves no money, so no account and no lock are
+     * needed to decide it. They exist so that institutional/ReservationService can answer such a call without
+     * demanding a row that may be gone, while the (state, command) table stays in this one class: the
+     * decisions they take are exactly the terminal arms of settle and release above, with the mutating HELD
+     * arm excluded rather than reimplemented.
+     */
+    /**
+     * Decides a settle on an already-terminal reservation, without the account row.
+     *
+     * <p>Returns for {@code SETTLED}, the idempotent no-op the contract answers {@code 200} with; refuses
+     * {@code RELEASED} and {@code EXPIRED} exactly as {@link #settle} refuses them. Nothing is mutated and no
+     * ledger row is named, because a terminal settle moves no money.</p>
+     *
+     * @param reservation a reservation in one of the three terminal states
+     * @throws CashAccountException {@link CashAccountErrorCode#INVALID_TRANSITION} from {@code RELEASED} or
+     *         {@code EXPIRED}
+     * @throws IllegalArgumentException when the reservation is still {@code HELD}, which moves money and so
+     *         must go through {@link #settle} with the account locked
+     */
+    public static void settleFromTerminal(CashReservation reservation) {
+        requireReservation(reservation);
+
+        boolean refused = switch (reservation.state()) {
+            case SETTLED -> false;
+            // Both have already returned the held funds to available, so a settle has nothing left to commit.
+            case RELEASED, EXPIRED -> true;
+            case HELD -> throw heldNeedsTheAccount(reservation, "settled");
+        };
+        if (refused) {
+            throw CashAccountException.forReservation(CashAccountErrorCode.INVALID_TRANSITION,
+                    reservation.reservationId());
+        }
+    }
+
+    /**
+     * Decides a release on an already-terminal reservation, without the account row.
+     *
+     * <p>Returns for {@code RELEASED} and {@code EXPIRED}, both of which already have the funds where a
+     * release would put them; refuses {@code SETTLED} exactly as {@link #release} refuses it.</p>
+     *
+     * @param reservation a reservation in one of the three terminal states
+     * @throws CashAccountException {@link CashAccountErrorCode#INVALID_TRANSITION} from {@code SETTLED}
+     * @throws IllegalArgumentException when the reservation is still {@code HELD}, which moves money and so
+     *         must go through {@link #release} with the account locked
+     */
+    public static void releaseFromTerminal(CashReservation reservation) {
+        requireReservation(reservation);
+
+        boolean refused = switch (reservation.state()) {
+            case RELEASED, EXPIRED -> false;
+            // Settled funds have left the account for good, so a release has nothing to give back.
+            case SETTLED -> true;
+            case HELD -> throw heldNeedsTheAccount(reservation, "released");
+        };
+        if (refused) {
+            throw CashAccountException.forReservation(CashAccountErrorCode.INVALID_TRANSITION,
+                    reservation.reservationId());
+        }
+    }
+
+    /*
+     * A defect in the caller's routing rather than a caller condition: a HELD reservation is the one state
+     * from which money moves, so it must be reached through settle or release with the account locked. It is
+     * reported the way every other pairing defect in this class is, and the handler's catch-all renders it as
+     * 500 INTERNAL instead of dressing a bug up as a 4xx a caller could act on.
+     */
+    private static IllegalArgumentException heldNeedsTheAccount(CashReservation reservation, String verb) {
+        return new IllegalArgumentException("reservation " + reservation.reservationId()
+                + " is HELD and can only be " + verb + " with its account locked");
     }
 
     private static Effect settleHeld(CashAccount account, CashReservation reservation, Money settleAmount) {
@@ -297,11 +376,11 @@ public final class ReservationStateMachine {
 
         Money remainder = held.minus(settled);
         Money newReserved = reservedAfterReleasing(account, held);
-        // The remainder can only re-enter available funds up to the NUMERIC(9,2) ceiling: a credit taken while
-        // the funds were held can leave no room for them to return, and Money.plus then raises
-        // AMOUNT_OUT_OF_RANGE (422) rather than storing a truncated balance the way the legacy program did
-        // (CASH00.cbl:L17). Widening that ceiling is a recorded open item, not a decision this class makes.
-        Money newAvailable = account.availableBalance().plus(remainder);
+        // The remainder always has room to return: CashAccount bounds available + reserved on every write, so
+        // available + remainder <= available + reserved <= Money.MAX_VALUE however large a credit was taken
+        // while the funds were held. A credit that would have filled that room was refused at the time with
+        // 422 AMOUNT_OUT_OF_RANGE instead of being allowed to strand this hold.
+        Money newAvailable = availableAfterCrediting(account, remainder);
 
         account.moveBalances(newAvailable, newReserved);
         reservation.applyTransition(ReservationState.SETTLED, settled);
@@ -319,7 +398,7 @@ public final class ReservationStateMachine {
     private static Effect releaseHeld(CashAccount account, CashReservation reservation) {
         Money amount = reservation.amount();
         Money newReserved = reservedAfterReleasing(account, amount);
-        Money newAvailable = account.availableBalance().plus(amount);
+        Money newAvailable = availableAfterCrediting(account, amount);
 
         account.moveBalances(newAvailable, newReserved);
         reservation.applyTransition(ReservationState.RELEASED, null);
@@ -341,6 +420,32 @@ public final class ReservationStateMachine {
         } catch (CashAccountException underflow) {
             throw new IllegalStateException("reserved balance " + account.reservedBalance() + " of account "
                     + account.owner() + " is short of the held amount " + amount, underflow);
+        }
+    }
+
+    /*
+     * The available-side counterpart of reservedAfterReleasing, shared by the settle, release and expiry
+     * credit-backs, and there for the same reason: this addition cannot legitimately be refused, so a refusal
+     * is a defect report rather than a caller-facing 422.
+     *
+     * CashAccount bounds available + reserved on every write, so for any row this application created
+     * available + amount <= available + reserved <= Money.MAX_VALUE whenever amount is money this class
+     * reserved - which is the only amount any of the three callers passes. An AMOUNT_OUT_OF_RANGE here
+     * therefore means the pair was written past the ceiling by something outside the application: a psql
+     * UPDATE, or a row stored before that guard existed. Reporting it as a 422 would tell an institutional
+     * caller its perfectly valid release lacked range over an amount it never chose, and would leave the hold
+     * with no reachable terminal state at all (AAP 0.6.3) - money stuck in reserved_balance and retail
+     * PUT/DELETE refused for as long as the row exists. It is re-reported as the defect it is instead, naming
+     * the owner, both balances and the amount so the offending row can be found and corrected. Widening the
+     * ceiling is a recorded open item (AAP 0.11.2), not a decision this class makes.
+     */
+    private static Money availableAfterCrediting(CashAccount account, Money amount) {
+        try {
+            return account.availableBalance().plus(amount);
+        } catch (CashAccountException overflow) {
+            throw new IllegalStateException("available balance " + account.availableBalance() + " of account "
+                    + account.owner() + " cannot take back " + amount + " with " + account.reservedBalance()
+                    + " still reserved", overflow);
         }
     }
 
@@ -374,6 +479,13 @@ public final class ReservationStateMachine {
     private static void requirePair(CashAccount account, CashReservation reservation) {
         if (account == null || reservation == null) {
             throw new IllegalArgumentException("account and reservation are required");
+        }
+    }
+
+    /* The account-free decisions have only the reservation to check, and a null of it is the same defect. */
+    private static void requireReservation(CashReservation reservation) {
+        if (reservation == null) {
+            throw new IllegalArgumentException("reservation is required");
         }
     }
 }

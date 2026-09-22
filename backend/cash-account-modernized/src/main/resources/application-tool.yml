@@ -104,6 +104,13 @@ tool:
   # individual row still looked plausible.
   legacy-timezone: UTC
 
+  # NOT A tool.* KEY, AND DELIBERATELY SO. The chunk size a bulk load and a bulk reconcile flush by lives
+  # at cashaccount.migration.batch-chunk-size in application.yml, beside the JDBC batch size it has to
+  # match. MigrationToolRunner rejects any tool.* command-line option outside the seven it declares, so a
+  # tuning knob added to this namespace could never be passed on the command line — the one place an
+  # operator sizing a migration window would reach for it. Override it per invocation with
+  # --cashaccount.migration.batch-chunk-size=<rows>, which the runner's typo guard leaves alone.
+
   # Intentionally empty: the one value in this file whose absence of a default IS the requirement.
   # CASH00 writes 57 bytes — the accumulated width of WS-VSAM-RECORD
   # (backend/cash-account-cobol/COBOL/CASH00.cbl:L38-L45), passed as LENGTH OF WS-VSAM-RECORD at L128 —

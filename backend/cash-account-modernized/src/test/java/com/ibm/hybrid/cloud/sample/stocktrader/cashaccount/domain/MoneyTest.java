@@ -183,6 +183,25 @@ class MoneyTest {
                 .isEqualTo(CashAccountErrorCode.INVALID_AMOUNT);
 
         /*
+         * The sub-cent case is what distinguishes judging the sign before scaling from scaling first, which
+         * -0.01 alone cannot: -0.001 truncates DOWN to 0.00, so an implementation that normalized before
+         * judging the sign would accept it as a legal zero - a retail debit answering 200 with a zero-amount
+         * ledger row, and a settle read as the zero settlement that consumes nothing and releases the whole
+         * hold. Both factories are asserted because of(String) has to inherit the decision through its
+         * delegation rather than repeat it. The last assertion is the other half of the ordering: once the
+         * sign has been judged on the value as written, scaling still happens and still truncates DOWN.
+         */
+        assertThatThrownBy(() -> Money.of(new BigDecimal("-0.001")))
+                .isInstanceOf(CashAccountException.class)
+                .extracting(rejection -> ((CashAccountException) rejection).errorCode())
+                .isEqualTo(CashAccountErrorCode.INVALID_AMOUNT);
+        assertThatThrownBy(() -> Money.of("-0.001"))
+                .isInstanceOf(CashAccountException.class)
+                .extracting(rejection -> ((CashAccountException) rejection).errorCode())
+                .isEqualTo(CashAccountErrorCode.INVALID_AMOUNT);
+        assertThat(Money.of("0.001").amount()).isEqualTo(new BigDecimal("0.00"));
+
+        /*
          * Deliberate deviation, not a parity gap (AAP 0.4.6, 0.6.2): WS-CALC is unsigned (CASH00.cbl:L17),
          * so a debit larger than the balance did not fail at L255-L256 - it committed a positive balance
          * equal to the magnitude of the overdraft. The replacement rejects it with INSUFFICIENT_FUNDS and

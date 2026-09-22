@@ -17,13 +17,17 @@
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.migration;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.fail;
+import static org.assertj.core.api.Assertions.tuple;
 import static org.assertj.core.api.SoftAssertions.assertSoftly;
 
+import java.io.IOException;
 import java.math.BigDecimal;
 import java.net.URISyntaxException;
 import java.net.URL;
 import java.nio.charset.Charset;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.ZoneId;
@@ -35,10 +39,11 @@ import java.util.UUID;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.autoconfigure.actuate.observability.AutoConfigureObservability;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.test.context.TestPropertySource;
 
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.domain.CashAccount;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.domain.LedgerEventType;
@@ -47,9 +52,9 @@ import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.migration.reconcile.L
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.migration.reconcile.LegacyRateTable;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.migration.reconcile.MigrationRun;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.persistence.CashAccountRepository;
-import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.persistence.LegacyHistoryRepository;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.persistence.LegacyRateTableRepository;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.persistence.MigrationRunRepository;
+import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.support.LegacyHistoryTestQueries;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.support.PostgresTestSupport;
 
 /** Proves {@code LegacyLoader} applies the matched fixture export and that its two history shapes decode identically (AAP 0.10.3). */
@@ -67,13 +72,18 @@ import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.support.PostgresTestS
  * itself - open a run, load, close the run - and asserts the exit code as the persisted state the runner maps
  * to it (CLEAN with no variance is exit 0; variance is 2 and a failure is 1), never by invoking the runner.
  */
+// No web layer is needed: this test drives the service layer directly.
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE)
-// No web layer is needed: this test drives the service layer directly. Metrics export is switched off by
-// Boot's test observability customizer, which would leave config/MetricsScrapeController without the
-// PrometheusMeterRegistry its constructor requires and fail the whole context - a bean this test never calls
-// but one that is component-scanned regardless, so the annotation is load-bearing rather than decorative.
-@AutoConfigureObservability
+// The chunk size a load applies and stages by, forced to a value several times smaller than every count this
+// class asserts. That is what makes the assertions below evidence of bounded-ness as well as of correctness: the
+// six owners, the three rate rows and the eight history rows each cross several chunk boundaries, so a flush and
+// clear that lost, duplicated or reordered a row would show up as a wrong count or a missing account here rather
+// than only under a production-sized export no test can ship (AAP 0.10.3 fixtures only).
+@TestPropertySource(properties = "cashaccount.migration.batch-chunk-size=" + LoaderIT.FORCED_CHUNK_SIZE)
 class LoaderIT extends PostgresTestSupport {
+
+    /** Package-private so the annotation above and the guard below read one declaration of the forced size. */
+    static final String FORCED_CHUNK_SIZE = "2";
 
     private static final String MATCHED_FIXTURES = "/fixtures/legacy-export/matched";
 
@@ -104,6 +114,15 @@ class LoaderIT extends PostgresTestSupport {
 
     private static final int EXPECTED_HISTORY_ROWS = 8;
 
+    // The single stamp the fixture gives BOTH of JOHN's history rows, date and time alike. It is shared on
+    // purpose: the 29-byte KSDS key is name + date + time (CASH00.cbl:L47-L50; KEYS(29 0), DEFKSDS.jcl:L14),
+    // so holding the stamp identical leaves the raw name as the only field separating the two keys, and the
+    // assertion below then fails if a load ever folds the casing. Two different stamps would have kept the
+    // rows apart by themselves and proven nothing about the name.
+    private static final String JOHN_SHARED_EVENT_DATE = "20240115";
+
+    private static final String JOHN_SHARED_EVENT_TIME = "091500";
+
     // Six of the eight history rows carry a counted request code. The two Q rows are staged and excluded
     // from the count on purpose: CASH00 writes its history record after END-EVALUATE unconditionally
     // (CASH00.cbl:L102, L111-L131), so reads were recorded too, while the target ledger records state
@@ -121,7 +140,7 @@ class LoaderIT extends PostgresTestSupport {
     private CashAccountRepository cashAccounts;
 
     @Autowired
-    private LegacyHistoryRepository legacyHistory;
+    private LegacyHistoryTestQueries legacyHistory;
 
     @Autowired
     private LegacyRateTableRepository legacyRates;
@@ -152,6 +171,13 @@ class LoaderIT extends PostgresTestSupport {
 
     @Test
     void loadsTheMatchedExportAndStagesBothHistoryShapesIdentically() {
+        // The forced chunk size is asserted rather than assumed: raise it above the fixture counts and every
+        // number below would still pass while proving nothing about a chunk boundary.
+        assertThat(Integer.parseInt(FORCED_CHUNK_SIZE))
+                .as("the forced chunk size must be smaller than the row counts this test asserts")
+                .isLessThan(EXPECTED_HISTORY_ROWS)
+                .isLessThan(EXPECTED_ACCOUNTS.size());
+
         Path matched = matchedFixtureDirectory();
         LegacyLoader.LoadSources resolved = LegacyLoader.LoadSources.inDirectory(matched);
         assertThat(resolved.historyTextFile())
@@ -286,19 +312,20 @@ class LoaderIT extends PostgresTestSupport {
             // 5. History staging keeps every row and every casing. MOVE WS-NAME TO WS-VR-NAME applies no
             //    case folding (CASH00.cbl:L111), so "John"+stamp and "JOHN"+stamp are two distinct valid
             //    29-byte KSDS keys (DEFKSDS.jcl:L14) that must both survive under one uppercased join key.
+            //    The fixture's two JOHN rows carry the SAME stamp, so the tuple assertion below is the whole
+            //    proof that the raw name is part of the key: it holds only if staging kept both casings, and
+            //    a name folded to upper case would leave one row where the export held two. The dedupe guard
+            //    keyed on the raw name and legacy_history's primary key are what make the pair legal.
             softly.assertThat(legacyHistory.countByRunId(runA.runId())).as("staged history rows")
                     .isEqualTo(EXPECTED_HISTORY_ROWS);
             List<LegacyHistory> johnRows = legacyHistory.findByRunIdAndOwnerKey(runA.runId(), "JOHN");
             softly.assertThat(johnRows).as("history rows joined to owner JOHN").hasSize(2);
-            softly.assertThat(johnRows).extracting(LegacyHistory::name)
-                    .as("raw, unfolded names of JOHN's history rows")
-                    .containsExactlyInAnyOrder("John", "JOHN");
-            softly.assertThat(johnRows).extracting(LegacyHistory::eventTime)
-                    .as("JOHN's two rows differ in the time half of the key")
-                    .containsExactlyInAnyOrder("091500", "091501");
-            softly.assertThat(johnRows).extracting(LegacyHistory::eventDate)
-                    .as("both of JOHN's rows fall on the fixture's single export date")
-                    .containsOnly("20240115");
+            softly.assertThat(johnRows)
+                    .as("JOHN's two raw names, both surviving at one identical stamp")
+                    .extracting(LegacyHistory::name, LegacyHistory::eventDate, LegacyHistory::eventTime)
+                    .containsExactlyInAnyOrder(
+                            tuple("John", JOHN_SHARED_EVENT_DATE, JOHN_SHARED_EVENT_TIME),
+                            tuple("JOHN", JOHN_SHARED_EVENT_DATE, JOHN_SHARED_EVENT_TIME));
             softly.assertThat(legacyHistory.countByRunIdAndRequestCodeIn(runA.runId(),
                             LegacyExportFormat.COUNTED_REQUEST_CODES))
                     .as("history rows whose request code is a state change, the two Q reads excluded")
@@ -346,6 +373,53 @@ class LoaderIT extends PostgresTestSupport {
                     .extracting(MigrationRun::runId)
                     .as("both runs of the batch, in start order")
                     .containsExactly(runA.runId(), runB.runId());
+        });
+    }
+
+    /*
+     * WHY A MALFORMED EXPORT IS WRITTEN HERE RATHER THAN COMMITTED AS A FIXTURE. The committed fixtures are the
+     * acceptance evidence of AAP 0.10.3 and every one of them is well formed; a deliberately corrupt file beside
+     * them would be read as legacy data that looks like this. The two lines below are the minimum that proves
+     * both halves of the contract: the first is a legacy NULL balance, which the source validation records as a
+     * finding before the second line is reached, and the second carries characters after a closing quote, where
+     * RFC 4180 admits only a delimiter, a record end or end of file (AAP 0.12.1). Before this was rejected,
+     * "JOHN"X loaded as the owner JOHNX - a value no producer wrote and no operator could trace.
+     */
+    @Test
+    void rejectsAnAccountExportCarryingCharactersAfterAClosingQuote(@TempDir Path exportDirectory)
+            throws IOException {
+        Path accountsFile = exportDirectory.resolve(LegacyExportFormat.CASH_ACCOUNT_FILE);
+        Files.writeString(accountsFile, String.join("\n",
+                "owner,balance,currencyc",
+                "NULLBAL,,USD",
+                "\"JOHN\"X,1000.00,USD") + "\n");
+
+        MigrationRun run = migrationRuns.save(MigrationRun.start(UUID.randomUUID(), UUID.randomUUID(),
+                MigrationRun.Mode.LOAD, accountsFile.toString(), MigrationRun.CharacterizationStatus.DRAFT));
+
+        // The failure has to name the file and the 1-based line an operator can open, and say which rule the
+        // line breaks - a load that fails without saying where is a load nobody can fix.
+        assertThatThrownBy(() -> loader.load(run, LegacyLoader.LoadSources.accountsOnly(accountsFile),
+                LEGACY_CHARSET, LEGACY_ZONE, null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining(accountsFile.toString())
+                .hasMessageContaining("line 3")
+                .hasMessageContaining("RFC 4180");
+
+        assertSoftly(softly -> {
+            // THE SINGLE-TRANSACTION CONTRACT (AAP 0.6.3). NULLBAL's finding row was written before the
+            // malformed line was reached, so a load that left anything at all behind would show it here - and
+            // the accounts, ledger and finding tables are checked together because "nothing was applied" is a
+            // statement about all three.
+            softly.assertThat(cashAccounts.count()).as("cash_account rows after a rejected export").isZero();
+            softly.assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM ledger_entry WHERE run_id = ?",
+                            Long.class, run.runId()))
+                    .as("ledger rows written under a rejected export").isZero();
+            softly.assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM migration_reconciliation WHERE run_id = ?",
+                            Long.class, run.runId()))
+                    .as("finding rows surviving a rejected export").isZero();
+            softly.assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM legacy_history", Long.class))
+                    .as("staged history rows after a rejected export").isZero();
         });
     }
 

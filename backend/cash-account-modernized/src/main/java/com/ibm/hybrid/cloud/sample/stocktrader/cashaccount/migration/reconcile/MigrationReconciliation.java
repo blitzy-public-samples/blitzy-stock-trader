@@ -47,6 +47,22 @@ import java.util.UUID;
 @Table(name = "migration_reconciliation")
 public class MigrationReconciliation {
 
+    /**
+     * The {@code legacy_value} of a {@link VarianceKind#BALANCE} row whose legacy side stated no balance.
+     *
+     * <p>Public because {@code shadow/ShadowComparator} classifies that condition and its integration test
+     * asserts the token out of the row; the rendering itself is {@link #balance}'s, so the two cannot
+     * drift.</p>
+     */
+    // AN ABSENT SIDE IS NAMED, NEVER LEFT BLANK. A shadow capture whose successful reply carried no balance is
+    // a malformed capture, and the row is the only place that survives to say so: with legacy_value, legacy_balance
+    // and variance all null, the finding would be indistinguishable from a comparison the tooling failed to
+    // complete, and an operator reviewing runbook Step 2's rows could neither triage it nor trace it back to the
+    // capture. Only the legacy side can be absent - a BALANCE row is written after the target answered with a
+    // balance, and a target that refused the line is a REJECTED_BY_TARGET row instead - so there is deliberately
+    // no counterpart token for the migrated side.
+    public static final String ABSENT_IN_CAPTURE = "ABSENT_IN_CAPTURE";
+
     /** Width of {@code legacy_value} and {@code migrated_value} in the schema. */
     private static final int MAX_VALUE_LENGTH = 64;
 
@@ -64,9 +80,10 @@ public class MigrationReconciliation {
     private Long reconciliationId;
 
     // A plain UUID and deliberately not a @ManyToOne to MigrationRun: MigrationReconciliationRepository
-    // derives findByRunIdOrderByReconciliationIdAsc(UUID), findByRunIdAndStatus(UUID, ReconciliationStatus)
-    // and countByRunIdAndStatus(UUID, ReconciliationStatus) from this attribute, and an association would
-    // force every one of them to findByRun_RunId(...) instead. Referential integrity is not lost by that
+    // derives countByRunIdAndStatus(UUID, ReconciliationStatus) from this attribute, the test tree's
+    // MigrationReconciliationTestQueries derives findByRunIdOrderByReconciliationIdAsc(UUID) and
+    // findByRunIdAndStatus(UUID, ReconciliationStatus) from it, and an association would force every one of
+    // them to findByRun_RunId(...) instead. Referential integrity is not lost by that
     // choice - the foreign key to migration_run(run_id) is enforced by the schema - and nothing in the
     // tooling navigates from a finding to its run, so an association would buy a lazy proxy and a second
     // query per row for no caller.
@@ -85,9 +102,11 @@ public class MigrationReconciliation {
     private VarianceKind varianceKind;
 
     // The text renderings of the two sides, or the reason token of a non-monetary kind (MISSING_IN_TARGET,
-    // NULL_IN_LEGACY, INVALID_IN_LEGACY, NULL_RATE, INSUFFICIENT_FUNDS...). Both nullable because a finding
-    // that one side is absent has nothing to render for it, and recording an absence as an empty string
-    // would be indistinguishable from an exported empty field - which is itself a characterized condition.
+    // NULL_IN_LEGACY, INVALID_IN_LEGACY, NULL_RATE, INSUFFICIENT_FUNDS, ABSENT_IN_CAPTURE...). Both nullable
+    // because a kind may leave a side with nothing to state at all - a count row states no balance on either
+    // side - and an absence recorded as an empty string would be indistinguishable from an exported empty
+    // field, which is itself a characterized condition. Where a side's absence IS the finding, it is named by
+    // a token rather than left null, so the row cannot be read as a comparison that failed to complete.
     @Column(name = "legacy_value", length = MAX_VALUE_LENGTH)
     private String legacyValue;
 
@@ -117,9 +136,14 @@ public class MigrationReconciliation {
     @Column(name = "status", nullable = false, length = 20)
     private ReconciliationStatus status;
 
-    // OffsetDateTime for TIMESTAMPTZ, never Instant, LocalDateTime or Timestamp: the first two lose the
-    // offset the column stores, and a finding's timestamp is read back by an operator in the runbook's
-    // evidence, where a zone-less reading of a cross-region run is unusable. The schema's DEFAULT now() is
+    // OffsetDateTime for TIMESTAMPTZ, never LocalDateTime or java.sql.Timestamp. PostgreSQL's TIMESTAMPTZ
+    // stores an instant normalized to UTC and keeps no offset of its own, so the mapping question is not
+    // whether a type "loses the offset" - Instant would carry the same instant faithfully - but which type
+    // maps to the declared column and reads back unambiguously. LocalDateTime maps to "timestamp without time
+    // zone", which ddl-auto=validate rejects at start-up (the wording domain/LedgerEntry uses for the same
+    // decision), and java.sql.Timestamp resolves its instant against the JVM default zone. OffsetDateTime is
+    // chosen over Instant for consistency with every other timestamp in this module and because a finding read
+    // back in the runbook's evidence then carries an explicit offset on its face. The schema's DEFAULT now() is
     // there for a hand-written INSERT; the factories always stamp it, so the recorded time is the moment the
     // tooling observed the difference rather than the moment the row reached the database.
     @Column(name = "recorded_at", nullable = false)
@@ -181,6 +205,10 @@ public class MigrationReconciliation {
     /**
      * Records a {@link VarianceKind#BALANCE} difference: both balances, their plain-decimal renderings and
      * the signed variance, computed here so no call site can get the sign or the scale wrong.
+     *
+     * <p>An absent legacy balance renders as {@link #ABSENT_IN_CAPTURE} rather than as nothing, so the row
+     * states which side was missing; the balance and variance columns stay null, because neither is
+     * knowable.</p>
      */
     public static MigrationReconciliation balance(UUID runId,
                                                   String owner,
@@ -188,7 +216,7 @@ public class MigrationReconciliation {
                                                   BigDecimal migratedBalance,
                                                   ReconciliationStatus status) {
         return of(runId, owner, VarianceKind.BALANCE, status,
-                render(legacyBalance), render(migratedBalance),
+                legacyBalance == null ? ABSENT_IN_CAPTURE : render(legacyBalance), render(migratedBalance),
                 legacyBalance, migratedBalance,
                 signedVariance(legacyBalance, migratedBalance));
     }

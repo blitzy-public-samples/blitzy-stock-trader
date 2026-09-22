@@ -74,7 +74,10 @@ public class ApiExceptionHandler {
             LOGGER.error("Internal failure handling a request for owner {}", exception.owner(), exception);
         } else if (code.status().is5xxServerError()) {
             // The cause matters operationally here - an unreachable exchange-rate endpoint or a datastore
-            // outage - and it is recorded only in the log, never in the response body.
+            // outage - and it is recorded only in the log, never in the response body. This is the one WARN
+            // record a rejected request produces for a 5xx condition, and the cause chain it carries is the
+            // only place that exchange-rate or datastore failure is recorded at all: fx's own client logs the
+            // same failure at DEBUG precisely so one provider outage cannot cost two WARN records per request.
             LOGGER.warn("Rejecting request for owner {}: {}", exception.owner(), code.code(), exception);
         } else {
             LOGGER.debug("Rejecting request for owner {}: {} - {}", exception.owner(), code.code(),
@@ -97,11 +100,12 @@ public class ApiExceptionHandler {
     // a selector-restricted advice is never consulted for it - which would leave Spring Boot's white-label
     // body on the wire instead of an ApiError.
     //
-    // Both no-handler types are handled because which one Spring raises is decided by resource-handler and
-    // "throw-exception-if-no-handler-found" configuration that lives in application.yml, not in this file:
-    // NoResourceFoundException surfaces under the default static-resource mapping of Spring Framework 6.1,
-    // NoHandlerFoundException when no-handler dispatch is configured to throw. Covering the pair makes the
-    // fail-closed 404 independent of that setting.
+    // Both no-handler types are handled so the fail-closed 404 does not depend on which one Spring raises.
+    // The active route is NoResourceFoundException: under Spring Framework 6.1's default static-resource
+    // handling - which this module configures nothing about, carrying no spring.mvc or spring.web.resources
+    // settings at all - a path no handler matches falls through to the resource handler and surfaces as that
+    // type. NoHandlerFoundException is declared beside it as defensive coverage, for a build that ever
+    // configures no-handler dispatch to throw instead.
     @ExceptionHandler({ NoResourceFoundException.class, NoHandlerFoundException.class })
     public ResponseEntity<ApiError> handleUnsupportedPath(Exception exception) {
         LOGGER.debug("Rejecting request: no resource mapped - {}", exception.getMessage());
@@ -111,17 +115,29 @@ public class ApiExceptionHandler {
     // Same fail-closed rationale as the handler above: a known path reached with a verb this service does
     // not implement is rejected explicitly rather than dispatched to whatever the legacy fall-through would
     // have echoed back.
+    //
+    // The exception's own headers travel with the response because they carry Allow whenever Spring MVC knew
+    // which verbs the path does support: a caller told only "not this verb" has to rediscover the contract by
+    // trial, which is the discovery-by-guesswork the legacy single status channel forced. The body is unchanged -
+    // Allow is method metadata, not a second error shape.
     @ExceptionHandler(HttpRequestMethodNotSupportedException.class)
     public ResponseEntity<ApiError> handleUnsupportedMethod(HttpRequestMethodNotSupportedException exception) {
         LOGGER.debug("Rejecting request: method not supported - {}", exception.getMessage());
-        return respond(ApiError.of(CashAccountErrorCode.UNSUPPORTED_METHOD));
+        return respond(ApiError.of(CashAccountErrorCode.UNSUPPORTED_METHOD), exception.getHeaders());
     }
 
-    // The value's own name selects the code because the retail "amount" and the ledger query parameters
-    // share this failure mode: "amount" is bound from its string form to BigDecimal, so a non-numeric or
-    // absent value lands here rather than in any validator. The Idempotency-Key row exists so that a
-    // missing required header renders the 400 the institutional contract promises instead of falling to the
-    // catch-all as an internal error.
+    // The value's own name selects the code, and one route into here is live today: an ABSENT "?amount=" on
+    // retail debit or credit, which @RequestParam without a default raises as
+    // MissingServletRequestParameterException and whose parameter name maps to INVALID_AMOUNT. Everything
+    // else in that family is parsed in code and never reaches this method - a present-but-invalid amount
+    // (retail/RetailCashAccountController declares it as String and parses it, throwing INVALID_AMOUNT), an
+    // unparsable "since" (institutional/ReservationController, INVALID_QUERY) and an out-of-range "limit"
+    // (audit/LedgerService, INVALID_QUERY) all arrive as CashAccountException instead, which keeps every
+    // status inside the closed sets those contracts fix. MethodArgumentTypeMismatchException and
+    // MissingRequestHeaderException are declared defensively rather than for a current caller: no handler
+    // method declares a typed query parameter, and the mandatory Idempotency-Key is read with
+    // required = false so ReservationService reports it missing. Declaring them means that if one is ever
+    // introduced its failure renders in this one payload shape instead of Spring's ProblemDetail.
     @ExceptionHandler({ MethodArgumentTypeMismatchException.class, MissingServletRequestParameterException.class,
             MissingRequestHeaderException.class })
     public ResponseEntity<ApiError> handleRequestValueBinding(Exception exception) {
@@ -155,9 +171,12 @@ public class ApiExceptionHandler {
 
     // A lock conflict is an explicit, retryable 409 with a Retry-After hint rather than a 500, because it is
     // a normal outcome of two callers touching one account row: the balance is unchanged, no ledger row was
-    // written, and the caller may simply retry. Its legacy counterpart was a CICS backout whose -911/-913
-    // reached the caller as unsigned digits [backend/cash-account-cobol/COBOL/CASH00.cbl:L104], indis-
-    // tinguishable from a validation failure. PessimisticLockingFailureException is declared beside
+    // written, and the caller may simply retry. Its legacy counterparts were two distinct codes: -911 was
+    // returned once the unit of work had already been rolled back, -913 when it had not and the application
+    // still owned the commit-or-rollback decision. Which one a CICS caller saw depended on the attachment's
+    // DROLLBACK setting, which is not in this repository [docs/legacy-characterization.md section 9.9]; either
+    // way the caller received unsigned digits [backend/cash-account-cobol/COBOL/CASH00.cbl:L104],
+    // indistinguishable from a validation failure. PessimisticLockingFailureException is declared beside
     // CannotAcquireLockException because Hibernate's jakarta.persistence.PessimisticLockException translates
     // to that supertype, not to CannotAcquireLockException, and a lock conflict must never degrade to 500.
     @ExceptionHandler({ ObjectOptimisticLockingFailureException.class, PessimisticLockingFailureException.class,
@@ -207,10 +226,18 @@ public class ApiExceptionHandler {
     // no handler can choose a status of its own and no condition can acquire or lose a retry hint by being
     // rendered in one place rather than another. The content type is set explicitly so the ApiError is
     // written as JSON even when the request's Accept header asked for something else - a request that fails
-    // closed must still answer in the one shape every consumer parses.
+    // closed must still answer in the one shape every consumer parses. A handler that has protocol metadata of
+    // its own to add passes it as headers through the overload rather than building its own response, so that
+    // derivation stays in this one place; the content type is applied after them, so no caller of the overload
+    // can displace it.
     private ResponseEntity<ApiError> respond(ApiError body) {
+        return respond(body, HttpHeaders.EMPTY);
+    }
+
+    private ResponseEntity<ApiError> respond(ApiError body, HttpHeaders additionalHeaders) {
         CashAccountErrorCode code = body.code();
         ResponseEntity.BodyBuilder response = ResponseEntity.status(code.status())
+                .headers(additionalHeaders)
                 .contentType(MediaType.APPLICATION_JSON);
         if (code.hasRetryAfter()) {
             response = response.header(HttpHeaders.RETRY_AFTER, code.retryAfterSeconds().toString());

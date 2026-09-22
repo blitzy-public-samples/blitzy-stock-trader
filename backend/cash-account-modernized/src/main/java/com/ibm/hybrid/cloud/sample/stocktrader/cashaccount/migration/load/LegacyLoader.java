@@ -16,6 +16,10 @@
 
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.migration.load;
 
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.PersistenceContext;
+import jakarta.persistence.PersistenceException;
+
 import java.nio.charset.Charset;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -25,17 +29,17 @@ import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeParseException;
-import java.util.ArrayList;
 import java.util.LinkedHashSet;
-import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Consumer;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.dao.DataAccessException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -99,6 +103,15 @@ public class LegacyLoader {
 
     private static final String HISTORY_RECORD_LENGTH_PROPERTY = "${tool.history-record-length:#{null}}";
 
+    // How many rows are applied or staged before the persistence context is flushed and cleared. A property
+    // because the value trades round trips against resident rows and decides nothing about correctness, and 50
+    // because it matches hibernate.jdbc.batch_size in application.yml, so one flush maps onto whole JDBC
+    // batches rather than straddling them. Under cashaccount.* rather than tool.*: MigrationToolRunner rejects
+    // any tool.* command-line option outside the seven it declares, which would leave an operator sizing a
+    // migration window unable to pass this one. The textual default keeps a context that sets nothing - the
+    // deployed web application, which never loads - starting exactly as before.
+    private static final String BATCH_CHUNK_SIZE_PROPERTY = "${cashaccount.migration.batch-chunk-size:50}";
+
     private final CashAccountRepository accounts;
 
     private final CashReservationRepository reservations;
@@ -123,6 +136,17 @@ public class LegacyLoader {
 
     private final Integer historyRecordLength;
 
+    private final int batchChunkSize;
+
+    // CONTEXT CONTROL ONLY, NEVER A DATA PATH. Every read and every write in this class goes through a
+    // repository under persistence/ (AAP 0.6.5); this reference exists for the single operation no Spring Data
+    // interface exposes - clear(), which is what bounds the persistence context across a bulk load - paired
+    // with the flush that must precede it. No row is persisted, merged, removed or queried through it.
+    // @PersistenceContext injects the shared transaction-scoped proxy, so it acts inside the caller's single
+    // transaction (AAP 0.6.3) and never opens one of its own.
+    @PersistenceContext
+    private EntityManager entityManager;
+
     public LegacyLoader(CashAccountRepository accounts,
                         CashReservationRepository reservations,
                         LegacyHistoryRepository legacyHistory,
@@ -132,7 +156,8 @@ public class LegacyLoader {
                         ReconciliationService reconciliationService,
                         @Value(LEGACY_CHARSET_PROPERTY) String legacyCharset,
                         @Value(LEGACY_TIMEZONE_PROPERTY) String legacyTimeZone,
-                        @Value(HISTORY_RECORD_LENGTH_PROPERTY) Integer historyRecordLength) {
+                        @Value(HISTORY_RECORD_LENGTH_PROPERTY) Integer historyRecordLength,
+                        @Value(BATCH_CHUNK_SIZE_PROPERTY) int batchChunkSize) {
         this.accounts = Objects.requireNonNull(accounts, "accounts");
         this.reservations = Objects.requireNonNull(reservations, "reservations");
         this.legacyHistory = Objects.requireNonNull(legacyHistory, "legacyHistory");
@@ -144,6 +169,14 @@ public class LegacyLoader {
         this.legacyCharset = charsetOf(legacyCharset);
         this.legacyTimeZone = zoneOf(legacyTimeZone);
         this.historyRecordLength = historyRecordLength;
+        // Refused rather than defaulted away: a chunk size below one would stage a row and flush on every row
+        // at best, and at worst describe a batch that cannot exist - a misconfiguration an operator must see
+        // at start-up rather than halfway through a migration window.
+        if (batchChunkSize < 1) {
+            throw CashAccountException.of(CashAccountErrorCode.INTERNAL,
+                    "cashaccount.migration.batch-chunk-size must be at least 1 row per chunk, but was " + batchChunkSize);
+        }
+        this.batchChunkSize = batchChunkSize;
     }
 
     /**
@@ -248,72 +281,37 @@ public class LegacyLoader {
         Objects.requireNonNull(legacyTimeZone, "legacyTimeZone");
 
         MigrationRun activeRun = activeRun(run);
+        // Flushed here so the run row is in the database before the source validation writes this run's first
+        // finding: migration_reconciliation.run_id references migration_run, and run_id is a plain UUID column
+        // rather than an association, so the insert ordering hibernate.order_inserts performs (application.yml)
+        // knows nothing of that dependency.
+        entityManager.flush();
 
-        // Read everything before writing anything, so a malformed file fails the load without having touched
-        // a single account row.
-        List<LegacyCashAccountRecord> accountRecords = exportReader.readCashAccounts(sources.accountsFile());
-        List<LegacyRateRecord> rateRecords = sources.rateFile() == null
-                ? List.of()
-                : exportReader.readRates(sources.rateFile());
-        List<VsamHistoryRecord> historyRecords = readHistory(sources, legacyCharset, historyRecordLength);
+        // Fail closed before a byte is read, not when the history file is reached: the declared record length is
+        // the operator's answer to an open item and a run that lacks it cannot frame the binary export at all.
+        requireHistoryRecordLength(sources, historyRecordLength);
 
-        // Source validation first, always: it decides which rows may be applied at all, and inventing a value
-        // for a legacy NULL or an out-of-set currency here instead would erase the finding an operator reviews.
+        // WHY THE WHOLE EXPORT IS CLASSIFIED BEFORE THE FIRST ACCOUNT ROW IS WRITTEN. The source validation is a
+        // complete first pass over the account and rate exports: which owners may be applied at all, and whether
+        // the files parse, are settled before this load touches an account row - and inventing a value for a
+        // legacy NULL or an out-of-set currency instead would erase the finding an operator reviews. It is a pass
+        // and never a copy, so neither file is held; and what makes a failure anywhere in the load - in the
+        // second pass, in staging, in the database - leave nothing behind is the single ambient transaction
+        // (AAP 0.6.3) rather than the order these passes run in.
         ReconciliationService.SourceValidation validation =
-                reconciliationService.validateSource(activeRun, accountRecords, rateRecords);
+                reconciliationService.validateSource(activeRun, sources.accountsFile(), sources.rateFile());
 
-        int migrated = 0;
-        int variances = validation.varianceCount();
-        Set<String> seenOwners = new LinkedHashSet<>();
+        // The second pass applies. Rows reach it one at a time, so the loader holds one exported record and one
+        // chunk of accounts rather than the file.
+        LoadTally tally = new LoadTally(validation.varianceCount());
+        exportReader.streamCashAccounts(sources.accountsFile(),
+                record -> applyAccount(activeRun, sources, validation, record, tally));
+        boundPersistenceContext();
 
-        for (LegacyCashAccountRecord record : accountRecords) {
-            String owner = OwnerNormalizer.normalize(record.owner());
+        int stagedRates = stageRates(activeRun, validation, sources);
+        int stagedHistory = stageHistory(activeRun, sources, legacyCharset, legacyTimeZone, historyRecordLength);
 
-            // A repeated owner is malformed input rather than a last-write-wins case: the legacy primary key
-            // was the owner itself and storage was upper case (CASH00.cbl:L155), so a well-formed unload
-            // cannot produce one, and collapsing it silently would breach the one-load-event-per-owner rule
-            // that the partial index uq_ledger_entry_migration_load enforces.
-            if (!seenOwners.add(owner)) {
-                throw CashAccountException.forOwner(CashAccountErrorCode.INTERNAL, owner,
-                        "The account export " + sources.accountsFile() + " names owner '" + owner
-                                + "' more than once; a load applies each owner exactly once per run");
-            }
-
-            if (!validation.loadableOwners().contains(owner)) {
-                continue;
-            }
-
-            Money balance = Money.of(record.balance());
-            Optional<CashAccount> existing = accounts.findByOwnerForUpdate(owner);
-
-            if (existing.isEmpty()) {
-                insertAccount(activeRun, owner, record.currency(), balance);
-                migrated++;
-                continue;
-            }
-
-            // WHY A HELD RESERVATION MAKES THE OWNER UNTOUCHABLE. Overwriting an absolute balance while funds
-            // sit in reserved_balance would hand an institutional caller's held money back to the available
-            // side, leaving a HELD cash_reservation row that its settlement can no longer honour - the
-            // conservation the reservation state machine guarantees is only true while nothing rewrites the
-            // account behind it (schema/cash-account-schema.sql, cash_reservation; AAP 0.6.3). The condition is
-            // therefore tested before any mutation, and the answer is a recorded row for the operator rather
-            // than a balance this load decided on its own.
-            if (reservations.existsByOwnerAndState(owner, ReservationState.HELD)) {
-                if (reconciliationService.recordReservationsOutstanding(activeRun, owner) != null) {
-                    variances++;
-                }
-                continue;
-            }
-
-            overwriteAccount(activeRun, existing.get(), record.currency(), balance);
-            migrated++;
-        }
-
-        int stagedRates = stageRates(activeRun, validation, rateRecords, sources);
-        int stagedHistory = stageHistory(activeRun, historyRecords, legacyTimeZone);
-
-        LoadResult result = new LoadResult(validation.legacyAccountCount(), migrated, variances,
+        LoadResult result = new LoadResult(validation.legacyAccountCount(), tally.migrated, tally.variances,
                 stagedHistory, stagedRates);
 
         LOGGER.info("Load run {} read {} account rows, applied {}, recorded {} variance rows, staged {} history"
@@ -334,6 +332,81 @@ public class LegacyLoader {
      */
     private MigrationRun activeRun(MigrationRun run) {
         return runs.findById(run.runId()).orElseGet(() -> runs.save(run));
+    }
+
+    /**
+     * Applies one exported account row: inserted, overwritten, or left alone with a recorded reason.
+     *
+     * <p>Called once per row of the second pass, so nothing it holds outlives the row except the tally.</p>
+     */
+    private void applyAccount(MigrationRun run,
+                              LoadSources sources,
+                              ReconciliationService.SourceValidation validation,
+                              LegacyCashAccountRecord record,
+                              LoadTally tally) {
+        String owner = OwnerNormalizer.normalize(record.owner());
+
+        // A repeated owner is malformed input rather than a last-write-wins case: the legacy primary key
+        // was the owner itself and storage was upper case (CASH00.cbl:L155), so a well-formed unload
+        // cannot produce one, and collapsing it silently would breach the one-load-event-per-owner rule
+        // that the partial index uq_ledger_entry_migration_load enforces.
+        if (!tally.seenOwners.add(owner)) {
+            throw CashAccountException.forOwner(CashAccountErrorCode.INTERNAL, owner,
+                    "The account export " + sources.accountsFile() + " names owner '" + owner
+                            + "' more than once; a load applies each owner exactly once per run");
+        }
+
+        // REJECTION, NOT MEMBERSHIP. The source validation returns the owners it refused rather than the
+        // owners it accepted, because this pass is already reading the export and every owner it sees was named
+        // by the file: asking "was this one refused?" needs state proportional to the refusals, while asking
+        // "is this one on the accepted list?" would need a set holding every owner in the export.
+        if (validation.rejectedOwners().contains(owner)) {
+            return;
+        }
+
+        Money balance = Money.of(record.balance());
+        Optional<CashAccount> existing = accounts.findByOwnerForUpdate(owner);
+
+        if (existing.isEmpty()) {
+            insertAccount(run, owner, record.currency(), balance);
+            tally.migrated++;
+        } else if (reservations.existsByOwnerAndState(owner, ReservationState.HELD)) {
+            // WHY A HELD RESERVATION MAKES THE OWNER UNTOUCHABLE. Overwriting an absolute balance while funds
+            // sit in reserved_balance would hand an institutional caller's held money back to the available
+            // side, leaving a HELD cash_reservation row that its settlement can no longer honour - the
+            // conservation the reservation state machine guarantees is only true while nothing rewrites the
+            // account behind it (schema/cash-account-schema.sql, cash_reservation; AAP 0.6.3). The condition is
+            // therefore tested before any mutation, and the answer is a recorded row for the operator rather
+            // than a balance this load decided on its own.
+            //
+            // The condition is established ONCE, here, under that lock, and the locked row is handed to the
+            // recorder: a release has to take this same cash_account row lock, so nothing can free the funds
+            // between the test and the row that reports them, and re-testing inside the recorder would only
+            // repeat a statement whose answer this transaction owns.
+            reconciliationService.recordReservationsOutstanding(run, existing.get());
+            tally.variances++;
+        } else {
+            overwriteAccount(run, existing.get(), record.currency(), balance);
+            tally.migrated++;
+        }
+
+        // The applied rows and their ledger events leave the persistence context at the chunk boundary, so the
+        // second pass costs one chunk of entities however many owners the export names. The account row locks
+        // this pass has taken are unaffected: they belong to the transaction and are held until it ends.
+        tally.appliedSinceFlush++;
+        if (tally.appliedSinceFlush >= batchChunkSize) {
+            tally.appliedSinceFlush = 0;
+            boundPersistenceContext();
+        }
+    }
+
+    // FLUSH BEFORE CLEAR, ALWAYS. clear() discards whatever is pending, so a clear without a flush would drop
+    // the very rows the load has just applied. Neither is a commit: both run inside the one ambient transaction
+    // (AAP 0.6.3), so nothing this load writes becomes durable before the whole load does, and a failure at any
+    // chunk still leaves the target exactly as it was.
+    private void boundPersistenceContext() {
+        entityManager.flush();
+        entityManager.clear();
     }
 
     // WHY A FRESH incarnation_id ON EVERY CREATE. CashAccount.open stamps a new one, and it is what scopes an
@@ -370,57 +443,128 @@ public class LegacyLoader {
 
     private int stageRates(MigrationRun run,
                            ReconciliationService.SourceValidation validation,
-                           List<LegacyRateRecord> rateRecords,
                            LoadSources sources) {
-        List<LegacyRateTable> staged = new ArrayList<>(rateRecords.size());
-        Set<String> stagedKeys = new LinkedHashSet<>();
+        // No rate file is the accounts-only shape: nothing is read and nothing is staged, exactly as a load
+        // that saw an empty rate list did.
+        if (sources.rateFile() == null) {
+            return 0;
+        }
 
-        for (LegacyRateRecord record : rateRecords) {
-            // The same key expression the validation used, so the two sets line up exactly rather than
+        StagingTally tally = new StagingTally();
+        stagingRun(sources.rateFile(), () -> exportReader.streamRates(sources.rateFile(), record -> {
+            // The same key expression the validation used, so the two decisions line up exactly rather than
             // approximately; the accepted spellings of the base-currency column are the reader's business.
             String rateKey = LegacyExportFormat.trimPadding(record.currnkey());
-            if (!validation.loadableRateKeys().contains(rateKey)) {
-                continue;
-            }
-            if (!stagedKeys.add(rateKey)) {
-                throw CashAccountException.of(CashAccountErrorCode.INTERNAL,
-                        "The rate export " + sources.rateFile() + " names rate key '" + rateKey
-                                + "' more than once, which its legacy primary key could not hold");
+            if (validation.rejectedRateKeys().contains(rateKey)) {
+                return;
             }
             // A null currnbase or amount is staged as null: the program fetched both columns and referenced
             // neither, so neither is a value this loader may invent.
-            staged.add(LegacyRateTable.staged(run.runId(), record));
-        }
+            stage(legacyRates.save(LegacyRateTable.staged(run.runId(), record)), tally);
+        }));
 
-        legacyRates.saveAll(staged);
-        return staged.size();
+        return tally.staged;
     }
 
+    /**
+     * Stages the one history shape this run carries, or nothing when the sources name neither.
+     *
+     * <p>The binary export wins whenever it is named, because both shapes decode to the same
+     * {@code (name, event_date, event_time)} keys and staging both under one {@code run_id} would collide on
+     * {@code legacy_history}'s primary key. A run that means to stage the text shape names the text file
+     * alone, which is how a comparison of the two shapes is two runs rather than one.</p>
+     */
     // WHY legacy_history.name KEEPS THE CALLER'S CASING. CASH00 moved WS-NAME into the record with no case
     // folding (CASH00.cbl:L111) while the account table stored upper case, so "John"+stamp and "JOHN"+stamp
     // were two distinct, equally valid 29-byte KSDS keys (DEFKSDS.jcl:L14) - and on a Q request WS-NAME had
     // already been replaced by the database's upper-case OWNER (CASH00.cbl:L144), so one physical owner
     // legitimately appears under two casings. Folding the name would merge real records; the uppercased join
     // key is carried beside it instead, as legacy_history.owner_key.
-    private int stageHistory(MigrationRun run, List<VsamHistoryRecord> historyRecords, ZoneId legacyTimeZone) {
-        List<LegacyHistory> staged = new ArrayList<>(historyRecords.size());
-        Set<List<String>> stagedKeys = new LinkedHashSet<>();
+    private int stageHistory(MigrationRun run,
+                             LoadSources sources,
+                             Charset legacyCharset,
+                             ZoneId legacyTimeZone,
+                             Integer historyRecordLength) {
+        StagingTally tally = new StagingTally();
+        // Both shapes stage through one consumer, so the text and binary paths cannot diverge in what they
+        // write - which is the property AAP 0.10.3 has LoaderIT assert row for row.
+        Consumer<VsamHistoryRecord> staging = record -> stageHistoryRecord(run, record, legacyTimeZone, tally);
 
-        for (VsamHistoryRecord record : historyRecords) {
-            List<String> key = List.of(record.name(), record.eventDate(), record.eventTime());
-            if (!stagedKeys.add(key)) {
-                throw CashAccountException.of(CashAccountErrorCode.INTERNAL,
-                        "The history export names the key " + key + " more than once; that is the KSDS key"
-                                + " itself, so the records are indistinguishable and staging cannot be lossless");
-            }
-            // A blank name propagates as INVALID_OWNER rather than being dropped: staging is lossless, and a
-            // record whose owner cannot be derived is a file to fix, not a row to lose.
-            staged.add(LegacyHistory.staged(run.runId(), record, OwnerNormalizer.normalize(record.name()),
-                    eventAt(record, legacyTimeZone)));
+        if (sources.historyBinaryFile() != null) {
+            stagingRun(sources.historyBinaryFile(), () -> new VsamHistoryRecordDecoder(legacyCharset,
+                    historyRecordLength).streamAll(sources.historyBinaryFile(), staging));
+        } else if (sources.historyTextFile() != null) {
+            stagingRun(sources.historyTextFile(),
+                    () -> exportReader.streamHistory(sources.historyTextFile(), staging));
         }
 
-        legacyHistory.saveAll(staged);
-        return staged.size();
+        return tally.staged;
+    }
+
+    private void stageHistoryRecord(MigrationRun run,
+                                    VsamHistoryRecord record,
+                                    ZoneId legacyTimeZone,
+                                    StagingTally tally) {
+        // A blank name propagates as INVALID_OWNER rather than being dropped: staging is lossless, and a
+        // record whose owner cannot be derived is a file to fix, not a row to lose.
+        stage(legacyHistory.save(LegacyHistory.staged(run.runId(), record,
+                OwnerNormalizer.normalize(record.name()), eventAt(record, legacyTimeZone))), tally);
+    }
+
+    // WHERE THE DUPLICATE-KEY CHECK LIVES, AND WHY IT IS NOT A SET IN MEMORY. A staged row's identity is its
+    // legacy primary key within this run - (run_id, currnkey) and the raw 29-byte KSDS key (CASH00.cbl:L47-L50,
+    // DEFKSDS.jcl:L14) - and the staging tables declare exactly those as primary keys, so the run-scoped
+    // uniqueness the export must satisfy is already held by the database. Detecting a repeat there instead of
+    // in a set costs nothing per row and keeps the loader's footprint independent of the export's length, which
+    // a set of every key it has seen could not. The abort is unchanged: the whole load is one transaction
+    // (AAP 0.6.3), so a repeated key leaves nothing behind either way - and the driver names the offending key
+    // values, which is what an operator needs to find the line.
+    //
+    // Both moments are covered. Two rows with one key in the same chunk collide in the persistence context, and
+    // rows in different chunks collide at the insert; Spring's exception translation renders each as a
+    // DataAccessException, which is why the translation below catches the family rather than one type.
+    private void stagingRun(Path exportFile, Runnable stagingPass) {
+        try {
+            stagingPass.run();
+            // The trailing partial chunk leaves the context here, inside the translation below, so a repeated
+            // key among the last few rows of a file is reported exactly like one in any other chunk.
+            boundPersistenceContext();
+        } catch (DataAccessException | PersistenceException rejected) {
+            // Two exception families because the failure has two origins: a repeat inside one chunk is raised by
+            // the repository's save and arrives translated as a DataAccessException, while a repeat across chunks
+            // is raised by the flush and arrives as the provider's own PersistenceException, which nothing
+            // translates because the flush is not a repository call.
+            throw CashAccountException.of(CashAccountErrorCode.INTERNAL,
+                    "The export " + exportFile + " could not be staged: a record repeats a key its legacy"
+                            + " primary key could not hold twice, so staging cannot be lossless."
+                            + " The database reports: " + rootCause(rejected), rejected);
+        }
+    }
+
+    // The driver's own message, which carries the duplicate key's values; Spring's wrapper text names only the
+    // statement. Walked to the deepest cause so the detail is not buried under two layers of translation.
+    private static String rootCause(Throwable thrown) {
+        Throwable cause = thrown;
+        while (cause.getCause() != null && cause.getCause() != cause) {
+            cause = cause.getCause();
+        }
+        String message = cause.getMessage();
+        return message == null ? cause.getClass().getSimpleName() : message.strip();
+    }
+
+    // WHY save AND NOT saveAll, AND WHY THE ROW LEAVES THE CONTEXT AT A CHUNK BOUNDARY. save() on a staging
+    // entity is an insert and nothing more: both staging entities declare their own newness (Persistable on
+    // reconcile/LegacyHistory and reconcile/LegacyRateTable), so Spring Data persists rather than merges and no
+    // existence SELECT is issued for an assigned composite key. saveAll would add nothing but a list of every
+    // row. The chunk boundary is where the accumulated inserts leave the context; its size equals
+    // hibernate.jdbc.batch_size (application.yml), so a flush is whole JDBC batches rather than one statement
+    // per row - the default Hibernate would otherwise apply, which makes a bulk staging pass N round trips.
+    private void stage(Object stagedRow, StagingTally tally) {
+        Objects.requireNonNull(stagedRow, "A staged row is required");
+        tally.staged++;
+        if (tally.staged % batchChunkSize == 0) {
+            boundPersistenceContext();
+        }
     }
 
     /**
@@ -446,37 +590,21 @@ public class LegacyLoader {
         }
     }
 
-    /**
-     * Reads the one history shape this run stages, or nothing when the sources carry neither.
-     *
-     * <p>The binary export wins whenever it is named, because both shapes decode to the same
-     * {@code (name, event_date, event_time)} keys and staging both under one {@code run_id} would collide on
-     * {@code legacy_history}'s primary key. A run that means to stage the text shape names the text file
-     * alone, which is how a comparison of the two shapes is two runs rather than one.</p>
-     */
+    /** Requires the declared record length whenever this run's sources name a binary history export. */
     // Fail closed on a binary export with no declared length. CASH00 writes a record whose width is the
     // accumulated width of WS-VSAM-RECORD (CASH00.cbl:L38-L45, passed as LENGTH OF at L128) into a cluster
     // whose RECSZ is wider (DEFKSDS.jcl:L11), and which of the two a REPRO yields depends on a CICS FILE
     // definition that is not in this repository (AAP 0.11.2); LegacyExportFormat holds both accepted widths.
     // A guessed length divides many files cleanly and then shifts every field of every record - a wrong load
-    // rather than a failed one.
-    private List<VsamHistoryRecord> readHistory(LoadSources sources,
-                                                Charset legacyCharset,
-                                                Integer historyRecordLength) {
-        if (sources.historyBinaryFile() != null) {
-            if (historyRecordLength == null) {
-                throw CashAccountException.of(CashAccountErrorCode.INTERNAL,
-                        "tool.history-record-length is mandatory whenever a binary history export ("
-                                + sources.historyBinaryFile() + ") is loaded: the record length is declared"
-                                + " from the CICS FILE definition, never inferred from the file");
-            }
-            return new VsamHistoryRecordDecoder(legacyCharset, historyRecordLength)
-                    .decodeAll(sources.historyBinaryFile());
+    // rather than a failed one. Checked at the top of the load rather than where the file is staged, so a run
+    // that cannot decode its history never reaches the database at all.
+    private static void requireHistoryRecordLength(LoadSources sources, Integer historyRecordLength) {
+        if (sources.historyBinaryFile() != null && historyRecordLength == null) {
+            throw CashAccountException.of(CashAccountErrorCode.INTERNAL,
+                    "tool.history-record-length is mandatory whenever a binary history export ("
+                            + sources.historyBinaryFile() + ") is loaded: the record length is declared"
+                            + " from the CICS FILE definition, never inferred from the file");
         }
-        if (sources.historyTextFile() != null) {
-            return exportReader.readHistory(sources.historyTextFile());
-        }
-        return List.of();
     }
 
     // Locale.ROOT, never the no-argument toUpperCase(): a Turkish default locale maps "i" to U+0130, which
@@ -516,5 +644,34 @@ public class LegacyLoader {
                     "tool.legacy-timezone names '" + candidate + "', which is not a zone this JVM knows",
                     unresolvable);
         }
+    }
+
+    /** What the account pass has applied so far, carried across its chunks. */
+    // seenOwners is the one member that grows with the export, and it holds a normalized owner key per row -
+    // never a record and never an entity. It cannot be dropped in favour of the database's own constraint:
+    // losslessness requires naming a file that lists one owner twice, and the partial index
+    // uq_ledger_entry_migration_load could only report that some row was a duplicate, not which line wrote it.
+    private static final class LoadTally {
+
+        private final Set<String> seenOwners = new LinkedHashSet<>();
+
+        private int migrated;
+
+        private int variances;
+
+        private int appliedSinceFlush;
+
+        private LoadTally(int variancesAlreadyRecorded) {
+            this.variances = variancesAlreadyRecorded;
+        }
+    }
+
+    /** How many rows one staging pass has written. */
+    // A counter and nothing else. The keys a staging pass has already seen are held by the staging tables'
+    // own run-scoped primary keys rather than by this class, so the pass costs the same whether it stages six
+    // rows or six million (see stagingRun).
+    private static final class StagingTally {
+
+        private int staged;
     }
 }

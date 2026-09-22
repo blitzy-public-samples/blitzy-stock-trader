@@ -27,7 +27,6 @@ import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.support.PostgresTestS
 
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.autoconfigure.actuate.observability.AutoConfigureObservability;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.http.HttpEntity;
@@ -48,15 +47,11 @@ import java.time.Instant;
 // [CASH00.cbl:L105-L106, L108], so the caller read its OWN submitted amount as the "balance"; and the
 // unconditional history write [CASH00.cbl:L126-L131] recorded the non-event as though it had happened. A
 // caller therefore could not distinguish a rejected request from a completed one. Failing closed instead is
-// an authorized deliberate improvement, and these two tests are its executable proof: the improvement is
-// only real if an unmapped path and an unmapped verb are each observably rejected, with a body that names
-// the reason.
-/** Proves an unmapped path and an unmapped verb are each rejected explicitly, in the one ApiError shape. */
+// an authorized deliberate improvement, and these three tests are its executable proof: the improvement is
+// only real if an unmapped path, an unmapped verb, and the OPTIONS Spring MVC would otherwise answer with a
+// 200 of its own are each observably rejected, with a body that names the reason.
+/** Proves an unmapped path, an unmapped verb and an auto-answerable OPTIONS each fail closed as one ApiError. */
 @SpringBootTest(classes = CashAccountApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
-// Required for the context to start at all, not for anything either test asserts: config/MetricsScrapeController
-// takes PrometheusMeterRegistry as a mandatory constructor argument, and Spring Boot's test customizer disables
-// metrics export by default, which would leave that bean absent and fail the whole context.
-@AutoConfigureObservability
 class FailClosedIT extends PostgresTestSupport {
 
     private static final String OWNER = "JOHN";
@@ -104,12 +99,39 @@ class FailClosedIT extends PostgresTestSupport {
         assertThat(response.getStatusCode().value())
                 .isEqualTo(CashAccountErrorCode.UNSUPPORTED_METHOD.status().value());
         assertApiErrorShape(response, CashAccountErrorCode.UNSUPPORTED_METHOD, "UNSUPPORTED_METHOD");
+
+        // The 405 names the verb the path does accept, so a caller learns the contract from the rejection instead
+        // of probing for it: the debit mapping is PUT-only, and PUT alone is what Allow may therefore list.
+        assertThat(response.getHeaders().getAllow()).containsExactly(HttpMethod.PUT);
+    }
+
+    // OPTIONS is the one verb a caller can reach this service with without naming a contract operation, and Spring
+    // MVC answers it for every mapped path on its own with 200 and an Allow header - so it is the one path by which
+    // a request the service does not implement could still be answered as though it had succeeded, which is exactly
+    // the legacy fall-through this file exists to disprove.
+    @Test
+    void optionsOnAMappedPathIsRejectedAsUnsupportedMethod() {
+        ResponseEntity<String> response = rest.exchange("/cash-account/" + OWNER, HttpMethod.OPTIONS,
+                new HttpEntity<Void>(authenticatedHeaders()), String.class);
+
+        assertThat(response.getStatusCode().value())
+                .isEqualTo(CashAccountErrorCode.UNSUPPORTED_METHOD.status().value());
+        assertApiErrorShape(response, CashAccountErrorCode.UNSUPPORTED_METHOD, "UNSUPPORTED_METHOD");
+
+        // The rejection still reports the verbs the path does implement - asserted as a parsed set, because the
+        // order MVC computes them in is not part of the contract - and no longer offers the one just refused.
+        assertThat(response.getHeaders().getAllow()).containsExactlyInAnyOrder(HttpMethod.GET, HttpMethod.HEAD,
+                HttpMethod.POST, HttpMethod.PUT, HttpMethod.DELETE);
     }
 
     private ResponseEntity<String> authenticatedGet(String path) {
+        return rest.exchange(path, HttpMethod.GET, new HttpEntity<Void>(authenticatedHeaders()), String.class);
+    }
+
+    private static HttpHeaders authenticatedHeaders() {
         HttpHeaders headers = new HttpHeaders();
         headers.set(HttpHeaders.AUTHORIZATION, AUTHORIZATION);
-        return rest.exchange(path, HttpMethod.GET, new HttpEntity<Void>(headers), String.class);
+        return headers;
     }
 
     // Read as a tree rather than deserialized into ApiError, because only a tree can prove a field is ABSENT:

@@ -27,9 +27,9 @@ a reproducibility fact, which is not the same thing as a checksum artifact.
 | File | What it encodes | Finding / seed it carries | Expected tooling outcome |
 |---|---|---|---|
 | `cashaccounty.csv` | The legacy truth. Header `owner,balance,currencyc` per `DCLCASH.cpy:L17-L19` / `DB2DDL.jcl:L47-L49`; **7** data rows — the six `matched/` accounts plus `NULLBAL,,USD` | §0.4.5 nullable legacy columns: `balance` and `currencyc` carry no `NOT NULL` (`DB2DDL.jcl:L48-L49`) and the program declares no null indicators for them (`DCLCASH.cpy:L17-L19`), so a NULL is representable in a real export and unhandled by the program. §0.10.3 `NULLBAL` seed | `legacy_record_count 7`; `NULLBAL` → `STATE` / `NULL_IN_LEGACY`, account **not** loaded |
-| `frankfurt1.csv` | The legacy rate table. Header `currnkey,cyrrnbase,amount,rates,loaddt`; **4** data rows — the three `matched/` rates (`USD 1.00`, `EUR 0.92`, `GBP 0.79`) plus `ZZZ,,,,2024-01-15` | §0.4.1: `CURRNBASE` and `AMOUNT` are fetched by the credit and debit `SELECT` (`CASH00.cbl:L215`, `L249`) yet referenced by **no** `COMPUTE` and no `MOVE` — only `RATES` reaches the arithmetic (`L222`, `L256`) — so both columns are inert and are staged, never used. §0.4.5 nullability; §0.10.3 `ZZZ` seed | `ZZZ` → `RATE_SOURCE` / `NULL_RATE`, rate row **not** staged; the empty `cyrrnbase` and `amount` on that row are staged as NULL with **no** variance |
+| `frankfurt1.csv` | The legacy rate table. Header `currnkey,cyrrnbase,amount,rates,loaddt`; **4** data rows — the three `matched/` rates (`USD 1.00`, `EUR 0.92`, `GBP 0.79`) plus `ZZZ,,,,2024-01-15` | §0.4.1: `CURRNBASE` and `AMOUNT` are fetched by the credit and debit `SELECT` (`CASH00.cbl:L215`, `L249`) yet referenced by **no** `COMPUTE` and no `MOVE` — only `RATES` reaches the arithmetic (`L222`, `L256`) — so both columns are inert: a loadable row stages them and no code ever reads them. §0.4.5 nullability; §0.10.3 `ZZZ` seed | `ZZZ` → `RATE_SOURCE` / `NULL_RATE`, and **the whole row stays unstaged** — its null `rates` makes the key unloadable and the loader stages only the keys `validateSource()` left loadable, so the empty `cyrrnbase` and `amount` are not staged either. A null `cyrrnbase` or `amount` is what stages as NULL with **no** variance, but only on a row whose `rates` is non-null — not this one |
 | `target-state.csv` | The divergent already-migrated state — same account column shape as `cashaccounty.csv`; **5** data rows. `ReconciliationIT` loads it through `LegacyLoader` as if it were the result of an earlier faulty load, then reconciles `cashaccounty.csv` against it | §0.10.3 seeds: `KARRI` digit transposition, `ERIC` currency change, `GREG` absence | `migrated_record_count 5`; three of the five variance rows |
-| `history.csv` | **Byte-identical to `matched/history.csv`** — eight records, header `name,event_date,event_time,request_code,balance,currency,retcode` | §0.12.1 record layout (`CASH00.cbl:L38-L45`). Caller casing is preserved because `MOVE WS-NAME TO WS-VR-NAME` applies no case folding (`L111`); the retcode is nine digits because `MOVE SQLCODE TO WS-VR-RETCODE` renders it into `X(10)` (`L117`); two rows are `Q` because the write is unconditional, following `END-EVALUATE` (`L102`) with no guard (`L111-L131`) | Staged into `legacy_history` under the run id; contributes **no** variance |
+| `history.csv` | **Byte-identical to `matched/history.csv`** — eight records, header `name,event_date,event_time,request_code,balance,currency,retcode` | §0.12.1 record layout (`CASH00.cbl:L38-L45`). Caller casing is preserved because `MOVE WS-NAME TO WS-VR-NAME` applies no case folding (`L111`), which rows 1 and 2 carry as `John` and `JOHN` **at one shared stamp** (`20240115` `091500`), so the raw name alone separates their two 29-byte keys (`CASH00.cbl:L47-L50`; `DEFKSDS.jcl:L14`) — see `matched/MANIFEST.md` §3, and never re-separate them by editing a stamp; the retcode is nine digits because `MOVE SQLCODE TO WS-VR-RETCODE` renders it into `X(10)` (`L117`); two rows are `Q` because the write is unconditional, following `END-EVALUATE` (`L102`) with no guard (`L111-L131`) | Staged into `legacy_history` under the run id as two rows for `owner_key` `JOHN`; contributes **no** variance |
 | `history.cp037.bin` | **Byte-identical to `matched/history.cp037.bin`** — the same eight records as fixed-length 100-byte IBM037 records | §0.12.1 / §0.12.2 encoding; `RECSZ(100 100)` (`DEFKSDS.jcl:L11`); the §0.11.2 record-length open item | Decodes identically to `history.csv` (`LoaderIT`); requires `tool.history-record-length=100` |
 
 **Why the history pair is unchanged between the two variants.** Holding history byte-for-byte constant
@@ -78,7 +78,7 @@ Eight records of **100 bytes** each (57 data bytes + 43 bytes of EBCDIC space `0
 bytes**, no trailing newline.
 
 ```
-sha256  bb400ee499d6e7d611427782afc58497cb7bb3b0c182c0497adbfc8c6c552c97
+sha256  4c2146fdbff851ceaf812169d70ba5ad44f3b923b9435b9d5e0a0931b60bc241
 ```
 
 | Offset | Length | Field | Legacy picture |
@@ -146,7 +146,13 @@ expected count would become six, not five. The row seeds exactly one condition: 
 
 **`ZZZ` yields one row and not two.** A rate key is **never** currency-validated; only accounts are.
 So `ZZZ`, although it is not an ISO code and is not in the accepted set, produces only the
-`RATE_SOURCE` / `NULL_RATE` row for its empty `rates` field.
+`RATE_SOURCE` / `NULL_RATE` row for its empty `rates` field. That one row is also the only trace it
+leaves: the null `rates` puts the key among the rejected ones, the loader stages a rate row only for a
+key `validateSource()` left loadable, so **no `legacy_rate_table` row carries `ZZZ` at all** — not even
+its empty `cyrrnbase` and `amount` as NULLs. That is the intended outcome rather than a gap: with no
+staged rate, a later `C`/`D` replay for that currency is rejected by the target instead of being
+computed against the invented rate the legacy program used when its own `SELECT` failed
+(`CASH00.cbl:L215-L231`).
 
 ## 5. Encoding discipline
 

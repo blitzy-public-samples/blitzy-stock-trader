@@ -17,7 +17,6 @@
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.fx;
 
 import java.math.BigDecimal;
-import java.util.Locale;
 import java.util.Objects;
 
 import org.slf4j.Logger;
@@ -26,6 +25,8 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Primary;
 import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Component;
+
+import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.migration.reconcile.MigrationRun;
 
 // Selection by profile, never by qualifier (AAP 0.6.5). RetailCashAccountService injects the bare ExchangeRateSource
 // and must keep doing so: the whole point of the shadow comparator is that a replay exercises the REAL service code
@@ -42,8 +43,10 @@ import org.springframework.stereotype.Component;
 //
 // The value arrives through @Value because the fx package depends on nothing in config (AAP 0.8.2); tool.rate-source
 // is the key application-tool.yml declares and the runbook's Step 1 and Step 2 command lines pass, and the same key
-// with the same default is read by ReconciliationService and ShadowComparator, so no two of them can disagree about
-// which rate priced an expected balance.
+// with the same default is read by ReconciliationService and ShadowComparator. Those three readings agree because
+// all of them resolve the value through MigrationRun.RateSource.of(...), the single canonicalization: comparing the
+// raw text in one place and canonicalizing it in another is how a " LIVE " run could price live while its own rows
+// claimed the legacy-table parity gate.
 //
 // Delegation is bare, and each omission is load-bearing. Both delegates already normalize and validate their codes,
 // short-circuit a same-currency pair to exactly 1 and raise ExchangeRateUnavailableException when no rate can be
@@ -64,21 +67,14 @@ public class ToolExchangeRateSource implements ExchangeRateSource {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(ToolExchangeRateSource.class);
 
-    // The two legal values, spelled exactly as application-tool.yml documents them. Held as compile-time constants
-    // so they are legal switch case labels and so the rejection message below can list precisely what is accepted.
-    // No tolerant alias is recognized, because none is documented: accepting legacy_table or legacytable here would
-    // make the accepted spelling depend on which class read the property, and ReconciliationService and
-    // ShadowComparator match the documented tokens literally.
-    private static final String LEGACY_TABLE_SOURCE = "legacy-table";
-
-    private static final String LIVE_SOURCE = "live";
-
-    // A rejected value is echoed into an exception message that reaches an operator's console and a batch id into a
-    // log line, so each is echoed in a bounded form: enough to spot a typo, too little to carry an injected record.
+    // A batch id is echoed into a log line, so it is echoed in a bounded form: enough to identify the step, too
+    // little to carry an injected record. The rejected-value echo lives with the parsing, in
+    // MigrationRun.RateSource.of(...), for the same reason the parsing does - one place decides what the property
+    // says and what an operator is told when it says nothing usable.
     private static final int MAX_ECHOED_CHARS = 40;
 
-    // Stands in for an absent value in both the rejection message and the start-up line, so neither renders as an
-    // empty pair of quotes that reads like a tool defect rather than a missing argument.
+    // Stands in for an absent batch id in the start-up line, so it does not render as an empty pair of quotes that
+    // reads like a tool defect rather than a missing argument.
     private static final String UNSET = "<unset>";
 
     // Resolved once, in the constructor, and never re-read per call. The active rate source has to be constant for
@@ -110,25 +106,22 @@ public class ToolExchangeRateSource implements ExchangeRateSource {
             FrankfurterExchangeRateClient liveExchangeRateClient,
             @Value("${tool.rate-source:legacy-table}") String rateSource,
             @Value("${tool.batch-id:}") String batchId) {
-        String requested = rateSource == null ? "" : rateSource.trim().toLowerCase(Locale.ROOT);
+        // Canonicalized and validated by the policy, never by a comparison of this class's own: of(...) tolerates
+        // only surrounding whitespace and letter case, and fails closed on anything else, so this constructor and
+        // the two classifiers that read the same property cannot disagree about which source is in force.
+        MigrationRun.RateSource requested = MigrationRun.RateSource.of(rateSource);
 
-        // Fail closed, exactly as the module fails closed on an unmapped path, an unknown auth type and a
-        // non-postgres JDBC_KIND (AAP 0.6.5). Defaulting a misspelling such as --tool.rate-source=leagcy-table to
-        // either source would let a whole reconciliation run judge parity against rates the legacy program never
-        // saw - producing a wall of unexplained BALANCE variances, or worse a clean-looking run for the wrong
-        // reason, with nothing in the evidence to show which happened. Refusing to start costs one restart.
         this.delegate = switch (requested) {
-            case LEGACY_TABLE_SOURCE -> Objects.requireNonNull(legacyRateTableSource, "legacyRateTableSource");
-            case LIVE_SOURCE -> Objects.requireNonNull(liveExchangeRateClient, "liveExchangeRateClient");
-            default -> throw new IllegalStateException("tool.rate-source must be '" + LEGACY_TABLE_SOURCE + "' or '"
-                    + LIVE_SOURCE + "', but was '" + abbreviate(requested.isEmpty() ? UNSET : requested) + "'");
+            case LEGACY_TABLE -> Objects.requireNonNull(legacyRateTableSource, "legacyRateTableSource");
+            case LIVE -> Objects.requireNonNull(liveExchangeRateClient, "liveExchangeRateClient");
         };
 
         // One line, at start-up, never per call: the shadow comparator replays whole transaction streams through
         // this object, so a per-call line would bury the run's own evidence. Runbook Steps 1 and 2 require showing
-        // which rate source a run used, and this is the cheapest record of it that survives in a captured log.
-        LOGGER.info("Migration tooling exchange rate source: {} (tool.batch-id={})", requested,
-                abbreviate(batchId == null || batchId.isBlank() ? UNSET : batchId.trim()));
+        // which rate source a run used, and this is the cheapest record of it that survives in a captured log. The
+        // canonical token is logged rather than the raw value, so the transcript names the source that was applied.
+        LOGGER.info("Migration tooling exchange rate source: {} (tool.batch-id={})", requested.token(),
+                abbreviate(batchId == null || batchId.isBlank() ? UNSET : batchId.strip()));
     }
 
     @Override

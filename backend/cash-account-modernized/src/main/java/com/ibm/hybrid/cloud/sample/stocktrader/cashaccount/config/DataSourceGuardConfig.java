@@ -209,16 +209,38 @@ public class DataSourceGuardConfig {
         return url.toString();
     }
 
-    // Absent means off, reproducing <variable name="JDBC_SSL" defaultValue="false"/>
-    // [backend/portfolio/src/main/liberty/config/includes/postgres.xml:L2]. An unset, blank or unparsable value is
-    // read as "no TLS" and not as an error, because the chart's own database.ssl default is false
-    // [infra/stocktrader-operator/helm-charts/stocktrader/values.yaml:L74-L81] and a local run supplies nothing.
+    // Absence means off - that and only that reproduces <variable name="JDBC_SSL" defaultValue="false"/>
+    // [backend/portfolio/src/main/liberty/config/includes/postgres.xml:L2] and the chart's own database.ssl default
+    // [infra/stocktrader-operator/helm-charts/stocktrader/values.yaml:L81], which is what a local run relies on. A
+    // value that IS present and is neither true nor false is refused instead, because reading JDBC_SSL=ture as
+    // false would drop ssl=true&sslmode=verify-ca from the URL and the ledger's own database connection would lose
+    // server-certificate verification with nothing in the log to say so. That is the legacy dispatcher's
+    // silent-success failure mode - an unrecognized input falling through to a code that looks like it worked
+    // [backend/cash-account-cobol/COBOL/CASH00.cbl:L89-L102] - and this module is fail-closed by design (0.6.5).
     /**
+     * Parses the TLS flag strictly.
+     *
      * @param rawValue the configured {@code cashaccount.jdbc.ssl} (the chart's {@code JDBC_SSL})
-     * @return {@code true} only for a case-insensitive {@code true} after trimming
+     * @return {@code true} for a case-insensitive {@code true} after trimming, {@code false} for a case-insensitive
+     *         {@code false} and for an unset or blank value
+     * @throws IllegalStateException for any other value, so a typo cannot silently disable TLS
      */
     public static boolean sslEnabled(String rawValue) {
-        return rawValue != null && "true".equalsIgnoreCase(rawValue.trim());
+        if (!hasText(rawValue)) {
+            return false;
+        }
+        String candidate = rawValue.trim();
+        if ("true".equalsIgnoreCase(candidate)) {
+            return true;
+        }
+        if ("false".equalsIgnoreCase(candidate)) {
+            return false;
+        }
+        throw new IllegalStateException("Cannot assemble the cash ledger JDBC URL: JDBC_SSL (property"
+                + " cashaccount.jdbc.ssl) is '" + candidate + "', which is neither 'true' nor 'false'. Set the"
+                + " chart value database.ssl to one of those two, or leave the variable unset for no TLS - this"
+                + " service will not read an unrecognized value as 'no TLS' and connect without"
+                + " server-certificate verification.");
     }
 
     // cert_defaultTrustStore is not a canonical relaxed-binding name and belongs to no prefix this module owns, so
@@ -326,8 +348,10 @@ public class DataSourceGuardConfig {
     private static String requireConfigured(String value, String variable, String property) {
         if (!hasText(value)) {
             throw new IllegalStateException("Cannot assemble the cash ledger JDBC URL: " + variable + " (property "
-                    + property + ") is " + describe(value) + ". The chart injects it from the release configMap;"
-                    + " a hand-started run must supply it.");
+                    + property + ") is " + describe(value) + ". The chart injects it from the release configMap's"
+                    + " database.host/port/db keys; a hand-started run must supply it. There is no fallback on"
+                    + " purpose: a default would point this ledger at some other database instead of stopping"
+                    + " here.");
         }
         return value.trim();
     }

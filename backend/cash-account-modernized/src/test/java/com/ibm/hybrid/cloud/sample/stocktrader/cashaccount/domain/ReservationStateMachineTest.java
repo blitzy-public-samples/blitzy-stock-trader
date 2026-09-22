@@ -17,6 +17,7 @@
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.domain;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatNoException;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.tuple;
 import static org.assertj.core.api.InstanceOfAssertFactories.throwable;
@@ -74,6 +75,11 @@ class ReservationStateMachineTest {
 
     private static final String HOLD_AMOUNT = "250.00";
 
+    /** The account's currency; a hold in anything else is the CURRENCY_MISMATCH the institutional path refuses. */
+    private static final String ACCOUNT_CURRENCY = "USD";
+
+    private static final String OTHER_CURRENCY = "EUR";
+
     /** cash_reservation.request_hash is CHAR(64), so the factory demands exactly 64 characters. */
     private static final String REQUEST_HASH = "0123456789abcdef".repeat(4);
 
@@ -90,9 +96,19 @@ class ReservationStateMachineTest {
      * and every scenario that needs funds actually reserved calls hold first.
      */
     private static Fixture heldAtRest(String holdAmount) {
-        CashAccount account = CashAccount.open("JOHN", "USD", Money.of(OPENING_BALANCE));
-        CashReservation reservation = CashReservation.newHold(account, "ORDER-1", Money.of(holdAmount), "USD",
-                EXPIRES_AT, "idem-key-1", REQUEST_HASH);
+        return heldAtRest(holdAmount, ACCOUNT_CURRENCY);
+    }
+
+    /*
+     * The reservation currency is a parameter only so the CURRENCY_MISMATCH rejection can build a hold in a
+     * currency the account is not held in. CashReservation.newHold validates the code's shape and column
+     * width but never its equality with the account - that pairing rule is the state machine's, which is
+     * exactly what the rejection asserts.
+     */
+    private static Fixture heldAtRest(String holdAmount, String reservationCurrency) {
+        CashAccount account = CashAccount.open("JOHN", ACCOUNT_CURRENCY, Money.of(OPENING_BALANCE));
+        CashReservation reservation = CashReservation.newHold(account, "ORDER-1", Money.of(holdAmount),
+                reservationCurrency, EXPIRES_AT, "idem-key-1", REQUEST_HASH);
         return new Fixture(account, reservation);
     }
 
@@ -241,6 +257,15 @@ class ReservationStateMachineTest {
         assertRejectedWith(CashAccountErrorCode.INVALID_TRANSITION,
                 () -> ReservationStateMachine.settle(fromReleased.account(), fromReleased.reservation(),
                         Money.of(HOLD_AMOUNT), NOW));
+        /*
+         * The account-free decision answers the same rejection. It exists because a terminal reservation
+         * outlives the account it names - cash_reservation has no foreign key and its rows are retained after
+         * a retail DELETE (AAP 0.11.1) - so institutional/ReservationService must be able to refuse this
+         * without a CashAccount to pass in. Asserting it beside its account-taking twin is what keeps the two
+         * answers from drifting apart.
+         */
+        assertRejectedWith(CashAccountErrorCode.INVALID_TRANSITION,
+                () -> ReservationStateMachine.settleFromTerminal(fromReleased.reservation()));
 
         // PAST_EXPIRY appears only to drive the expiry; the settle under test is judged at NOW, and the
         // outcome is the same at either instant because isExpiredAt reports only a HELD reservation as
@@ -251,6 +276,8 @@ class ReservationStateMachineTest {
         assertRejectedWith(CashAccountErrorCode.INVALID_TRANSITION,
                 () -> ReservationStateMachine.settle(fromExpired.account(), fromExpired.reservation(),
                         Money.of(HOLD_AMOUNT), NOW));
+        assertRejectedWith(CashAccountErrorCode.INVALID_TRANSITION,
+                () -> ReservationStateMachine.settleFromTerminal(fromExpired.reservation()));
 
         Fixture fromSettled = heldAtRest(HOLD_AMOUNT);
         ReservationStateMachine.hold(fromSettled.account(), fromSettled.reservation());
@@ -258,6 +285,8 @@ class ReservationStateMachineTest {
                 Money.of(HOLD_AMOUNT), NOW);
         assertRejectedWith(CashAccountErrorCode.INVALID_TRANSITION,
                 () -> ReservationStateMachine.release(fromSettled.account(), fromSettled.reservation(), NOW));
+        assertRejectedWith(CashAccountErrorCode.INVALID_TRANSITION,
+                () -> ReservationStateMachine.releaseFromTerminal(fromSettled.reservation()));
 
         /*
          * The two amount rejections also assert the balances afterwards, and this is the only place the test
@@ -286,6 +315,63 @@ class ReservationStateMachineTest {
                 () -> ReservationStateMachine.hold(overHold.account(), overHold.reservation()));
         assertThat(overHold.account().availableBalance().amount()).isEqualTo(new BigDecimal("1000.00"));
         assertThat(overHold.account().reservedBalance().amount()).isEqualTo(new BigDecimal("0.00"));
+
+        /*
+         * The fifth rejection, and the only one that is about the pairing rather than the state: a hold in a
+         * currency the account is not held in is a 400 and not something to translate, because conversion
+         * never happens on the institutional path (AAP 0.7.2) - reserving 250.00 EUR against a USD account
+         * would leave the reserved balance and the account currency describing different money. It is refused
+         * before the available-funds check, so the balances and the reservation are read afterwards to show
+         * that nothing moved even though the account could easily have covered the amount.
+         */
+        Fixture currencyMismatch = heldAtRest(HOLD_AMOUNT, OTHER_CURRENCY);
+        assertRejectedWith(CashAccountErrorCode.CURRENCY_MISMATCH,
+                () -> ReservationStateMachine.hold(currencyMismatch.account(),
+                        currencyMismatch.reservation()));
+        assertThat(currencyMismatch.account().availableBalance().amount())
+                .isEqualTo(new BigDecimal("1000.00"));
+        assertThat(currencyMismatch.account().reservedBalance().amount()).isEqualTo(new BigDecimal("0.00"));
+        assertThat(currencyMismatch.reservation().state()).isEqualTo(ReservationState.HELD);
+        assertThat(currencyMismatch.reservation().settledAmount()).isNull();
+    }
+
+    @Test
+    void aBalanceIncreaseCannotFillTheRoomHeldFundsMustReturnTo() {
+        /*
+         * WHY THIS CASE EXISTS. A credit that bounded only the available balance could raise it to the ceiling
+         * while a hold still held funds in reserved_balance, and the release, settle or expiry that had to hand
+         * those funds back then had nowhere to put them: the reservation could reach no terminal state, the
+         * money stayed reserved for good, and retail PUT/DELETE answered RESERVATIONS_OUTSTANDING for as long
+         * as the row existed. The ceiling therefore bounds available + reserved, and the entry point exercised
+         * here is the one the retail credit, update and the migration loader all write through.
+         */
+        Fixture fixture = heldAtRest(HOLD_AMOUNT);
+        ReservationStateMachine.hold(fixture.account(), fixture.reservation());
+
+        // 9999999.99 is a legal Money and a legal available balance on its own; with 250.00 reserved the pair
+        // is not, so the write is refused and neither balance moves.
+        assertRejectedWith(CashAccountErrorCode.AMOUNT_OUT_OF_RANGE,
+                () -> fixture.account().overwriteAvailableBalance(Money.of("9999999.99")));
+        assertThat(fixture.account().availableBalance().amount()).isEqualTo(new BigDecimal("750.00"));
+        assertThat(fixture.account().reservedBalance().amount()).isEqualTo(new BigDecimal("250.00"));
+        assertThat(fixture.reservation().state()).isEqualTo(ReservationState.HELD);
+
+        // The credit that exactly fills the room the hold does not need is still accepted, so the guard bounds
+        // the pair rather than reserving headroom the account never uses: 9999749.99 + 250.00 is the ceiling.
+        fixture.account().overwriteAvailableBalance(Money.of("9999749.99"));
+        assertThat(fixture.account().totalBalance()).isEqualTo(new BigDecimal("9999999.99"));
+
+        // The point of the whole case: from that maximal state the hold is still terminable, which is what the
+        // lifecycle promises for every HELD reservation.
+        Effect effect = ReservationStateMachine.release(fixture.account(), fixture.reservation(), NOW);
+
+        assertThat(effect.resultingState()).isEqualTo(ReservationState.RELEASED);
+        assertThat(effect.availableBalance().amount()).isEqualTo(new BigDecimal("9999999.99"));
+        assertThat(effect.reservedBalance().amount()).isEqualTo(new BigDecimal("0.00"));
+        assertThat(effect.ledgerEffects())
+                .extracting(LedgerEffect::eventType, ledger -> ledger.amount().amount())
+                .containsExactly(tuple(LedgerEventType.RELEASE, new BigDecimal("250.00")));
+        assertThat(effect.idempotentNoOp()).isFalse();
     }
 
     @Test
@@ -309,6 +395,10 @@ class ReservationStateMachineTest {
         assertThat(settleAgain.ledgerEffects()).isEmpty();
         assertThat(settleAgain.availableBalance().amount()).isEqualTo(new BigDecimal("750.00"));
         assertThat(settleAgain.reservedBalance().amount()).isEqualTo(new BigDecimal("0.00"));
+        // The same no-op decided without the account, which is how the service answers a retry whose account
+        // has since been deleted: it accepts rather than throwing, and the caller reports the current state.
+        assertThatNoException()
+                .isThrownBy(() -> ReservationStateMachine.settleFromTerminal(settled.reservation()));
 
         Fixture released = heldAtRest(HOLD_AMOUNT);
         ReservationStateMachine.hold(released.account(), released.reservation());
@@ -321,6 +411,8 @@ class ReservationStateMachineTest {
         assertThat(releaseAgain.ledgerEffects()).isEmpty();
         assertThat(releaseAgain.availableBalance().amount()).isEqualTo(new BigDecimal("1000.00"));
         assertThat(releaseAgain.reservedBalance().amount()).isEqualTo(new BigDecimal("0.00"));
+        assertThatNoException()
+                .isThrownBy(() -> ReservationStateMachine.releaseFromTerminal(released.reservation()));
 
         // An expiry already put the funds where a release would: the caller's intent is satisfied, so the
         // release reports EXPIRED rather than refusing what the sweep happened to do first.
@@ -335,5 +427,7 @@ class ReservationStateMachineTest {
         assertThat(releaseExpired.ledgerEffects()).isEmpty();
         assertThat(releaseExpired.availableBalance().amount()).isEqualTo(new BigDecimal("1000.00"));
         assertThat(releaseExpired.reservedBalance().amount()).isEqualTo(new BigDecimal("0.00"));
+        assertThatNoException()
+                .isThrownBy(() -> ReservationStateMachine.releaseFromTerminal(expired.reservation()));
     }
 }

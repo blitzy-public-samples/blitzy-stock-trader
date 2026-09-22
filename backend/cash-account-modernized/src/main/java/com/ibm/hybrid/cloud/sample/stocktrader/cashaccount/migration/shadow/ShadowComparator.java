@@ -81,14 +81,6 @@ public class ShadowComparator {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(ShadowComparator.class);
 
-    // The one value of tool.rate-source that opens the RATE_SOURCE reclassification path; the default,
-    // legacy-table, is the parity gate, where both sides were priced from the same staged RATES and a
-    // difference therefore cannot be a rate difference (AAP 0.12.5).
-    private static final String LIVE_RATE_SOURCE = "live";
-
-    // The legacy-side reason token for a success reply that carried no balance to compare against.
-    private static final String ABSENT_IN_CAPTURE = "ABSENT_IN_CAPTURE";
-
     // The owner column of migration_reconciliation is NOT NULL, so a capture whose owner the target refuses
     // still needs a grouping key; this is the one used when nothing usable survives stripping.
     private static final String UNUSABLE_OWNER_KEY = "UNUSABLE_OWNER";
@@ -157,7 +149,12 @@ public class ShadowComparator {
 
     private final CashAccountRepository accounts;
 
-    private final String rateSource;
+    // Held as MigrationRun.RateSource rather than as raw text, because that type is the one place
+    // tool.rate-source is canonicalized: fx/ToolExchangeRateSource chooses the delegate that prices the replay
+    // from the same property after trimming and folding its case, so comparing the raw value here could leave a
+    // live-priced window classified as the legacy-table parity gate - where a difference cannot be a rate
+    // difference by definition (AAP 0.12.5) - and the window's rows would contradict the rates behind them.
+    private final MigrationRun.RateSource rateSource;
 
     // Constructed, not injected: DelimitedExportReader carries no Spring stereotype, holds no state and is
     // thread-safe, so a bean definition would add a wiring dependency that buys nothing - and declaring one
@@ -177,7 +174,7 @@ public class ShadowComparator {
         this.runs = Objects.requireNonNull(runs, "runs");
         this.legacyRates = Objects.requireNonNull(legacyRates, "legacyRates");
         this.accounts = Objects.requireNonNull(accounts, "accounts");
-        this.rateSource = Objects.requireNonNull(rateSource, "rateSource");
+        this.rateSource = MigrationRun.RateSource.of(rateSource);
         this.exportReader = new DelimitedExportReader();
     }
 
@@ -251,13 +248,32 @@ public class ShadowComparator {
         LOGGER.info("Shadow window {}: replaying {} captured transactions against {} captured replies",
                 run.runId(), transactionsBySeq.size(), responsesBySeq.size());
 
+        // THE COUNTS ARE RECORDED AS THEY BECOME TRUE, NOT AT THE END. Every evidence row below commits on its
+        // own (see the propagation note above), so a window that dies part-way leaves its findings in the table
+        // while this instance is the only statement of how far the replay got - and MigrationToolRunner writes
+        // that statement onto the FAILED row. Setting the counts after the last step would close such a row
+        // with zeros beside committed findings, which reads as "the attempt found nothing".
+        //
+        // The number of captured replies is final the moment the capture is indexed, and it is set here rather
+        // than after the lookup below because that lookup queries the database and can fail: a window that has
+        // read and joined its whole capture must never be recorded as one that read nothing.
+        run.setLegacyRecordCount(responsesBySeq.size());
+
         // Resolved once, and only where it can be used: the staged rate table is read exclusively by the
         // live-mode explanation below, so the default parity gate spends no query on it at all. One lookup up
         // front is also what keeps this class free of a mutable per-instance cache, which a @Service shared
         // across tool invocations must not carry.
-        UUID stagingLoadRunId = LIVE_RATE_SOURCE.equals(rateSource) ? latestLoadRunId(run.batchId()) : null;
+        UUID stagingLoadRunId = rateSource.isLive() ? latestLoadRunId(run.batchId()) : null;
 
+        int replayed = 0;
         for (Map.Entry<Long, ShadowTransaction> entry : transactionsBySeq.entrySet()) {
+            // RAISED BEFORE THE LINE IS TAKEN UP, NOT AFTER IT IS CLASSIFIED. The replay and the row that
+            // records its outcome commit in separate transactions, so a line whose target operation committed
+            // and whose evidence insert then failed has really happened and must appear in this count;
+            // incrementing afterwards would omit exactly that line and understate what the target did.
+            // Attempted, not accepted, which is the same rule as before: a line the target refused was still
+            // taken up, and its refusal is recorded as its own row rather than as a shortfall here.
+            run.setMigratedRecordCount(++replayed);
             replayAndClassify(run, entry.getKey(), entry.getValue(),
                     responsesBySeq.get(entry.getKey()), stagingLoadRunId);
         }
@@ -271,13 +287,12 @@ public class ShadowComparator {
         int varianceCount = Math.toIntExact(
                 reconciliations.countByRunIdAndStatus(run.runId(), ReconciliationStatus.VARIANCE));
 
-        // Exactly three fields of the run, and nothing else. The verdict, finishedAt, sourcePath, batchId and
-        // characterizationStatus belong to MigrationToolRunner, which opened this row as SHADOW/RUNNING and is
-        // the single closer of it; a second writer would let the row's status and its rows disagree.
-        run.setLegacyRecordCount(responsesBySeq.size());
-        // Attempted, not accepted: a capture line the target refused was still replayed, and its rejection is
-        // already recorded as its own row.
-        run.setMigratedRecordCount(transactionsBySeq.size());
+        // Exactly three fields of the run, and nothing else - the two above as the window progressed, this one
+        // now that the rows are in. The verdict, finishedAt, sourcePath, batchId and characterizationStatus
+        // belong to MigrationToolRunner, which opened this row as SHADOW/RUNNING and is the single closer of
+        // it; a second writer would let the row's status and its rows disagree. The row itself is deliberately
+        // not saved here for the same reason, which is why a lost window's counts reach the database through
+        // the runner's failure path (MigrationRun.recordProgress) rather than through a save of this instance.
         run.setVarianceCount(varianceCount);
 
         LOGGER.info("Shadow window {}: {} variance rows persisted", run.runId(), varianceCount);
@@ -395,13 +410,14 @@ public class ShadowComparator {
         BigDecimal capturedBalance = capturedBalance(legacyResponse);
         if (capturedBalance == null) {
             // A success reply that carried no balance leaves nothing to compare, so the line fails closed
-            // rather than being skipped silently. ReconciliationService.record renders the value columns of a
-            // BALANCE row from the two balances themselves (MigrationReconciliation.balance), so the absent
-            // legacy side reaches the row as a null balance, a null rendering and a null variance; the token
-            // names the condition for a reader of this classification and adding a second persist path to
-            // carry it would be worse than leaving it implicit.
+            // rather than being skipped silently - and the row has to say WHICH side was missing, or a reader
+            // cannot tell a malformed capture from a comparison the tool botched. The value columns of a
+            // BALANCE row are rendered by MigrationReconciliation.balance from the balances themselves, which
+            // is why the two value arguments are null here as they are for every BALANCE row: that factory
+            // writes MigrationReconciliation.ABSENT_IN_CAPTURE into legacy_value whenever the legacy balance
+            // is absent, leaving legacy_balance and the variance null because neither is knowable.
             reconciliationService.record(run, owner, VarianceKind.BALANCE, ReconciliationStatus.VARIANCE,
-                    ABSENT_IN_CAPTURE, response.balance().toPlainString(), null, response.balance());
+                    null, null, null, response.balance());
             return;
         }
 
@@ -719,9 +735,11 @@ public class ShadowComparator {
             if (folded.isEmpty()) {
                 return UNUSABLE_OWNER_KEY;
             }
-            return folded.length() <= OwnerNormalizer.MAX_LENGTH
+            // Counted and cut in code points, the unit OwnerNormalizer.MAX_LENGTH is stated in: a UTF-16 cut could
+            // split a supplementary character and leave an unpaired surrogate as the key's last unit.
+            return folded.codePointCount(0, folded.length()) <= OwnerNormalizer.MAX_LENGTH
                     ? folded
-                    : folded.substring(0, OwnerNormalizer.MAX_LENGTH);
+                    : folded.substring(0, folded.offsetByCodePoints(0, OwnerNormalizer.MAX_LENGTH));
         }
     }
 

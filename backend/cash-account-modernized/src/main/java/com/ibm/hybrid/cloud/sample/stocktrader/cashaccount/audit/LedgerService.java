@@ -174,11 +174,15 @@ public class LedgerService {
         Objects.requireNonNull(runId, "runId");
 
         // No existence check, deliberately: the partial index uq_ledger_entry_migration_load on (run_id, owner)
-        // WHERE event_type = 'MIGRATION_LOAD' is the deduplication rule for loader retries, and a read-then-write
-        // check here would both duplicate it and lose to a concurrent run. The constraint arbitrates, and the
-        // DataIntegrityViolationException it raises propagates so the loader's single transaction fails whole -
-        // either every export row is applied or the run is FAILED and a retry is a new run_id (AAP 0.6.3).
-        // amount is the resulting available balance, absolute rather than a delta, as for every load event.
+        // WHERE event_type = 'MIGRATION_LOAD' is the deduplication rule WITHIN one run - one load event per owner
+        // per run (AAP 0.6.3) - and a read-then-write check here would both duplicate it and lose to a concurrent
+        // run. It says nothing across runs, because a retry carries a new run_id: a retry is safe because the
+        // loader's load is one transaction, so a failed run leaves no row to duplicate, and because an owner whose
+        // balance and currency already match the export is left alone and writes no event at all. So the
+        // constraint arbitrates rather than a guard here, and the DataIntegrityViolationException it raises
+        // propagates, failing the loader's transaction whole - either every export row is applied or the run is
+        // FAILED (AAP 0.6.3). amount is the resulting available balance, absolute rather than a delta, as for
+        // every load event.
         return append(account.owner(), account.incarnationId(), LedgerEventType.MIGRATION_LOAD,
                 account.availableBalance(), account.currency(), account.availableBalance(),
                 account.reservedBalance(), null, null, LedgerEntry.Source.MIGRATION, runId);

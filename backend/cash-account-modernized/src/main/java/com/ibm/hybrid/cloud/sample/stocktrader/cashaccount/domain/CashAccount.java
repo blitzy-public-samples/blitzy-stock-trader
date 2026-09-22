@@ -97,13 +97,28 @@ public class CashAccount {
     @Column(name = "reserved_balance", precision = 9, scale = 2, nullable = false)
     private BigDecimal reservedBalance;
 
-    // A primitive long, not a Long: a new entity then starts at 0, which is what the column's DEFAULT 0 holds,
-    // so a row inserted by psql and a row inserted by the service are indistinguishable to the version check.
-    // Optimistic locking backs the pessimistic account lock taken by CashAccountRepository.findByOwnerForUpdate -
-    // a conflict that still slips through surfaces as 409 CONCURRENT_MODIFICATION rather than a lost update.
+    // A NULLABLE Long, and that nullability is load-bearing: it is how this entity declares that it has not been
+    // written yet. Spring Data decides between EntityManager.persist and EntityManager.merge from the version
+    // attribute, and it consults the attribute only when the attribute can be null - a PRIMITIVE version makes
+    // JpaMetamodelEntityInformation fall back to "is the @Id null?", and the @Id here is the assigned owner, which
+    // is never null. A fresh account would therefore be judged already-persisted and every save() would MERGE:
+    // Hibernate would SELECT the row, find the one a concurrent create had just committed, and UPDATE it - losing
+    // that account's balance and currency and answering 200 - instead of INSERTing and raising the primary-key
+    // violation that RetailCashAccountService.create translates into 409 ACCOUNT_ALREADY_EXISTS - the modern
+    // reading of the legacy INSERT's -803 against PRIMARY KEY(owner)
+    // [backend/cash-account-cobol/COBOL/CASH00.cbl:L153-L155;
+    // backend/cash-account-cobol/DB2-DDL/DB2DDL.jcl:L46-L50; AAP 0.12.3]. Null until written keeps creation an
+    // INSERT, which is what makes the owner primary key - and not the non-atomic existsByOwner pre-check - the
+    // authority on whether an account already exists.
+    //
+    // Nothing is given up by moving off the primitive: the column is NOT NULL DEFAULT 0, so a row inserted by psql
+    // loads with 0 exactly as a row inserted by this service does, and the two remain indistinguishable to the
+    // version check. Optimistic locking backs the pessimistic account lock taken by
+    // CashAccountRepository.findByOwnerForUpdate - a conflict that still slips through surfaces as
+    // 409 CONCURRENT_MODIFICATION rather than a lost update.
     @Version
     @Column(name = "version", nullable = false)
-    private long version;
+    private Long version;
 
     @Column(name = "created_at", nullable = false, updatable = false)
     private OffsetDateTime createdAt;
@@ -169,11 +184,16 @@ public class CashAccount {
     /**
      * Returns available plus reserved funds, the figure the institutional account view reports.
      *
-     * <p>Deliberately a {@link BigDecimal} and not a {@link Money}: each column is independently bounded by
-     * NUMERIC(9,2), so a legitimate pair of balances can sum past Money's 9,999,999.99 ceiling - hold the whole
-     * balance of a maximal account and credit the freed available balance back up again - and
-     * {@link Money#plus} would then raise AMOUNT_OUT_OF_RANGE on what is only a read. A query surface must not
-     * fail on state the writes were entitled to create. The sum is never stored, so no column has to hold it.</p>
+     * <p>Every write through this entity bounds the pair - {@link #overwriteAvailableBalance} and
+     * {@link #moveBalances} both refuse a result whose {@code available + reserved} exceeds
+     * {@link Money#MAX_VALUE} - so for any row the application created this sum is a representable amount,
+     * and a held reservation's funds always have room to come back.</p>
+     *
+     * <p>The return type stays {@link BigDecimal} rather than {@link Money} because a read must not fail on a
+     * row the application did not write: each column is independently {@code NUMERIC(9,2)}, so a row inserted
+     * or corrected with {@code psql} - or stored before the write guard existed - can still hold a pair that
+     * sums past the ceiling, and {@link Money#plus} would raise AMOUNT_OUT_OF_RANGE on what is only a query.
+     * The sum is never stored, so no column has to hold it.</p>
      */
     public BigDecimal totalBalance() {
         // Both operands are already at scale 2, so this setScale discards nothing and cannot round; it is here
@@ -181,7 +201,17 @@ public class CashAccount {
         return availableBalance.add(reservedBalance).setScale(Money.SCALE, Money.ROUNDING);
     }
 
-    public long version() {
+    /**
+     * The optimistic-locking version, {@code null} until the account has been written.
+     *
+     * <p>It returns the field verbatim and <strong>must keep doing so</strong>. Spring Data reads the version
+     * through property access when it decides whether to insert or to merge an entity, and this accessor is what
+     * it finds; coalescing the unsaved {@code null} to {@code 0} here would report every new account as already
+     * stored and send its creation through a merge - the very lost-update path the field's comment describes. The
+     * value is nullable for the same reason the field is, and a caller that wants the stored number should read it
+     * off an account it loaded.</p>
+     */
+    public Long version() {
         return version;
     }
 
@@ -200,11 +230,20 @@ public class CashAccount {
      * [backend/cash-account-cobol/COBOL/CASH00.cbl:L172-L177], and credit and debit computed a new absolute
      * balance before storing it the same way. Reserved funds are out of its reach by construction, so a retail
      * write can neither spend nor disturb money an institutional caller is holding.</p>
+     *
+     * @param newAvailableBalance the new absolute available balance
+     * @throws CashAccountException {@link CashAccountErrorCode#AMOUNT_OUT_OF_RANGE} when this balance plus the
+     *         funds already reserved would leave the representable range
      */
     public void overwriteAvailableBalance(Money newAvailableBalance) {
         if (newAvailableBalance == null) {
             throw new IllegalArgumentException("newAvailableBalance is required");
         }
+        // The pair is judged even though only one side moves: the reserved balance this write leaves alone is
+        // exactly what the returning funds of a held reservation will need room for. The stored field is read
+        // rather than reservedBalance(), so a row written outside the application is judged by the check below
+        // instead of failing earlier inside Money.of.
+        requireRepresentablePair(owner, newAvailableBalance.amount(), reservedBalance);
         this.availableBalance = newAvailableBalance.amount();
         touch();
     }
@@ -232,11 +271,14 @@ public class CashAccount {
      *
      * Both values arrive as Money, so each has already passed Money's scale, floor and ceiling rules; the
      * invariant that the pair is conserved across a transition belongs to the state machine that computed them.
+     * The pair's own ceiling is checked here rather than there, because it is the one rule every balance write
+     * shares and a second copy of it would be free to disagree.
      */
     void moveBalances(Money newAvailableBalance, Money newReservedBalance) {
         if (newAvailableBalance == null || newReservedBalance == null) {
             throw new IllegalArgumentException("newAvailableBalance and newReservedBalance are required");
         }
+        requireRepresentablePair(owner, newAvailableBalance.amount(), newReservedBalance.amount());
         this.availableBalance = newAvailableBalance.amount();
         this.reservedBalance = newReservedBalance.amount();
         touch();
@@ -267,6 +309,44 @@ public class CashAccount {
      */
     private void touch() {
         updatedAt = OffsetDateTime.now();
+    }
+
+    /*
+     * THE ONE CEILING EVERY BALANCE WRITE PASSES, AND WHY IT BOUNDS THE PAIR RATHER THAN EACH COLUMN. Money
+     * already bounds each value it carries to the legacy result field's range - WS-CALC is pic 9(7)V99 with no
+     * S in its picture [backend/cash-account-cobol/COBOL/CASH00.cbl:L17] - and the two columns are
+     * independently NUMERIC(9,2), so nothing below this method would refuse a pair that sums past that range.
+     * Such a pair is not a legal state of an account: reserved funds must always be able to come home, and a
+     * settle, release or expiry hands the held amount back onto the available balance through Money.plus. Let
+     * a retail credit fill the available side while a hold is outstanding and that credit-back has nowhere to
+     * land - the reservation can never reach a terminal state, the money stays in reserved_balance for good,
+     * and retail PUT/DELETE answer RESERVATIONS_OUTSTANDING indefinitely. Bounding available + reserved on
+     * every write is therefore what keeps HELD's terminal states reachable at all (AAP 0.6.3), and it lives
+     * here because this entity is the single point both the absolute write and the reservation write funnel
+     * through: retail create/update/credit/debit, the migration loader and all four reservation transitions.
+     *
+     * WHY 422 AND NOT 400: the request is well formed and nothing about the caller's input is wrong - it is
+     * the resulting balance that cannot be represented, which is exactly what AMOUNT_OUT_OF_RANGE states
+     * ("the result leaves 0.00 ... 9999999.99", AAP 0.6.2). The owner is attached because it is known here and
+     * not inside Money, and ApiError.owner is what tells an operator whose account refused the write.
+     *
+     * The comparison is against Money.MAX_VALUE, never a literal: widening the ceiling for institutional
+     * volumes is a recorded open item - one DDL change plus that constant (AAP 0.11.2) - and stays surgical
+     * only while the number exists in one place. open() needs no check of its own: the reserved balance starts
+     * at zero there and the opening balance is already a bounded Money.
+     *
+     * A null operand means an entity that reached a mutator without passing open() or a JPA load, since
+     * reserved_balance is NOT NULL in the schema; that is a defect in this module and is reported as one
+     * rather than dereferenced.
+     */
+    private static void requireRepresentablePair(String owner, BigDecimal newAvailableBalance,
+            BigDecimal newReservedBalance) {
+        if (newAvailableBalance == null || newReservedBalance == null) {
+            throw new IllegalArgumentException("both balances are required to judge the account ceiling");
+        }
+        if (newAvailableBalance.add(newReservedBalance).compareTo(Money.MAX_VALUE) > 0) {
+            throw CashAccountException.forOwner(CashAccountErrorCode.AMOUNT_OUT_OF_RANGE, owner);
+        }
     }
 
     /*

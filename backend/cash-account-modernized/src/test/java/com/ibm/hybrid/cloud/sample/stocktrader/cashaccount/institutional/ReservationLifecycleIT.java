@@ -204,6 +204,83 @@ class ReservationLifecycleIT extends PostgresTestSupport {
     }
 
     @Test
+    void replayIsRecognizedFromTheReturnedOrderReferenceAndOnlyFromTheExactPayload() throws Exception {
+        String owner = "REPLAYECHO";
+        String key = "IDEM-REPLAY-ECHO";
+        // An order reference carrying surrounding blanks, and an explicit expiry in a non-UTC offset at
+        // nanosecond precision. The two are treated differently on purpose: the reference is stored and
+        // returned verbatim because the idempotency hash is taken from it exactly (AAP 0.7.3), while the
+        // expiry is stored and returned as the same instant in UTC at the microsecond resolution TIMESTAMPTZ
+        // keeps, so the body a caller receives cannot differ from any later read of the row.
+        String orderReference = "  ORD-REPLAY-ECHO  ";
+        OffsetDateTime expiry = OffsetDateTime.parse("2099-06-01T14:00:00.123456789+02:00");
+        ResponseEntity<String> first =
+                openAccountAndPostHold(owner, key, holdBody(orderReference, "250.00", expiry));
+
+        ReservationResponse created = reservationOf(first);
+        assertThat(created.orderReference()).isEqualTo(orderReference);
+        assertThat(created.expiresAt()).isEqualTo(OffsetDateTime.parse("2099-06-01T12:00:00.123456Z"));
+
+        // The reference exactly as the response handed it back: the same request, so the original body comes
+        // back. A reference altered on its way into the column would hash to something else and be refused.
+        assertReplayedFrom(first, postHold(owner, key,
+                holdBody(created.orderReference(), "250.00", expiry)));
+
+        // Payloads differing only where the canonical form compares exactly - the blanks around the
+        // reference, and an expiry one nanosecond away - are different requests under one key, and the
+        // contract reports that rather than answering with the stored hold.
+        ResponseEntity<String> strippedReference =
+                postHold(owner, key, holdBody(orderReference.strip(), "250.00", expiry));
+        assertThat(strippedReference.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+        assertThat(errorOf(strippedReference).code()).isEqualTo(CashAccountErrorCode.IDEMPOTENCY_KEY_REUSED);
+
+        ResponseEntity<String> nearbyExpiry =
+                postHold(owner, key, holdBody(orderReference, "250.00", expiry.minusNanos(1)));
+        assertThat(nearbyExpiry.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+        assertThat(errorOf(nearbyExpiry).code()).isEqualTo(CashAccountErrorCode.IDEMPOTENCY_KEY_REUSED);
+
+        assertHeldExactlyOnce(owner, created.reservationId(), "250.00", "750.00");
+    }
+
+    @Test
+    void replayAfterATerminalTransitionStillReturnsTheOriginalHeldResponse() throws Exception {
+        // One test across the three terminal states rather than three near-identical ones (AAP 0.7.6): the
+        // property is single - a repeated key answers with the body its creating call returned - and what has
+        // to be shown is that it survives however the hold ended, since the row's own state, settled amount
+        // and updated_at have all moved on by the time the retry arrives.
+        String settleKey = "IDEM-REPLAY-AFTER-SETTLE";
+        String settleBody = holdBody("ORD-REPLAY-AFTER-SETTLE", "250.00", FIXED_EXPIRY);
+        ResponseEntity<String> settledFirst = openAccountAndPostHold("REPLAYSETTLED", settleKey, settleBody);
+        UUID settledId = reservationOf(settledFirst).reservationId();
+        assertThat(postSettle(settledId, new SettleRequest(null)).getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertReplayedFrom(settledFirst, postHold("REPLAYSETTLED", settleKey, settleBody));
+
+        String releaseKey = "IDEM-REPLAY-AFTER-RELEASE";
+        String releaseBody = holdBody("ORD-REPLAY-AFTER-RELEASE", "250.00", FIXED_EXPIRY);
+        ResponseEntity<String> releasedFirst = openAccountAndPostHold("REPLAYRELEASED", releaseKey, releaseBody);
+        UUID releasedId = reservationOf(releasedFirst).reservationId();
+        assertThat(postRelease(releasedId).getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertReplayedFrom(releasedFirst, postHold("REPLAYRELEASED", releaseKey, releaseBody));
+
+        // An expiry needs an overdue hold, so this one is created with a past expiresAt - accepted as handed
+        // in, the hold error set carries no code for it - and the sweep is called directly rather than waited
+        // for, as in the sweep case above. The replay re-sends this same body text, so the hash matches.
+        String expiryKey = "IDEM-REPLAY-AFTER-EXPIRY";
+        String expiryBody = holdBody("ORD-REPLAY-AFTER-EXPIRY", "250.00",
+                OffsetDateTime.now(ZoneOffset.UTC).minusMinutes(1));
+        ResponseEntity<String> expiredFirst = openAccountAndPostHold("REPLAYEXPIRED", expiryKey, expiryBody);
+        UUID expiredId = reservationOf(expiredFirst).reservationId();
+        assertThat(reservationService.sweepExpiredReservations()).isGreaterThanOrEqualTo(1);
+        assertReplayedFrom(expiredFirst, postHold("REPLAYEXPIRED", expiryKey, expiryBody));
+
+        // The three replays reported HELD because that is the answer owed to a retry; the reservations
+        // themselves really are terminal, and this is where a caller asking for current state is served.
+        assertThat(reservationOf(getReservation(settledId)).state()).isEqualTo(ReservationState.SETTLED);
+        assertThat(reservationOf(getReservation(releasedId)).state()).isEqualTo(ReservationState.RELEASED);
+        assertThat(reservationOf(getReservation(expiredId)).state()).isEqualTo(ReservationState.EXPIRED);
+    }
+
+    @Test
     void theSameKeyCarryingADifferentPayloadIsRejectedAsReuse() throws Exception {
         String owner = "REUSE1";
         openAccount(owner);
@@ -216,6 +293,69 @@ class ReservationLifecycleIT extends PostgresTestSupport {
         assertThat(reused.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
         assertThat(errorOf(reused).code()).isEqualTo(CashAccountErrorCode.IDEMPOTENCY_KEY_REUSED);
         assertHeldExactlyOnce(owner, reservationOf(first).reservationId(), "10.00", "990.00");
+    }
+
+    @Test
+    void aHoldWithNoIdempotencyKeyHeaderIsRefused() throws Exception {
+        String owner = "NOKEY1";
+        openAccount(owner);
+
+        // The header is declared required = false precisely so this request reaches the service and is answered
+        // with the contract's own 400 IDEMPOTENCY_KEY_REQUIRED (AAP 0.6.2) rather than Spring's generic
+        // missing-header error, and nothing but a request that omits it can prove that wiring still holds.
+        ResponseEntity<String> refused = postHold(owner, null, holdBody("ORD-NO-KEY", "250.00", FIXED_EXPIRY));
+
+        assertThat(refused.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(errorOf(refused).code()).isEqualTo(CashAccountErrorCode.IDEMPOTENCY_KEY_REQUIRED);
+        assertNothingHeld(owner);
+    }
+
+    @Test
+    void aHoldWhoseCurrencyIsMalformedIsRefused() throws Exception {
+        String owner = "BADCCY1";
+        openAccount(owner);
+
+        // HoldRequest constrains currency with @NotBlank alone, so "US" passes Bean Validation and the code that
+        // decides is the service's ^[A-Z]{3}$ check - which is why the assertion is on INVALID_CURRENCY and not
+        // on a validation failure. A hold that never reaches the service would pass this test for the wrong
+        // reason, so the balance and ledger assertions below fix which layer refused it.
+        ResponseEntity<String> refused =
+                postHold(owner, "IDEM-BAD-CURRENCY", holdBody("ORD-BAD-CURRENCY", "250.00", FIXED_EXPIRY, "US"));
+
+        assertThat(refused.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(errorOf(refused).code()).isEqualTo(CashAccountErrorCode.INVALID_CURRENCY);
+        assertNothingHeld(owner);
+    }
+
+    @Test
+    void aKeyRetainedFromADeletedAccountsLifeIsReuseInTheNewOne() throws Exception {
+        String owner = "REUSEINCARN";
+        String key = "IDEM-REUSE-INCARNATION";
+        String orderReference = "ORD-REUSE-INCARNATION";
+
+        // Reservation rows carry no foreign key and survive the retail DELETE, so the new account's incarnation_id
+        // makes (incarnation_id, idempotency_key) unique again and the database guard cannot refuse this key. If
+        // the service did not refuse it either, the identical payload would be answered as a replay of a hold that
+        // reserved funds in an account life that no longer exists - or worse, held the money a second time
+        // (AAP 0.6.3 cash_reservation, AAP 0.11.1). The release before the DELETE is required: a retail delete is
+        // refused with RESERVATIONS_OUTSTANDING while any hold is still HELD.
+        ReservationResponse firstLife = openAccountAndHold(owner, key, orderReference, "250.00", FIXED_EXPIRY);
+        assertThat(postRelease(firstLife.reservationId()).getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(deleteAccount(owner).getStatusCode()).isEqualTo(HttpStatus.OK);
+        openAccount(owner);
+
+        ResponseEntity<String> reused = postHold(owner, key, holdBody(orderReference, "250.00", FIXED_EXPIRY));
+
+        assertThat(reused.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+        assertThat(errorOf(reused).code()).isEqualTo(CashAccountErrorCode.IDEMPOTENCY_KEY_REUSED);
+        // One reservation row and one HOLD row for this owner in total - both the first life's, neither the
+        // refused call's - and the new account still holds its opening balance with nothing reserved.
+        assertThat(reservationRowCount(owner)).isEqualTo(1);
+        assertThat(rowsOf(ledger(owner), LedgerEventType.HOLD)).hasSize(1);
+        assertThat(rowsOf(ledger(owner), LedgerEventType.HOLD, firstLife.reservationId())).hasSize(1);
+        InstitutionalAccountResponse account = account(owner);
+        assertThat(account.availableBalance()).isEqualByComparingTo(new BigDecimal(OPENING_BALANCE));
+        assertThat(account.reservedBalance()).isEqualByComparingTo(ZERO);
     }
 
     @Test
@@ -271,11 +411,102 @@ class ReservationLifecycleIT extends PostgresTestSupport {
                 rowsOf(rows, LedgerEventType.SETTLEMENT, hold.reservationId());
         List<LedgerEntryResponse> releases = rowsOf(rows, LedgerEventType.RELEASE, hold.reservationId());
         assertThat(settlements).hasSize(1);
-        assertThat(settlements.get(0).amount()).isEqualByComparingTo(new BigDecimal("100.00"));
         assertThat(releases).hasSize(1);
-        assertThat(releases.get(0).amount()).isEqualByComparingTo(new BigDecimal("150.00"));
-        assertThat(releases.get(0).availableAfter()).isEqualByComparingTo(new BigDecimal("900.00"));
-        assertThat(releases.get(0).reservedAfter()).isEqualByComparingTo(ZERO);
+        LedgerEntryResponse settlement = settlements.get(0);
+        LedgerEntryResponse release = releases.get(0);
+        assertThat(settlement.amount()).isEqualByComparingTo(new BigDecimal("100.00"));
+        assertThat(release.amount()).isEqualByComparingTo(new BigDecimal("150.00"));
+        assertThat(release.availableAfter()).isEqualByComparingTo(new BigDecimal("900.00"));
+        assertThat(release.reservedAfter()).isEqualByComparingTo(ZERO);
+        // Every row of one transition carries the same post-transition balances, so the pair is
+        // indistinguishable by balance and the event type, the amount and the identity are all that separate
+        // them - which is precisely why the query's tie-break has to be the identity.
+        assertThat(settlement.availableAfter()).isEqualByComparingTo(new BigDecimal("900.00"));
+        assertThat(settlement.reservedAfter()).isEqualByComparingTo(ZERO);
+
+        /*
+         * The primary half of the ordering contract, asserted on the only transition in the module that
+         * writes two rows at once. ledger_entry.entry_id is GENERATED ALWAYS AS IDENTITY and the rows are
+         * appended in the order the state machine named them - SETTLEMENT then RELEASE - so the RELEASE holds
+         * the greater identity and a recorded_at at or after the SETTLEMENT's, never before it. Under
+         * "recordedAt DESC, entryId DESC" (AAP 0.6.2) the RELEASE therefore comes back first, and these are
+         * the two newest rows on this owner because nothing has touched it since. Filtering by event type
+         * alone, as this test once did, would have passed under any ordering at all.
+         *
+         * recorded_at is stamped per row at microsecond precision, so these two usually differ and this test
+         * alone cannot show that the secondary entryId ordering exists. That half is proved deterministically
+         * by theLedgerQueryBreaksARecordedAtTieOnTheEntryIdentity below.
+         */
+        assertThat(settlement.entryId()).isNotNull();
+        assertThat(release.entryId()).isNotNull();
+        assertThat(release.entryId()).isGreaterThan(settlement.entryId());
+        assertThat(release.recordedAt().toInstant())
+                .isAfterOrEqualTo(settlement.recordedAt().toInstant());
+        assertThat(rows.get(0).entryId()).isEqualTo(release.entryId());
+        assertThat(rows.get(1).entryId()).isEqualTo(settlement.entryId());
+        assertNewestFirst(rows);
+    }
+
+    @Test
+    void theLedgerQueryBreaksARecordedAtTieOnTheEntryIdentity() throws Exception {
+        /*
+         * The secondary half of "recordedAt DESC, entryId DESC", which no transition can exercise on its own:
+         * LedgerEntry stamps recorded_at per row, so even the two rows of one partial settlement land
+         * microseconds apart and sort correctly on the timestamp alone - a query that had lost its entryId
+         * tie-break would still answer them in the right order. An exact tie is therefore arranged here, and
+         * it has to be arranged at INSERT time because ledger_entry refuses UPDATE (LedgerImmutabilityIT
+         * asserts that guard). The identities stay generated, so the greater one belongs to the row inserted
+         * second, and the assertion fails the moment the secondary ordering is dropped or reversed.
+         */
+        String owner = "TIEBREAK1";
+        OffsetDateTime tie = OffsetDateTime.parse("2026-03-01T12:00:00Z");
+        Long settlementId = insertLedgerRow(owner, tie, LedgerEventType.SETTLEMENT, "100.00");
+        Long releaseId = insertLedgerRow(owner, tie, LedgerEventType.RELEASE, "150.00");
+        assertThat(releaseId).isGreaterThan(settlementId);
+
+        List<LedgerEntryResponse> rows = ledger(owner);
+
+        assertThat(rows).extracting(LedgerEntryResponse::entryId)
+                .containsExactly(releaseId, settlementId);
+        // The tie is real rather than assumed: both rows carry the one instant they were written with, so the
+        // order above can only have come from the identity.
+        assertThat(rows.get(0).recordedAt().toInstant()).isEqualTo(tie.toInstant());
+        assertThat(rows.get(1).recordedAt().toInstant()).isEqualTo(tie.toInstant());
+        assertNewestFirst(rows);
+    }
+
+    @Test
+    void aSubCentNegativeSettlementIsRejectedAndLeavesTheHoldIntact() throws Exception {
+        String owner = "NEGSETTLE1";
+        ReservationResponse hold = openAccountAndHold(owner, "IDEM-NEGSETTLE-1", "ORD-NEGSETTLE-1", "250.00",
+                FIXED_EXPIRY);
+
+        // SettleRequest carries no Bean Validation on purpose, because a settlement of zero is legal
+        // (AAP 0.6.2), so domain/Money is the only thing between this body and a state transition. The sub-cent
+        // magnitude is what makes the case: -0.001 truncates DOWN to 0.00 at scale 2, and a sign judged after
+        // that normalization would read the request as the legal zero settlement - settling nothing while
+        // releasing the whole hold, on a caller value that was never valid.
+        ResponseEntity<String> response =
+                postSettle(hold.reservationId(), new SettleRequest(new BigDecimal("-0.001")));
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(errorOf(response).code()).isEqualTo(CashAccountErrorCode.INVALID_AMOUNT);
+
+        // The amount is parsed before the lazy-expiry commit and before any lock is taken, so a rejected settle
+        // has to leave the reservation, the balance split and the ledger exactly as the hold left them.
+        assertThat(reservationOf(getReservation(hold.reservationId())).state())
+                .isEqualTo(ReservationState.HELD);
+
+        InstitutionalAccountResponse account = account(owner);
+        assertThat(account.availableBalance()).isEqualByComparingTo(new BigDecimal("750.00"));
+        assertThat(account.reservedBalance()).isEqualByComparingTo(new BigDecimal("250.00"));
+        assertThat(account.totalBalance()).isEqualByComparingTo(new BigDecimal(OPENING_BALANCE));
+
+        // Owner-wide rather than filtered by reservation: this owner holds exactly one reservation, so any
+        // settlement or release row at all would be the transition this rejection must have prevented.
+        List<LedgerEntryResponse> rows = ledger(owner);
+        assertThat(rowsOf(rows, LedgerEventType.SETTLEMENT)).isEmpty();
+        assertThat(rowsOf(rows, LedgerEventType.RELEASE)).isEmpty();
     }
 
     @Test
@@ -332,6 +563,175 @@ class ReservationLifecycleIT extends PostgresTestSupport {
     }
 
     @Test
+    void aLapsedHoldIsExpiredAndCommittedByTheRequestThatTouchesIt() throws Exception {
+        /*
+         * The lazy-expiry path, deterministically rather than as the coin-flip half of the sweep-versus-settle
+         * race below. A hold created already overdue - the hold error set defines no code for a past expiry,
+         * so it is accepted as handed in - is expired by the very request that touches it, inside the one
+         * account-locking transaction that request takes. The settle is then refused AFTER that transaction
+         * commits, which is the whole reason the refusal is raised outside it: the EXPIRY row every transition
+         * owes the audit trail survives the 409 instead of being rolled back with it. A release reports the
+         * expiry as its own answer, because an expiry has already moved the money where a release would.
+         *
+         * No sweep interferes: application-test.yml moves the interval out to PT1H, so the only pass in a test
+         * JVM is the one at context start-up, long before these two holds exist.
+         */
+        String settleOwner = "LAPSESETTLE";
+        ReservationResponse lapsedForSettle = openAccountAndHold(settleOwner, "IDEM-LAPSE-SETTLE",
+                "ORD-LAPSE-SETTLE", "250.00", OffsetDateTime.now(ZoneOffset.UTC).minusMinutes(1));
+
+        ResponseEntity<String> refused = postSettle(lapsedForSettle.reservationId(), new SettleRequest(null));
+
+        assertThat(refused.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(errorOf(refused).code()).isEqualTo(CashAccountErrorCode.INVALID_TRANSITION);
+        assertThat(reservationOf(getReservation(lapsedForSettle.reservationId())).state())
+                .isEqualTo(ReservationState.EXPIRED);
+
+        List<LedgerEntryResponse> settleOwnerRows = ledger(settleOwner);
+        List<LedgerEntryResponse> expiries =
+                rowsOf(settleOwnerRows, LedgerEventType.EXPIRY, lapsedForSettle.reservationId());
+        assertThat(expiries).hasSize(1);
+        assertThat(expiries.get(0).amount()).isEqualByComparingTo(new BigDecimal("250.00"));
+        assertThat(expiries.get(0).availableAfter()).isEqualByComparingTo(new BigDecimal(OPENING_BALANCE));
+        assertThat(expiries.get(0).reservedAfter()).isEqualByComparingTo(ZERO);
+        // SYSTEM even though a caller's settle is what noticed it: the event is the TTL elapsing, which is
+        // what makes a lazily expired hold indistinguishable from one the scheduled sweep reached first.
+        assertThat(expiries.get(0).source()).isEqualTo(LedgerEntry.Source.SYSTEM);
+        assertThat(rowsOf(settleOwnerRows, LedgerEventType.SETTLEMENT, lapsedForSettle.reservationId()))
+                .isEmpty();
+        InstitutionalAccountResponse afterRefusal = account(settleOwner);
+        assertThat(afterRefusal.availableBalance()).isEqualByComparingTo(new BigDecimal(OPENING_BALANCE));
+        assertThat(afterRefusal.reservedBalance()).isEqualByComparingTo(ZERO);
+
+        String releaseOwner = "LAPSERELEASE";
+        ReservationResponse lapsedForRelease = openAccountAndHold(releaseOwner, "IDEM-LAPSE-RELEASE",
+                "ORD-LAPSE-RELEASE", "250.00", OffsetDateTime.now(ZoneOffset.UTC).minusMinutes(1));
+
+        ResponseEntity<String> released = postRelease(lapsedForRelease.reservationId());
+
+        assertThat(released.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(reservationOf(released).state()).isEqualTo(ReservationState.EXPIRED);
+        List<LedgerEntryResponse> releaseOwnerRows = ledger(releaseOwner);
+        assertThat(rowsOf(releaseOwnerRows, LedgerEventType.EXPIRY, lapsedForRelease.reservationId()))
+                .hasSize(1);
+        // One terminal row for the hold, not an EXPIRY and a RELEASE: the expiry is the release's answer.
+        assertThat(rowsOf(releaseOwnerRows, LedgerEventType.RELEASE, lapsedForRelease.reservationId()))
+                .isEmpty();
+        InstitutionalAccountResponse afterRelease = account(releaseOwner);
+        assertThat(afterRelease.availableBalance()).isEqualByComparingTo(new BigDecimal(OPENING_BALANCE));
+        assertThat(afterRelease.reservedBalance()).isEqualByComparingTo(ZERO);
+    }
+
+    @Test
+    void terminalReservationsStillAnswerAfterTheirAccountIsDeleted() throws Exception {
+        /*
+         * A retail DELETE is refused with 409 RESERVATIONS_OUTSTANDING while any hold is HELD, so settling or
+         * releasing first and then deleting is the only shape in which a reservation can outlive its account
+         * - and cash_reservation carries no foreign key precisely so that the row survives as the audit
+         * record (AAP 0.11.1). A retrying caller must therefore still be answered from the reservation: its
+         * settle or release moves no money, so the account's absence is not its concern and must not become
+         * its error. Taking the account lock first, as an earlier shape did, answered every one of these
+         * calls with a 409 about the deleted account instead of the state the reservation is in.
+         */
+        String settledOwner = "GONESETTLED";
+        ReservationResponse settledHold = openAccountAndHold(settledOwner, "IDEM-GONE-SETTLED",
+                "ORD-GONE-SETTLED", "250.00", FIXED_EXPIRY);
+        assertThat(postSettle(settledHold.reservationId(), new SettleRequest(null)).getStatusCode())
+                .isEqualTo(HttpStatus.OK);
+        assertThat(deleteAccount(settledOwner).getStatusCode()).isEqualTo(HttpStatus.OK);
+
+        ResponseEntity<String> settleAgain = postSettle(settledHold.reservationId(), new SettleRequest(null));
+        assertThat(settleAgain.getStatusCode()).isEqualTo(HttpStatus.OK);
+        ReservationResponse stillSettled = reservationOf(settleAgain);
+        assertThat(stillSettled.reservationId()).isEqualTo(settledHold.reservationId());
+        assertThat(stillSettled.state()).isEqualTo(ReservationState.SETTLED);
+        assertThat(stillSettled.settledAmount()).isEqualByComparingTo(new BigDecimal("250.00"));
+
+        // Settled funds have left the account for good, so a release is still the 409 the contract names -
+        // decided from the reservation's state, not from whether its account happens to exist.
+        ResponseEntity<String> releaseSettled = postRelease(settledHold.reservationId());
+        assertThat(releaseSettled.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(errorOf(releaseSettled).code()).isEqualTo(CashAccountErrorCode.INVALID_TRANSITION);
+
+        String releasedOwner = "GONERELEASED";
+        ReservationResponse releasedHold = openAccountAndHold(releasedOwner, "IDEM-GONE-RELEASED",
+                "ORD-GONE-RELEASED", "250.00", FIXED_EXPIRY);
+        assertThat(postRelease(releasedHold.reservationId()).getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(deleteAccount(releasedOwner).getStatusCode()).isEqualTo(HttpStatus.OK);
+
+        ResponseEntity<String> releaseAgain = postRelease(releasedHold.reservationId());
+        assertThat(releaseAgain.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(reservationOf(releaseAgain).state()).isEqualTo(ReservationState.RELEASED);
+
+        ResponseEntity<String> settleReleased =
+                postSettle(releasedHold.reservationId(), new SettleRequest(null));
+        assertThat(settleReleased.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(errorOf(settleReleased).code()).isEqualTo(CashAccountErrorCode.INVALID_TRANSITION);
+
+        // None of the four calls above wrote a second terminal row for either hold, and the retained ledger
+        // is still each deleted owner's audit path.
+        List<LedgerEntryResponse> settledLedger = ledger(settledOwner);
+        assertThat(rowsOf(settledLedger, LedgerEventType.SETTLEMENT, settledHold.reservationId())).hasSize(1);
+        assertThat(rowsOf(settledLedger, LedgerEventType.RELEASE, settledHold.reservationId())).isEmpty();
+        assertThat(rowsOf(settledLedger, LedgerEventType.ACCOUNT_DELETED)).hasSize(1);
+
+        List<LedgerEntryResponse> releasedLedger = ledger(releasedOwner);
+        assertThat(rowsOf(releasedLedger, LedgerEventType.RELEASE, releasedHold.reservationId())).hasSize(1);
+        assertThat(rowsOf(releasedLedger, LedgerEventType.SETTLEMENT, releasedHold.reservationId()))
+                .isEmpty();
+    }
+
+    @Test
+    void amountsAboveTheStorageCeilingAnswerWithTheContractsOwnCodes() throws Exception {
+        String owner = "CEILING1";
+        openAccount(owner);
+
+        /*
+         * 50,000,000.00 is past the NUMERIC(9,2) ceiling of 9,999,999.99, so the money type cannot represent
+         * it as a balance - but that is the service's constraint, not the caller's condition. What the caller
+         * asked for is more than the account can cover, and INSUFFICIENT_FUNDS is the only 422 the hold
+         * contract declares (AAP 0.6.2); AMOUNT_OUT_OF_RANGE, which the money type raises on its own, is in
+         * neither endpoint's error set. No account can hold more than the ceiling, so the comparison cannot
+         * be wrong.
+         */
+        ResponseEntity<String> overCeilingHold =
+                postHold(owner, "IDEM-CEILING-1", holdBody("ORD-CEILING-1", "50000000.00", FIXED_EXPIRY));
+        assertThat(overCeilingHold.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
+        assertThat(errorOf(overCeilingHold).code()).isEqualTo(CashAccountErrorCode.INSUFFICIENT_FUNDS);
+        assertThat(reservationRowCount(owner)).isZero();
+        assertThat(rowsOf(ledger(owner), LedgerEventType.HOLD)).isEmpty();
+        InstitutionalAccountResponse refused = account(owner);
+        assertThat(refused.availableBalance()).isEqualByComparingTo(new BigDecimal(OPENING_BALANCE));
+        assertThat(refused.reservedBalance()).isEqualByComparingTo(ZERO);
+
+        ResponseEntity<String> held =
+                postHold(owner, "IDEM-CEILING-2", holdBody("ORD-CEILING-2", "250.00", FIXED_EXPIRY));
+        assertThat(held.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        UUID reservationId = reservationOf(held).reservationId();
+
+        // Above the ceiling a settle amount necessarily exceeds any held amount, which the settle contract
+        // answers with 400 INVALID_AMOUNT - and an ordinary over-held amount answers with the same code from
+        // the state machine under the lock, so the caller cannot tell the two routes apart.
+        ResponseEntity<String> overCeilingSettle =
+                postSettle(reservationId, new SettleRequest(new BigDecimal("50000000.00")));
+        assertThat(overCeilingSettle.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(errorOf(overCeilingSettle).code()).isEqualTo(CashAccountErrorCode.INVALID_AMOUNT);
+
+        ResponseEntity<String> overHeldSettle =
+                postSettle(reservationId, new SettleRequest(new BigDecimal("300.00")));
+        assertThat(overHeldSettle.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(errorOf(overHeldSettle).code()).isEqualTo(CashAccountErrorCode.INVALID_AMOUNT);
+
+        // Both refusals happened before anything was written, so the hold is still live and the funds are
+        // still split exactly as the hold left them.
+        assertThat(reservationOf(getReservation(reservationId)).state()).isEqualTo(ReservationState.HELD);
+        assertThat(rowsOf(ledger(owner), LedgerEventType.SETTLEMENT, reservationId)).isEmpty();
+        InstitutionalAccountResponse stillHeld = account(owner);
+        assertThat(stillHeld.availableBalance()).isEqualByComparingTo(new BigDecimal("750.00"));
+        assertThat(stillHeld.reservedBalance()).isEqualByComparingTo(new BigDecimal("250.00"));
+    }
+
+    @Test
     @Timeout(60)
     void concurrentIdenticalHoldsCreateExactlyOneReservation() throws Exception {
         String owner = "RACEHOLD1";
@@ -347,12 +747,12 @@ class ReservationLifecycleIT extends PostgresTestSupport {
         List<ResponseEntity<String>> responses = List.of(outcome.first(), outcome.second());
 
         assertThat(statusesOf(responses)).containsExactlyInAnyOrder(HttpStatus.CREATED, HttpStatus.OK);
-        UUID reservationId = reservationOf(withStatus(responses, HttpStatus.CREATED)).reservationId();
-        ReservationResponse replayed = reservationOf(withStatus(responses, HttpStatus.OK));
-        assertThat(replayed.reservationId()).isEqualTo(reservationId);
-        assertThat(replayed.amount()).isEqualByComparingTo(new BigDecimal("250.00"));
-        assertThat(replayed.state()).isEqualTo(ReservationState.HELD);
-        assertHeldExactlyOnce(owner, reservationId, "250.00", "750.00");
+        // The replay contract is the same one a sequential repeat is held to: the loser of the constraint
+        // re-read the winner's row, so it must answer with the winner's body and the replay header, not with
+        // a body of its own making.
+        ResponseEntity<String> created = withStatus(responses, HttpStatus.CREATED);
+        assertReplayedFrom(created, withStatus(responses, HttpStatus.OK));
+        assertHeldExactlyOnce(owner, reservationOf(created).reservationId(), "250.00", "750.00");
     }
 
     @Test
@@ -437,18 +837,38 @@ class ReservationLifecycleIT extends PostgresTestSupport {
     private ReservationResponse openAccountAndHold(String owner, String idempotencyKey, String orderReference,
             String amount, OffsetDateTime expiresAt) throws Exception {
 
-        openAccount(owner);
-        ResponseEntity<String> response =
-                postHold(owner, idempotencyKey, holdBody(orderReference, amount, expiresAt));
-        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CREATED);
-        return reservationOf(response);
+        return reservationOf(openAccountAndPostHold(owner, idempotencyKey,
+                holdBody(orderReference, amount, expiresAt)));
     }
 
+    // Hands back the raw response rather than the parsed reservation: the replay cases compare the body a
+    // caller received character for character, so the text has to survive the helper.
+    private ResponseEntity<String> openAccountAndPostHold(String owner, String idempotencyKey, String jsonBody)
+            throws Exception {
+
+        openAccount(owner);
+        ResponseEntity<String> created = postHold(owner, idempotencyKey, jsonBody);
+        assertThat(created.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        return created;
+    }
+
+    // A null key means the header is ABSENT, not empty: an empty value would be a different request, and the
+    // branch under test is the one Spring reaches when required = false and nothing was sent at all.
     private ResponseEntity<String> postHold(String owner, String idempotencyKey, String jsonBody) {
         HttpHeaders headers = authJson();
-        headers.set(ReservationController.IDEMPOTENCY_KEY_HEADER, idempotencyKey);
+        if (idempotencyKey != null) {
+            headers.set(ReservationController.IDEMPOTENCY_KEY_HEADER, idempotencyKey);
+        }
         return rest.exchange(url(INSTITUTIONAL_BASE + "/accounts/" + owner + "/holds"), HttpMethod.POST,
                 new HttpEntity<>(jsonBody, headers), String.class);
+    }
+
+    // The retail seam is used to delete, exactly as a real operator would: it is the only path that writes the
+    // ACCOUNT_DELETED ledger row and the only one that enforces the HELD-reservation guard. The response is
+    // returned rather than asserted here so a caller can state what it expects of the delete itself.
+    private ResponseEntity<String> deleteAccount(String owner) {
+        return rest.exchange(url(RETAIL_BASE + "/" + owner), HttpMethod.DELETE,
+                new HttpEntity<>(authJson()), String.class);
     }
 
     private ResponseEntity<String> postSettle(UUID reservationId, SettleRequest request) throws Exception {
@@ -481,23 +901,77 @@ class ReservationLifecycleIT extends PostgresTestSupport {
         return objectMapper.readValue(response.getBody(), new TypeReference<List<LedgerEntryResponse>>() { });
     }
 
+    /*
+     * The one write in this class that bypasses the service, and the only way to produce two ledger rows
+     * sharing an instant: LedgerEntry stamps recorded_at itself, and ledger_entry forbids UPDATE, so neither
+     * the write path nor a later correction can create the tie. INSERT is the single mutation the immutability
+     * trigger permits by design. entry_id is omitted so the identity column still generates it, and the three
+     * nullable columns are omitted rather than bound as nulls.
+     */
+    private Long insertLedgerRow(String owner, OffsetDateTime recordedAt, LedgerEventType eventType,
+            String amount) {
+
+        return jdbc.queryForObject("insert into ledger_entry (owner, incarnation_id, event_type, amount,"
+                        + " currency, available_after, reserved_after, source, recorded_at)"
+                        + " values (?, ?, ?, ?, ?, ?, ?, ?, ?) returning entry_id",
+                Long.class, owner, UUID.randomUUID(), eventType.name(), new BigDecimal(amount), CURRENCY,
+                new BigDecimal("900.00"), ZERO, LedgerEntry.Source.INSTITUTIONAL.name(), recordedAt);
+    }
+
     private int reservationRowCount(String owner) {
         Integer count = jdbc.queryForObject("select count(*) from cash_reservation where owner = ?",
                 Integer.class, owner);
         return count == null ? 0 : count;
     }
 
+    /*
+     * WHY THE WHOLE RESPONSE IS COMPARED RATHER THAN A FEW FIELDS OF IT. A replay owes the caller the answer
+     * its original call received (AAP 0.6.2, 0.7.3), so every component of that payload is part of the
+     * promise: an assertion on reservationId, amount and state alone stays green while owner, orderReference,
+     * settledAmount, currency or any of the three timestamps changes underneath it. The parsed records are
+     * compared first because a failure then names the component; the raw text follows because it is what the
+     * caller actually receives and it catches a rendering difference the parse would smooth over - an expiry
+     * or a created_at returned at nanosecond precision by the original call and at the microsecond resolution
+     * TIMESTAMPTZ keeps by the replay.
+     *
+     * The state and settled-amount assertions are what make this usable after a terminal transition: the body
+     * owed to a retry is the created hold, HELD with nothing settled, not the reservation as it stands now.
+     */
     private void assertReplayedFrom(ResponseEntity<String> first, ResponseEntity<String> replay)
             throws Exception {
 
         assertThat(replay.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(replay.getHeaders().getFirst(ReservationController.IDEMPOTENT_REPLAYED_HEADER))
                 .isEqualTo("true");
+
         ReservationResponse original = reservationOf(first);
         ReservationResponse stored = reservationOf(replay);
-        assertThat(stored.reservationId()).isEqualTo(original.reservationId());
-        assertThat(stored.amount()).isEqualByComparingTo(original.amount());
-        assertThat(stored.state()).isEqualTo(original.state());
+        assertThat(stored).isEqualTo(original);
+        assertThat(replay.getBody()).isEqualTo(first.getBody());
+
+        // Asserted on the replayed body: a projection that dropped a mandatory component would still equal a
+        // first response that dropped the same one, so equality alone cannot show the payload is complete.
+        assertThat(stored.reservationId()).isNotNull();
+        assertThat(stored.owner()).isNotBlank();
+        assertThat(stored.orderReference()).isNotBlank();
+        assertThat(stored.amount()).isNotNull();
+        assertThat(stored.currency()).isEqualTo(CURRENCY);
+        assertThat(stored.expiresAt()).isNotNull();
+        assertThat(stored.createdAt()).isNotNull();
+        assertThat(stored.updatedAt()).isNotNull();
+        assertThat(stored.state()).isEqualTo(ReservationState.HELD);
+        assertThat(stored.settledAmount()).isNull();
+    }
+
+    // The rejection assertions of the two validation cases: a refused hold must leave no reservation row, no
+    // HOLD ledger row and the opening balance untouched, because a 400 that still moved money would satisfy a
+    // status-only assertion.
+    private void assertNothingHeld(String owner) throws Exception {
+        assertThat(reservationRowCount(owner)).isZero();
+        assertThat(rowsOf(ledger(owner), LedgerEventType.HOLD)).isEmpty();
+        InstitutionalAccountResponse account = account(owner);
+        assertThat(account.availableBalance()).isEqualByComparingTo(new BigDecimal(OPENING_BALANCE));
+        assertThat(account.reservedBalance()).isEqualByComparingTo(ZERO);
     }
 
     private void assertHeldExactlyOnce(String owner, UUID reservationId, String heldAmount,
@@ -534,8 +1008,16 @@ class ReservationLifecycleIT extends PostgresTestSupport {
     // Hand-built rather than serialized from a HoldRequest: the scale case needs two payloads that differ as
     // TEXT on the wire, and a record would normalise both to the same rendering before they were ever sent.
     private static String holdBody(String orderReference, String amount, OffsetDateTime expiresAt) {
+        return holdBody(orderReference, amount, expiresAt, CURRENCY);
+    }
+
+    // The currency is a parameter of this form alone so a malformed code travels as raw text, exactly as a
+    // caller would send it, instead of being rejected client-side before the service ever judges it.
+    private static String holdBody(String orderReference, String amount, OffsetDateTime expiresAt,
+            String currency) {
+
         return "{\"orderReference\":\"" + orderReference + "\",\"amount\":" + amount
-                + ",\"currency\":\"" + CURRENCY + "\""
+                + ",\"currency\":\"" + currency + "\""
                 + (expiresAt == null ? "" : ",\"expiresAt\":\"" + expiresAt + "\"") + "}";
     }
 
@@ -548,6 +1030,23 @@ class ReservationLifecycleIT extends PostgresTestSupport {
         return rowsOf(rows, eventType).stream()
                 .filter(row -> reservationId.equals(row.reservationId()))
                 .toList();
+    }
+
+    /*
+     * The list-wide half of the ledger ordering contract, asserted in the shape AuditImmediacyIT uses:
+     * recordedAt descending, with the generated entry identity breaking a tie. The conditional is not a
+     * loophole - theLedgerQueryBreaksARecordedAtTieOnTheEntryIdentity arranges a genuine tie and asserts the
+     * identity order unconditionally, so this helper is what carries that check across a mixed list.
+     */
+    private static void assertNewestFirst(List<LedgerEntryResponse> rows) {
+        for (int index = 1; index < rows.size(); index++) {
+            LedgerEntryResponse newer = rows.get(index - 1);
+            LedgerEntryResponse older = rows.get(index);
+            assertThat(newer.recordedAt().toInstant()).isAfterOrEqualTo(older.recordedAt().toInstant());
+            if (newer.recordedAt().toInstant().equals(older.recordedAt().toInstant())) {
+                assertThat(newer.entryId()).isGreaterThan(older.entryId());
+            }
+        }
     }
 
     private static List<HttpStatusCode> statusesOf(List<ResponseEntity<String>> responses) {

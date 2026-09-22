@@ -74,12 +74,14 @@ missing.
   | Placeholder | Substitute with |
   | --- | --- |
   | `<release>`, `<namespace>`, `<name>` | The Helm release, its namespace, and the StockTrader CR name |
-  | `<registry>`, `<version>` | The image registry path and the version tag being promoted |
-  | `<host>`, `<port>`, `<database>`, `<id>`, `<password>` | PostgreSQL connection details, from the `database.*` values |
+  | `<registry>`, `<version>`, `<digest>` | The image registry path, the version tag being promoted, and the image digest Step 0 records |
+  | `<host>`, `<port>`, `<database>`, `<id>` | PostgreSQL connection details, from the `database.*` values. The **password is never a placeholder** — it is supplied as [Operator command safety](#operator-command-safety) describes |
   | `<uuid>` | A fresh batch id, one per runbook step |
   | `<W>` | The ledger watermark recorded in Step 3(d) |
   | `<dir>`, `<window-dir>` | The directory holding that run's export or shadow files |
-  | `<OWNER>`, `<reservationId>`, `<token>` | An account owner, a reservation id, and a bearer token for a caller with the `StockTrader` role |
+  | `<export-pvc>`, `<job-name>` | The read-only volume claim that carries the frozen final export the scheduled reconcile of Step 3 reads, and the name of one of that schedule's jobs |
+  | `<n>` | The sequence number of a repeated evidence file — `step3-reconcile-1.txt`, then `-2`, and so on |
+  | `<OWNER>`, `<reservationId>` | Named in prose only. In a command they arrive as **data** from a file, never substituted into it — see [Operator command safety](#operator-command-safety). A bearer token is likewise never substituted; it reaches `curl` from a protected config file |
   | `<broker-host>` | The broker service host, for the one post-cutover read through broker |
   | `<hlq>`, `<sequential-dataset>`, `<wlm-env>`, `<db2-ssid>` | z/OS high-level qualifier, target data set, WLM environment and DB2 subsystem — site values supplied by the mainframe team |
   | `<region-ccsid>`, `<region-zone>`, `<57-or-100>` | The CICS region's code page and time zone, and the history record length, all obtained as Step 1 preconditions |
@@ -101,6 +103,107 @@ missing.
   there would silently read production. Steps 3 and 4 run against the default search path, which by
   then is where the live tables are. Either form may be replaced by
   `SET search_path TO cash_account_rehearsal;` once per session, but not by relying on a default.
+- **Operator command safety.** Secrets and caller-supplied values are never typed into a command line.
+  The two mechanisms are defined once, immediately below, and every step that needs one uses them.
+
+### Operator command safety
+
+A command line is neither private nor inert, which is why neither a secret nor an owner is ever
+written into one.
+
+- Its `argv` is readable by every process on the host for as long as the command runs (`ps -o args=`,
+  and `/proc/<pid>/cmdline`, which is mode `-r--r--r--`), and an interactive shell writes the line
+  verbatim into `HISTFILE`.
+- A pasted value is *interpreted*, not passed. `JDBC_PASSWORD=p@ss w;rd$1` runs `rd` as a command,
+  expands `$1` to nothing, and leaves the tool authenticating as `p@ss` — a failure that looks like a
+  wrong password rather than a mangled one.
+- An owner is any non-blank value of up to 32 characters (`OwnerNormalizer` imposes no character
+  class), so `/`, `;`, `&`, `?`, `#`, `%`, a quote and even an embedded newline are all legal owners.
+
+**Secrets — database passwords and bearer tokens — come from a 0600 file.** Write it with the shell's
+own `printf`, which is a builtin and therefore never becomes another process's `argv`:
+
+```bash
+umask 077                                       # every file created below is 0600
+IFS= read -rsp 'JDBC_PASSWORD: ' CA_PW; echo
+printf 'JDBC_KIND=postgres\nJDBC_HOST=<host>\nJDBC_PORT=<port>\nJDBC_DB=<database>\nJDBC_ID=<id>\nJDBC_PASSWORD=%s\n' "$CA_PW" > ca-db.env
+unset CA_PW
+```
+
+```bash
+# A container reads that file directly: docker parses KEY=VALUE literally, with no shell parsing and
+# no expansion, so a password containing shell metacharacters arrives byte-for-byte.
+docker run --env-file ./ca-db.env ...
+
+# A shell loads the same file without interpreting any value. `set -a; . ca-db.env` would NOT do:
+# sourcing is shell parsing, and the password above would execute rather than load.
+while IFS='=' read -r k v; do [ -n "$k" ] && export "$k=$v"; done < ca-db.env
+export PGPASSWORD="$JDBC_PASSWORD"              # psql reads it from the environment, not from argv
+```
+
+```bash
+# A bearer token travels in a curl config file, so it reaches no argv and no shell history.
+IFS= read -rsp 'Bearer token: ' CA_TOKEN; echo
+printf 'header = "Authorization: Bearer %s"\n' "$CA_TOKEN" > ca-auth.conf
+unset CA_TOKEN
+curl -sS --config ./ca-auth.conf --url "<url>"
+```
+
+The token is minted **short-lived and for the change window only**, for a caller holding
+`StockTrader`. Every step that creates one of these files destroys it before the step closes, and a
+credential that was ever displayed on a terminal is rotated afterwards:
+
+```bash
+unset JDBC_PASSWORD PGPASSWORD
+shred -u ca-db.env ca-auth.conf 2>/dev/null || rm -f ca-db.env ca-auth.conf
+```
+
+**No evidence file carries a secret.** The evidence register is attached to a change record that many
+people read, so a credential is recorded by where it came from — "the `database.password` key of the
+release secret, read at 14:05 by the platform operator" — and never by its value.
+
+The whole environment is never captured and filtered. A denylist (`env | grep -vE 'PASSWORD|TOKEN'`)
+passes every secret whose name it did not anticipate — `AWS_SECRET_ACCESS_KEY`, `DOCKER_AUTH_CONFIG`,
+a bearer token in `CURL_CONFIG` — and one unanticipated name is one leaked credential. Emit the named
+non-secret fields instead, each one chosen deliberately:
+
+```bash
+for v in JDBC_KIND JDBC_HOST JDBC_PORT JDBC_DB JDBC_ID AUTH_TYPE JWT_ISSUER JWT_AUDIENCE; do
+  printf '%s=%s\n' "$v" "${!v-<unset>}"
+done > step1-tool-settings.env
+```
+
+`JDBC_ID` is a user name rather than a credential and is deliberately in the list; `JDBC_PASSWORD` is
+deliberately not, and neither is anything else absent from it.
+
+**Caller data — owners and reservation ids — is passed as data.** It is read from a file and quoted;
+it is never substituted into a command string, and `eval` is never applied to it. Extract the owner
+set with a real CSV reader (the export is RFC 4180, so a quoted field may itself contain a comma or a
+newline) into a **NUL-delimited** list, because a newline-delimited list cannot carry an owner that
+contains a newline:
+
+```bash
+python3 - "<dir>/cashaccounty.csv" > step3-owners.nul <<'PY'
+import csv, sys
+with open(sys.argv[1], newline='') as f:
+    for row in csv.DictReader(f):
+        owner = (row['owner'] or '').strip()
+        if owner:
+            sys.stdout.write(owner + '\0')
+PY
+```
+
+```bash
+# One path segment, RFC 3986. safe='' encodes '/' as well, so no owner can add a path element:
+# A/../ADMIN becomes A%2F..%2FADMIN, and an owner containing a newline becomes LINE1%0ALINE2.
+ca_urlencode() {
+  python3 -c 'import sys, urllib.parse; sys.stdout.write(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
+}
+```
+
+Define `ca_urlencode` once in the session (or in a helper file the session sources); every loop below
+assumes it. Each consuming loop then reads `while IFS= read -r -d '' owner`, encodes, and puts the
+result inside a quoted URL.
 
 ### Step index
 
@@ -162,13 +265,21 @@ traffic on the line.
 
 ### Actions
 
-1. **Record the image digest** produced by the README build path. The digest, not the tag, is what
-   Step 3(e) puts into `cashAccount.image.*`:
+1. **Record the image digest** produced by the README build path, **and the two chart field values it
+   splits into**, because the chart renders the image as `repository` and `tag` joined by a colon
+   (`…/templates/cash-account.yaml:L65`) and a digest reference has to be split at its final colon to
+   survive that:
 
    ```bash
-   docker inspect --format '{{index .RepoDigests 0}}' <registry>/cash-account:<version>
+   REF=$(docker inspect --format '{{index .RepoDigests 0}}' <registry>/cash-account:<version>)
+   echo "reference:                    $REF"
+   echo "cashAccount.image.repository: ${REF%:*}"   # <registry>/cash-account@sha256
+   echo "cashAccount.image.tag:        ${REF##*:}"  # the 64-character hex digest
    ```
 
+   Both values are recorded here so that gate 3(e) applies them rather than re-deriving them under
+   change-window pressure; the full contract, including the invalid mapping to avoid, is in
+   [`../README.md#carrying-the-digest-through-the-charts-fixed-repositorytag-rendering`](../README.md#carrying-the-digest-through-the-charts-fixed-repositorytag-rendering).
    A tag can be re-pointed after the fact and a digest cannot, which is what makes "the image we
    validated" and "the image the pod runs" the same statement. This command only answers after the
    push: a locally built image carries no `RepoDigests` entry.
@@ -185,17 +296,50 @@ traffic on the line.
 
    Capture whichever one governs the release, and both if both exist.
 
-3. **Run the pre-cutover catalog query** against the selected database:
+3. **Run the pre-cutover catalog query** against the selected database, in a session with **no
+   `search_path` override**, as the identity that owns the schema — so that what the query cannot see
+   is genuinely absent rather than merely invisible:
 
    ```sql
-   SELECT table_name, column_name, data_type
+   SELECT table_schema, table_name, column_name, data_type
      FROM information_schema.columns
     WHERE table_name IN ('cashaccount','cash_account')
+    ORDER BY 1,2,3;
+   ```
+
+   `table_schema` is in the select list and the sort key because **a relation without its schema is
+   not located.** Step 1 deliberately creates `cash_account` in `cash_account_rehearsal`, so from
+   Step 1 onwards the unqualified output cannot distinguish "the rehearsal table exists, production is
+   still clean" — the intended state — from "this schema was applied to production", which blocks
+   Step 3(b). The same omission would hide a second `cashaccount` in another schema behind rows that
+   look like one table.
+
+   Run the companion query in the same session, and keep both outputs:
+
+   ```sql
+   SELECT n.nspname AS table_schema,
+          c.relname AS table_name,
+          n.nspname = ANY (current_schemas(false)) AS on_search_path
+     FROM pg_catalog.pg_class c
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relname IN ('cashaccount','cash_account')
+      AND c.relkind = 'r'
     ORDER BY 1,2;
    ```
 
-   The output must show **no `cash_account` at all** and, if `cashaccount` is present, its columns
-   exactly as the estate created them.
+   It exists because `information_schema` **filters by privilege**: a role without privileges on
+   `cashaccount` gets an empty result for a table that is plainly there, and an empty result is
+   exactly what the pass condition below wants to see for `cash_account`. The `pg_catalog` view
+   answers for every role, and `on_search_path` names which schema is "production" for this
+   session — the one Step 3 will use — without hard-coding `public`.
+
+   The pass condition, in schema terms:
+
+   | Gate | `cash_account` | `cashaccount` |
+   | --- | --- | --- |
+   | Step 0 baseline | **Absent from every schema** | If present: its columns exactly as the estate created them, in the schema that reports `on_search_path = t` |
+   | Re-run after Step 1 | Present in `cash_account_rehearsal` **and nowhere else** — in particular not in the schema that reports `on_search_path = t` | Rows byte-identical to the baseline |
+   | Re-run after Step 3(b) | Present in the schema that reports `on_search_path = t` (the final load's target), and in `cash_account_rehearsal` while the rehearsal schema still exists | Rows byte-identical to the baseline |
 
    Those two names are **different tables**, and the distinction is the whole point of the query. The
    estate's Azure init template creates a never-built Java-flavour `cashaccount(owner VARCHAR(32),
@@ -203,35 +347,107 @@ traffic on the line.
    (`infra/stocktrader-setup/azure/modules/postgres_init/init_schema.sql.tmpl:L3-L9`). This module's
    table is `cash_account` — underscore, `NUMERIC(9,2)`, available and reserved balances — and it
    neither reads nor alters `cashaccount`. Baselining the catalog now is how anyone can later show that
-   nothing in this migration touched a table it does not own: the same query is re-run after Steps 1
-   and 3, and the `cashaccount` rows must come back **byte-identical**.
+   nothing in this migration touched a table it does not own: both queries are re-run at each gate in
+   the table above, and each re-run is diffed against this baseline.
 
-4. **Run the memory-fit check** and observe readiness inside the chart's envelope:
+4. **Run the memory-fit check against a disposable database**, and observe readiness inside the
+   chart's envelope.
+
+   **This check must never be pointed at the release's store — the one action 3 just baselined, or
+   any other store this migration does not own.** Starting the image applies the schema: the service
+   runs with `spring.sql.init.mode=always` and
+   `spring.sql.init.schema-locations=classpath:schema/cash-account-schema.sql`
+   (`../src/main/resources/application.yml`), so every start creates the seven tables, the
+   `ledger_entry_reject()` function and the `ledger_entry_immutable` trigger in whatever schema the
+   connection resolves to. Against the selected store that would mutate it, void the `cashaccount`
+   baseline captured moments earlier, and put a `cash_account` into production before Step 3(b) — the
+   one thing Step 0 exists to rule out. Nor is "turn the initializer off" the alternative:
+   `spring.jpa.hibernate.ddl-auto=validate` then fails start-up against a store without those tables,
+   and readiness includes the `db` indicator, so a check with no reachable database can never answer
+   `200`. The isolation *is* the mechanism.
+
+   Create a throwaway PostgreSQL and a throwaway credential for it, both destroyed at the end of this
+   action. `--env-file` and the builtin `printf` keep the credential out of every `argv`, per
+   [Operator command safety](#operator-command-safety):
 
    ```bash
-   docker run --rm --memory=2g --cpus=1 \
-     -e JDBC_KIND=postgres -e JDBC_HOST=<host> -e JDBC_PORT=<port> -e JDBC_DB=<database> \
-     -e JDBC_ID=<id> -e JDBC_PASSWORD=<password> -e AUTH_TYPE=basic \
-     -p 8080:8080 <registry>/cash-account:<version>
+   umask 077
+   { printf 'POSTGRES_USER=memfit\nPOSTGRES_DB=memfit\nPOSTGRES_PASSWORD='; openssl rand -hex 24; } > memfit-db.env
+   { printf 'JDBC_KIND=postgres\nJDBC_HOST=ca-memfit-db\nJDBC_PORT=5432\nJDBC_DB=memfit\nJDBC_ID=memfit\nAUTH_TYPE=basic\nJDBC_PASSWORD='
+     sed -n 's/^POSTGRES_PASSWORD=//p' memfit-db.env; } > memfit-app.env
    ```
 
    ```bash
-   curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8080/actuator/health/readiness
+   docker network create ca-memfit-net
+   # A NAMED data volume, so the teardown below can remove exactly this cluster and nothing else:
+   # postgres:12.22-alpine declares /var/lib/postgresql/data as a VOLUME, and an anonymous one would
+   # have to be found among every dangling volume on a shared host.
+   docker run -d --name ca-memfit-db --network ca-memfit-net \
+     -v ca-memfit-data:/var/lib/postgresql/data \
+     --env-file ./memfit-db.env postgres:12.22-alpine
+   docker run -d --name ca-memfit-app --network ca-memfit-net --memory=2g --cpus=1 \
+     --env-file ./memfit-app.env -p 8080:8080 <registry>/cash-account:<version>
    ```
 
+   ```bash
+   # Poll rather than assume: a detached container has started a process, not answered a request, and
+   # this one applies the schema first. Anything other than 200 at the end is a failed check.
+   code=000
+   for i in $(seq 1 30); do
+     code=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' \
+                 http://localhost:8080/actuator/health/readiness) || code=000
+     [ "$code" = 200 ] && break
+     sleep 2
+   done
+   printf 'readiness=%s after %ss\n' "$code" "$((i * 2))"
+   [ "$code" = 200 ] || echo 'MEMORY-FIT CHECK FAILED - do not sign off; capture the logs below'
+   docker logs ca-memfit-app 2>&1 | grep -iE 'MaxRAM|Started CashAccountApplication'
+   ```
+
+   This action needs a host with Docker and the ability to pull `postgres:12.22-alpine` — it is the one
+   Step 0 item that runs a container rather than a query. `postgres:12.22-alpine` is the estate's
+   provisioned major version and the floor this module's
+   schema is written against, so the throwaway instance exercises the same DDL the release will get.
    `--memory=2g --cpus=1` mirrors the chart's limits
    (`…/templates/cash-account.yaml:L224-L232`). The check is **manual because no in-repo test can
    assert it**: the base image's `run-java.sh` derives the heap from the container memory limit, so the
    answer depends on the runtime limit rather than on anything a unit or integration test observes.
+
+   Tear the whole thing down — the point of a disposable instance is that nothing survives it. Run
+   this **whether the check passed or failed**; a failed check leaves a database holding the schema and
+   a file holding a credential, which is the worse of the two states to walk away from:
+
+   ```bash
+   # The volume is removed by name. `docker rm -f` never removes a named volume, and removing the
+   # container alone would leave the whole cluster - schema included - on the host.
+   docker rm -fv ca-memfit-app ca-memfit-db
+   docker network rm ca-memfit-net
+   docker volume rm ca-memfit-data
+   shred -u memfit-db.env memfit-app.env 2>/dev/null || rm -f memfit-db.env memfit-app.env
+   ```
+
+   Confirm the teardown rather than assuming it: each of the three commands below must print nothing.
+
+   ```bash
+   docker ps -a --filter name=ca-memfit --format '{{.Names}}'
+   docker volume ls -q --filter name=ca-memfit-data
+   ls memfit-db.env memfit-app.env 2>/dev/null
+   ```
+
+   *Gate:* readiness answers `200` under the chart's limits, and the seven tables exist **only** in the
+   throwaway instance. If this check was ever run against the selected store, treat
+   `step0-catalog-baseline.txt` as void: re-run action 3, record what the start-up created, and refer
+   the state to the cash-account data owner and the DDL-owning role before Step 1 begins. Step 0 is
+   signed off on the claim that it changed no state this migration owns, and that claim has to be true.
 
 ### Evidence to capture
 
 | Item | What it is |
 | --- | --- |
 | `step0-values-snapshot.yaml` / `step0-cr-snapshot.yaml` | The live values or CR, verbatim. The rollback target for Step 3 |
-| `step0-image-digest.txt` | The pushed image digest from `docker inspect` |
-| `step0-catalog-baseline.txt` | The catalog query output: no `cash_account`, `cashaccount` as created |
-| `step0-memory-fit.txt` | The `docker run --memory=2g --cpus=1` observation and the readiness status code |
+| `step0-image-digest.txt` | The pushed image digest from `docker inspect`, and the `cashAccount.image.repository` / `.tag` values it splits into, which gate 3(e) applies verbatim |
+| `step0-catalog-baseline.txt` | Both catalog queries' output, schema-qualified: `cash_account` absent from every schema, `cashaccount` as the estate created it, and which schema reports `on_search_path = t` |
+| `step0-memory-fit.txt` | The readiness status code and the heap line under `--memory=2g --cpus=1`, **naming the throwaway instance it ran against** and recording that it was destroyed. A memory-fit record that names the release's store is a Step 0 failure, not evidence |
 | `step0-store.txt` | The effective `database.kind` and the server version reported by `SELECT version();` |
 
 ### Sign-off required
@@ -248,8 +464,11 @@ is a **block**: any unmet prerequisite stops every step below from beginning. In
 
 - `database.kind` still `db2`, or a server older than PostgreSQL 12;
 - no recorded image digest, or a digest that does not match the artifact that passed `./mvnw -B clean verify`;
-- a catalog query showing a pre-existing `cash_account` — which means something already applied this
-  schema, and the "final load into an empty production schema" gate in Step 3(b) cannot be evaluated;
+- a catalog query showing a pre-existing `cash_account` in any schema — which means something already
+  applied this schema, and the "final load into an empty production schema" gate in Step 3(b) cannot
+  be evaluated;
+- a memory-fit check run against the release's store rather than the throwaway instance, which creates
+  exactly that `cash_account` and voids the baseline;
 - `vault.enabled` true;
 - no `CREATE SCHEMA` identity, which makes Step 1's isolation impossible.
 
@@ -330,11 +549,133 @@ the artifacts in this repository and must be reconciled with the deployed catalo
    `DSN=<hlq>.FRANKFRT.CSV`. Both tables live in table space `STOCKTRD.TSSTAPP`
    (`backend/cash-account-cobol/DB2-DDL/DB2DDL.jcl:L46-L62`).
 
-   Where the `UNLOAD` utility is not licensed, `DSNTIAUL` is the alternative, run under `IKJEFT01` with
-   `RUN PROGRAM(DSNTIAUL) PLAN(DSNTIAUL) PARMS('SQL')` and a `SYSIN` of
-   `SELECT * FROM STOCKTRD.CASHACCOUNTY;`. `DSNTIAUL` writes a **fixed-format** record, so the
-   delimited conversion becomes a separate `SORT`/`OUTREC` step — one more place for a column to shift,
-   which is why the `UNLOAD` template is the primary path.
+   Where the `UNLOAD` utility is not licensed, `DSNTIAUL` is the alternative, and it is a complete
+   second path rather than a hint: one job, both tables, and output that already satisfies the reader
+   contract below. `DSNTIAUL` writes one `SYSRECnn` per `SELECT` in statement order, so both tables
+   leave in a single step:
+
+   ```jcl
+   //UNLDTIAU JOB (ACCT#),'DSNTIAUL CASH',NOTIFY=&SYSUID,CLASS=A,
+   // MSGCLASS=H,MSGLEVEL=(1,1)
+   //TIAUL    EXEC PGM=IKJEFT01,DYNAMNBR=20,REGION=0M
+   //STEPLIB  DD  DISP=SHR,DSN=<db2-hlq>.SDSNEXIT
+   //         DD  DISP=SHR,DSN=<db2-hlq>.SDSNLOAD
+   //SYSTSPRT DD  SYSOUT=*
+   //SYSPRINT DD  SYSOUT=*
+   //SYSUDUMP DD  SYSOUT=*
+   //SYSPUNCH DD  DUMMY
+   //SYSREC00 DD  DSN=<hlq>.CASHACCT.BODY,DISP=(NEW,CATLG,DELETE),
+   //             SPACE=(CYL,(50,50),RLSE),UNIT=SYSDA,
+   //             DCB=(RECFM=FB,LRECL=100,BLKSIZE=27900)
+   //SYSREC01 DD  DSN=<hlq>.FRANKFRT.BODY,DISP=(NEW,CATLG,DELETE),
+   //             SPACE=(CYL,(5,5),RLSE),UNIT=SYSDA,
+   //             DCB=(RECFM=FB,LRECL=64,BLKSIZE=27904)
+   //SYSTSIN  DD  *
+     DSN SYSTEM(<db2-ssid>)
+     RUN  PROGRAM(DSNTIAUL) PLAN(DSNTIAUL) PARMS('SQL') -
+          LIB('<db2-hlq>.RUNLIB.LOAD')
+     END
+   //SYSIN    DD  *
+     SELECT CAST(COALESCE(
+         '"' CONCAT REPLACE(STRIP(OWNER,TRAILING),'"','""') CONCAT '"'
+         CONCAT ',' CONCAT
+         CASE WHEN BALANCE IS NULL THEN '' ELSE
+              CASE WHEN BALANCE < 0 THEN '-' ELSE '' END CONCAT
+              SUBSTR(DIGITS(BALANCE),1,7) CONCAT '.' CONCAT
+              SUBSTR(DIGITS(BALANCE),8,2)
+         END CONCAT ',' CONCAT
+         CASE WHEN CURRENCYC IS NULL THEN '' ELSE
+              '"' CONCAT REPLACE(STRIP(CURRENCYC,TRAILING),'"','""')
+              CONCAT '"'
+         END
+       ,'') AS CHAR(100))
+       FROM STOCKTRD.CASHACCOUNTY;
+     SELECT CAST(COALESCE(
+         '"' CONCAT REPLACE(STRIP(CURRNKEY,TRAILING),'"','""') CONCAT '"'
+         CONCAT ',' CONCAT
+         CASE WHEN CYRRNBASE IS NULL THEN '' ELSE
+              '"' CONCAT REPLACE(STRIP(CYRRNBASE,TRAILING),'"','""')
+              CONCAT '"'
+         END CONCAT ',' CONCAT
+         CASE WHEN AMOUNT IS NULL THEN '' ELSE
+              CASE WHEN AMOUNT < 0 THEN '-' ELSE '' END CONCAT
+              SUBSTR(DIGITS(AMOUNT),1,7) CONCAT '.' CONCAT
+              SUBSTR(DIGITS(AMOUNT),8,2)
+         END CONCAT ',' CONCAT
+         CASE WHEN RATES IS NULL THEN '' ELSE
+              CASE WHEN RATES < 0 THEN '-' ELSE '' END CONCAT
+              SUBSTR(DIGITS(RATES),1,1) CONCAT '.' CONCAT
+              SUBSTR(DIGITS(RATES),2,2)
+         END CONCAT ',' CONCAT
+         CHAR(LOADDT, ISO)
+       ,'') AS CHAR(64))
+       FROM STOCKTRD.FRANKFURT1;
+   /*
+   ```
+
+   **Why the `SELECT` formats the row instead of a downstream `SORT`/`OUTREC` step.** A raw
+   `SELECT *` unload hands back DB2's internal column images: `NUMERIC(9,2)` as five packed-decimal
+   bytes, `NUMERIC(3,2)` as two, and — because `balance`, `currencyc`, `cyrrnbase`, `amount` and `rates`
+   are all nullable (`backend/cash-account-cobol/DB2-DDL/DB2DDL.jcl:L48-L49, L56-L58`) — a one-byte null
+   indicator immediately **before** each of those columns, which is what the `NULLIF` clauses in the
+   generated `SYSPUNCH` control statements test:
+
+   | Table | Record layout `DSNTIAUL` writes for `SELECT *` | LRECL |
+   | --- | --- | --- |
+   | `STOCKTRD.CASHACCOUNTY` | `owner` 1-32; indicator 33; `balance` 34-38 (packed); indicator 39; `currencyc` 40-47 | 47 |
+   | `STOCKTRD.FRANKFURT1` | `currnkey` 1-5; indicator 6; `cyrrnbase` 7-11; indicator 12; `amount` 13-17 (packed); indicator 18; `rates` 19-20 (packed); `loaddt` 21-30 | 30 |
+
+   Converting that shape with `OUTREC` is possible but not merely a matter of `EDIT` masks: the reader
+   requires **an empty field** for a NULL, so every nullable column needs its own `IFTHEN` branch on the
+   indicator byte, and a squeeze-based idiom (`SQZ`) — the usual way to close up blanks into a delimited
+   line — silently drops the empty field instead of keeping it, turning a three-column row into two. The
+   `SELECT` above removes that entire class of error: `DIGITS` renders a fixed digit string, the
+   `CASE`/`COALESCE` pair renders a NULL as the empty field the contract asks for, `CAST(… AS CHAR(n))`
+   keeps the record fixed-length so no varying-length prefix appears, and `CHAR(LOADDT, ISO)` is already
+   `YYYY-MM-DD`.
+
+   Four details in those statements are load-bearing, and each maps to a rule the reader enforces rather
+   than a matter of taste:
+
+   - **Character fields are quoted and their embedded quotes doubled.** Nothing in the legacy DDL
+     restricts what a `CHAR` column may hold (`backend/cash-account-cobol/DB2-DDL/DB2DDL.jcl:L46-L62`),
+     and the owner is whatever reached the COMMAREA, so a value such as `DOE,JOHN` is possible. Emitted
+     bare it would split into four fields under a three-column header and the reader would reject the
+     row by field count; emitted with a bare quote inside it, the reader rejects the row for an
+     unquoted quote. `'"' CONCAT REPLACE(…,'"','""') CONCAT '"'` satisfies RFC 4180 for both cases, and
+     a value carrying a newline survives too, because the reader reads across a newline inside a quoted
+     field. That last case is the one to watch in the row-count evidence of step 3: an embedded newline
+     splits the record in the USS copy, so `wc -l` exceeds the unload's row count while the data is
+     intact — investigate a count difference before treating it as loss.
+   - **A NULL is an unquoted empty field, so the quoting sits inside the `CASE`, never around it.** The
+     reader separates the two at the parse level: an unquoted empty field reads as NULL, a quoted empty
+     field reads as the empty string. For the two nullable character columns the source validation
+     happens to treat an empty string exactly as a NULL, recording the same `STATE` /
+     `NULL_IN_LEGACY` variance, so quoting one would not change that row. The rule is kept for every
+     column anyway, because on a *numeric* column the difference is severe: a quoted empty is not a
+     NULL but a value that fails the plain-decimal check, which aborts the whole single-transaction
+     load and records **no** variance row at all — the operator loses the finding instead of reviewing
+     it. One rule for every column is what keeps that from depending on which column went NULL.
+   - **`DIGITS` drops the sign**, which is why the sign is rendered separately. The legacy program can
+     never have stored a negative balance (`WS-CALC` is unsigned,
+     `backend/cash-account-cobol/COBOL/CASH00.cbl:L17`), so a negative in the export is an anomaly that
+     must survive into the file to be seen rather than be silently made positive.
+   - **`DIGITS` zero-pads**, which is correct here because the reader accepts leading zeros but
+     right-trims only: a leading blank is data to it, so a mask that blank-suppresses would produce
+     fields it rejects.
+
+   The `CAST` widths are the worst case, not the typical one, because a `CAST` that is too narrow
+   truncates silently: an owner of 32 characters that are all quotes doubles to 64 and quotes to 66,
+   plus 11 for a signed balance, 18 for a similarly pathological currency and two commas — 97, hence
+   `CHAR(100)` and `LRECL=100`. The rate row's worst case is 12 + 12 + 11 + 5 + 10 + four commas = 54,
+   hence `CHAR(64)`. Trailing record padding after the final closing quote is harmless: the reader
+   right-trims it.
+
+   Before submission the mainframe team confirms three site facts against the deployed catalog, none of
+   which this repository can settle: the second rate column's real spelling (`CYRRNBASE` here, see the
+   alias note below), that `CURRENT DATE FORMAT`/`CHAR(date, ISO)` yields `YYYY-MM-DD`, and that
+   `DSNTIAUL` is available at the site's `PLAN(DSNTIAUL)`. The `UNLOAD` template remains the primary
+   path because it needs none of those confirmations.
 
    `FORMAT DELIMITED` emits **no column-name line**, so the header the readers require is prepended
    during the transfer (step 3 below). The reader contract the files must satisfy — it is enforced, not
@@ -371,9 +712,11 @@ the artifacts in this repository and must be reconciled with the deployed catalo
 
    The cluster name is `SYSD.STOCK.HISTORY`
    (`backend/cash-account-cobol/VSAM/DEFKSDS.jcl:L9`). The binary copy lands as `history.cp037.bin`;
-   a delimited conversion may be supplied instead, or as well, as `history.csv` with header
-   `name,event_date,event_time,request_code,balance,currency,retcode`, `event_date` as `YYYYMMDD` and
-   `event_time` as `HHMMSS`.
+   a delimited conversion may be supplied instead, or as well, becoming `history.csv` once step 3
+   transcodes it and prepends the header
+   `name,event_date,event_time,request_code,balance,currency,retcode`, with `event_date` as `YYYYMMDD`
+   and `event_time` as `HHMMSS`. **Either shape satisfies this step**, and step 3's checksum guard
+   requires at least one of them.
 
    For binary input `tool.history-record-length` is **mandatory** — `57` (what the program writes) or
    `100` (the cluster's `RECSZ`) — the file length must be an exact multiple of it, and any other value
@@ -386,39 +729,103 @@ the artifacts in this repository and must be reconciled with the deployed catalo
 
    ```bash
    # On z/OS UNIX. -B suppresses code-page translation; use it for the binary history only.
-   cp -B "//'<hlq>.HISTORY.SEQ'" history.cp037.bin
+   cp -B "//'<hlq>.HISTORY.SEQ'" history.cp037.bin     # only if the binary shape is delivered
+   cp    "//'<hlq>.HISTORY.CSV'" history.ebcdic        # only if the text shape is delivered
    cp    "//'<hlq>.CASHACCT.CSV'" cashaccounty.ebcdic
    cp    "//'<hlq>.FRANKFRT.CSV'" frankfurt1.ebcdic
    ```
 
+   **Tier 1 — transfer integrity, computed on both sides over the same bytes.** Hash the artifacts
+   **before** any conversion, on z/OS UNIX with whatever digest utility the site holds (`openssl dgst
+   -sha256`, the site's standard `csum`, or the digest the file-transfer tool itself reports), then again
+   on the landing host, and compare. Hash the **USS files** the `cp` above produced, never the MVS data
+   sets behind them: `cp` turns fixed-length records into newline-terminated lines, so a data set and
+   its own USS copy are not byte-identical and comparing across that boundary reproduces exactly the
+   mistake this tier exists to avoid. The USS copies, and only they, exist identically on both sides:
+
    ```bash
-   # On the landing host: convert the text exports and prepend the header line the readers require.
+   # On the landing host, over the untouched transferred artifacts.
+   set -- cashaccounty.ebcdic frankfurt1.ebcdic
+   if [ -f history.cp037.bin ]; then set -- "$@" history.cp037.bin; fi
+   if [ -f history.ebcdic ];    then set -- "$@" history.ebcdic;    fi
+   if [ "$#" -lt 3 ]; then
+     echo 'no history shape was transferred: deliver history.cp037.bin or history.ebcdic' >&2
+     exit 1
+   fi
+   sha256sum "$@" | tee step1-transfer.sha256
+   sha256sum -c step1-transfer.sha256
+   ```
+
+   The file list is built from what was actually delivered because the step above permits **either**
+   history shape, and the guard rejects a transfer that carried neither. A fixed list would fail a
+   perfectly valid binary-only or text-only rehearsal — and the failure would look like a transfer
+   fault, which is the one thing this evidence exists to rule out.
+
+   **Convert.** The text exports are EBCDIC and carry no column-name line, so each is transcoded and
+   re-headered. Each conversion also gets a row-count check, because this is where a hash stops being
+   able to help:
+
+   ```bash
+   # On the landing host. <region-ccsid> is the CCSID obtained as a precondition (for example IBM-037);
+   # it is not assumed here for the same reason the tool does not assume it.
    iconv -f <region-ccsid> -t UTF-8 cashaccounty.ebcdic | tr -d '\r' > cashaccounty.body
    { echo 'owner,balance,currencyc'; cat cashaccounty.body; } > cashaccounty.csv
-   iconv -f <region-ccsid> -t UTF-8 frankfurt1.ebcdic | tr -d '\r' > frankfurt1.body
+   iconv -f <region-ccsid> -t UTF-8 frankfurt1.ebcdic   | tr -d '\r' > frankfurt1.body
    { echo 'currnkey,currnbase,amount,rates,loaddt'; cat frankfurt1.body; } > frankfurt1.csv
+
+   # The text history shape, when that is the one delivered.
+   if [ -f history.ebcdic ]; then
+     iconv -f <region-ccsid> -t UTF-8 history.ebcdic | tr -d '\r' > history.body
+     { echo 'name,event_date,event_time,request_code,balance,currency,retcode'
+       cat history.body; } > history.csv
+   fi
+
+   # Row counts: each body must hold exactly the rows the unload reported in its SYSPRINT/SYSTSPRT.
+   wc -l cashaccounty.body frankfurt1.body history.body 2>/dev/null | tee step1-record-counts.txt
    ```
 
-   `<region-ccsid>` is the CCSID obtained as a precondition (for example `IBM-037`); it is not assumed
-   here for the same reason the tool does not assume it.
+   **Tier 2 — tool-input provenance.** Hash the files the tool will actually open. These are the
+   converted, re-headered artifacts, so they are byte-identical to **nothing** on z/OS and are never
+   compared with a source-side value; their purpose is to bind a reconciliation result to one specific
+   input, so that a later re-run can prove it read the same bytes:
 
    ```bash
-   # Record checksums over exactly the files the tool will read.
-   sha256sum cashaccounty.csv frankfurt1.csv history.cp037.bin history.csv \
-     | tee step1-export.sha256
-   sha256sum -c step1-export.sha256
+   set -- cashaccounty.csv frankfurt1.csv
+   if [ -f history.cp037.bin ]; then set -- "$@" history.cp037.bin; fi
+   if [ -f history.csv ];       then set -- "$@" history.csv;       fi
+   sha256sum "$@" | tee step1-tool-input.sha256
+   sha256sum -c step1-tool-input.sha256
    ```
 
-   Compute a checksum at the source as well, with the mainframe team's chosen utility, and compare.
-   The checksum is what distinguishes "the reconciliation found a variance" from "the transfer lost or
-   translated a byte", and those two findings have opposite remedies.
+   **Do not compare the two tiers.** The DB2 text exports are transcoded from EBCDIC to UTF-8 and given
+   a header line between tier 1 and tier 2, so a tier-1 hash can never equal its tier-2 counterpart, and
+   an operator who expects it to will read a successful conversion as a corrupt transfer. What each tier
+   answers is different and both answers are needed: tier 1 distinguishes "the reconciliation found a
+   variance" from "the transfer lost or translated a byte" — two findings with opposite remedies — while
+   tier 2 answers "which bytes produced this run". `history.cp037.bin` is the one artifact that appears
+   in both lists, because it is transferred in binary and never converted; its two hashes must be equal,
+   and a difference there is a transfer fault.
+
+   The row counts are the conversion's own integrity check. A hash cannot bridge a code-page conversion,
+   but a count can: `iconv` cannot add or lose a line, so a body whose line count differs from the row
+   count the unload reported has lost records in the transfer or the conversion, and the step restarts
+   rather than loads. `wc -l` is the record count here because the USS copy terminates every record,
+   including the last, so no line goes uncounted. Record the unload's reported count — `UNLOAD` prints
+   it in `SYSPRINT`, `DSNTIAUL` in `SYSTSPRT` — beside the `wc -l` output.
+
+   When both history shapes are delivered the loader stages the **binary** one and ignores `history.csv`
+   — it decodes `history.cp037.bin` whenever that file is present. Hashing both is still correct
+   evidence, but only one of them is a load input.
 
 4. **Load, then reconcile**, under one shared batch id:
 
+   The tool reads its database connection from the environment. Load it from the 0600 `ca-db.env` of
+   [Operator command safety](#operator-command-safety) — the password never appears on a command line,
+   and the literal loader is what lets it contain shell metacharacters without being mangled:
+
    ```bash
    BATCH_ID=<uuid>
-   export JDBC_KIND=postgres JDBC_HOST=<host> JDBC_PORT=<port> JDBC_DB=<database> \
-          JDBC_ID=<id> JDBC_PASSWORD=<password>
+   while IFS='=' read -r k v; do [ -n "$k" ] && export "$k=$v"; done < ca-db.env
 
    java -jar target/cash-account-modernized-1.0.0-SNAPSHOT.jar \
         --spring.profiles.active=tool \
@@ -440,18 +847,36 @@ the artifacts in this repository and must be reconciled with the deployed catalo
    echo "reconcile exit=$?"
    ```
 
-   Inside the container image the jar is `/deployments/app.jar`; the arguments are identical.
+   Inside the container image the jar is `/deployments/app.jar`; the arguments are identical, and a
+   container reads the same file directly with `--env-file ./ca-db.env`.
+
+   When the step closes, clear the credential from the session and destroy the file
+   (`unset JDBC_PASSWORD PGPASSWORD; shred -u ca-db.env`), as the convention requires.
 
    **The identifier model.** Every invocation is its own `migration_run` row with its own `run_id`; the
    `load` and the `reconcile` that judges it share the `--tool.batch-id`. A `load` runs in **one**
    database transaction — either the whole export is applied and the run is recorded `CLEAN`/`VARIANCE`,
    or nothing is applied and the run is `FAILED` — so a retry after a failure is simply a new `run_id`
-   under the same `batch_id`, with no half-loaded state to clean up first. A partial unique index on
-   `ledger_entry` additionally guarantees that a completed run can never write a second
-   `MIGRATION_LOAD` row for an owner, so a retry cannot double-count an account.
+   under the same `batch_id`, with no half-loaded state to clean up first.
 
-5. **Re-run the Step 0 catalog query** and diff it against `step0-catalog-baseline.txt`. The
-   `cashaccount` rows must be byte-identical; `cash_account` now appears, in the rehearsal schema only.
+   **What stops a retry double-counting an account, precisely.** Two facts, and the partial unique index
+   is neither of them. `uq_ledger_entry_migration_load` on
+   `ledger_entry (run_id, owner) WHERE event_type = 'MIGRATION_LOAD'` is scoped to **one** run: it
+   guarantees one load event per owner per run, which is what makes a run's own rows countable, and a
+   retry carries a **new** `run_id`, so the index never sees the two attempts as the same key. Across
+   runs the safety comes from (1) the single transaction above — a failed run leaves no row for a retry
+   to duplicate — and (2) an unchanged owner writing no event at all: the loader compares the exported
+   balance and currency against the row it finds and returns without touching the account or the ledger
+   when both already match, so re-loading an identical export adds nothing to either table. A re-load
+   that *does* change a balance is meant to record that change, and it does — one event, under that
+   run's id.
+
+5. **Re-run both Step 0 catalog queries** — schema-qualified, in a session with no `search_path`
+   override — and diff the output against `step0-catalog-baseline.txt`. The `cashaccount` rows must be
+   byte-identical, and `cash_account` must now appear in `cash_account_rehearsal` and in **no other
+   schema**: it must be absent from the schema that reports `on_search_path = t`, which is what proves
+   the rehearsal stayed inside its own schema. This is the Step 1 row of the gate table in Step 0
+   action 3.
 
 ### Evidence to capture
 
@@ -482,8 +907,10 @@ SELECT r.mode, v.owner, v.variance_kind, v.status,
 | `step1-migration-run.txt` | The `migration_run` rows for the batch, including `characterization_status` |
 | `step1-variances.txt` | Every `migration_reconciliation` row with status other than `MATCHED`, with the data owner's written disposition beside each |
 | `step1-exit-codes.txt` | The `load` and `reconcile` exit codes |
-| `step1-export.sha256` | Checksums of every transferred export, and the source-side comparison |
-| `step1-catalog-after.txt` | The re-run catalog query and its diff against the Step 0 baseline |
+| `step1-transfer.sha256` | Tier-1 checksums over the pre-conversion transferred artifacts, beside the source-side values they are compared with |
+| `step1-tool-input.sha256` | Tier-2 checksums over the files the tool opened — never compared with a source-side value, and the reference a re-run is proved against |
+| `step1-record-counts.txt` | The row count each unload reported, beside the `wc -l` of the converted body it produced |
+| `step1-catalog-after.txt` | Both catalog queries re-run, and their diff against the Step 0 baseline: `cash_account` in `cash_account_rehearsal` only, `cashaccount` unchanged |
 | `step1-tool-settings.txt` | The `tool.history-record-length`, `tool.legacy-charset` and `tool.legacy-timezone` used, and the file definition / region configuration they came from |
 
 `characterization_status` must read `ACCEPTED` on every row of the batch. It is copied from the
@@ -500,8 +927,10 @@ expensive to investigate in Step 3.
 
 ### Rollback criterion
 
-Roll back on **any unresolved `VARIANCE` row**, or **any checksum mismatch** on the transferred
-exports.
+Roll back on **any unresolved `VARIANCE` row**, on **any tier-1 checksum mismatch** between the
+source-side and landing-host values, or on **any row count** that differs from the count its unload
+reported. A tier-2 value has no counterpart to disagree with, so it is never itself a trigger; it is
+the record of which bytes the run read.
 
 The reset drops relations rather than deleting rows, which is what makes it compatible with ledger
 immutability — `ledger_entry` refuses `UPDATE` and `DELETE` by trigger, so "clear the rehearsal data"
@@ -666,8 +1095,142 @@ actions in a fixed order, and it is the last point at which rollback is cheap.
   (e): the replay file carries only an available balance, and legacy has no reservation concept, so a
   held amount would simply vanish from a hand-back. See the reservation precondition under
   [Rollback criterion](#rollback-criterion-3).
-- **A scheduled reconcile is in place** for the post-cutover window, with its own batch ids, because
-  one of the rollback criteria is a variance in a *scheduled* reconcile rather than in an ad-hoc one.
+- **The post-cutover scheduled reconcile exists, is owned, and is ready to run.** Gate (g) adjudicates
+  its first run, a variance it records is a rollback criterion, and Step 4 does not begin until a window
+  of its runs has passed. Nothing in this module schedules it — the only `@Scheduled` work in the
+  service is the reservation expiry sweep — so it is an external mechanism, and it is specified here in
+  full rather than assumed:
+
+  | Attribute | Value |
+  | --- | --- |
+  | What it runs | The gate (b) `reconcile` invocation: `--spring.profiles.active=tool --tool.command=reconcile`, no schema override, from the image **digest** Step 0 recorded. Never `load`: a scheduled load would write into the live tables |
+  | Its input | The **frozen** final export of gate (b), copied whole — every file it contains plus `step3-export.sha256` beside them — onto a read-only volume the job can reach. `reconcile` opens only `cashaccounty.csv` and `frankfurt1.csv`, which is why `--tool.history-record-length` is neither passed nor needed; the history files travel with them so the checksum file verifies against a complete directory |
+  | Its baseline | The data owner's **`ACCEPTED`** characterization document, mounted and named with `-Dcashaccount.characterization-doc=<path>`. The image carries only `/deployments/app.jar`, and the tool looks for `docs/legacy-characterization.md` relative to its working directory: with neither present it records `characterization_status = 'DRAFT'`, which Step 1's rule — a `DRAFT` baseline is never accepted against a real export — forbids for these runs, since they read the real frozen export |
+  | Input verification | `sha256sum -c` on both mounts before each run, so an input or a baseline that was replaced, truncated or partially copied fails the run instead of producing a clean one |
+  | Input refresh | **None, by design.** Legacy writes are frozen at gate (a), so there is nothing new to export; and a refreshed export would be a different baseline, against which the watermark `W` recorded at gate (d) would mean nothing |
+  | Cadence | Hourly for the first six hours after gate (f), then every six hours until the rollback window closes. Another cadence is permitted and must be recorded in the change record **before** gate (e); one slower than the interval at which the rollback decision is revisited is not, because a criterion that is only evaluated after the window has closed is not a criterion |
+  | Batch id | A fresh one per run, generated by the run and echoed into its log, so each run's `migration_run` and `migration_reconciliation` rows are attributable to it |
+  | Runs owned by | The on-call platform operator, who holds the schedule, its evidence, and the rollback decision |
+  | Output adjudicated by | The cash-account data owner, per run, with the three checks of gate (g) — (g1) export against the state at `W`, (g2) every reported difference against the ledger, (g3) the run itself |
+  | Evidence | Per run: `step3-run-<n>.txt` (the completed-run check), `step3-asof-w-<n>.txt` ((g1), which must be empty), `step3-reconcile-<n>.txt` ((g2) with every row's verdict), and the job's log line carrying the batch id and the tool's numeric exit code |
+  | A missed run | A gap in the evidence, not a clean run. The window counts as clean only if the cadence held: "no variance was reported" by a job that never ran is not a measurement |
+  | Retired | When the rollback window closes, before Step 4's first retirement action, with the removal recorded |
+
+  Publish the accepted baseline once, before the schedule is created, from the revision the data owner
+  signed off:
+
+  ```bash
+  cd backend/cash-account-modernized/docs
+  grep -n '^Status:' legacy-characterization.md            # must read ACCEPTED
+  sha256sum legacy-characterization.md | tee step3-characterization.sha256 \
+    > legacy-characterization.sha256
+  kubectl -n <namespace> create configmap cash-account-characterization \
+    --from-file=legacy-characterization.md --from-file=legacy-characterization.sha256
+  ```
+
+  The checksum travels in the same configMap as the document so the job can refuse a mismatched pair,
+  and `step3-characterization.sha256` records with the change evidence which revision the schedule ran
+  against.
+
+  Realize the schedule as an operator-applied CronJob in the release namespace —
+
+  ```yaml
+  apiVersion: batch/v1
+  kind: CronJob
+  metadata:
+    name: cash-account-scheduled-reconcile
+    namespace: <namespace>
+  spec:
+    schedule: "0 * * * *"          # the recorded cadence; "0 */6 * * *" after the first six hours
+    concurrencyPolicy: Forbid      # two reconciles of one frozen baseline race for nothing
+    startingDeadlineSeconds: 300
+    successfulJobsHistoryLimit: 24
+    failedJobsHistoryLimit: 24
+    jobTemplate:
+      metadata:
+        labels: { app.kubernetes.io/name: cash-account-scheduled-reconcile }
+      spec:
+        backoffLimit: 0            # a failed run is adjudicated, never silently retried
+        template:
+          spec:
+            restartPolicy: Never
+            containers:
+              - name: reconcile
+                image: <registry>/cash-account@sha256:<digest>
+                command: ["/bin/sh", "-c"]
+                args:
+                  - |
+                    set -e
+                    ( cd /export          && sha256sum -c step3-export.sha256 )
+                    ( cd /characterization && sha256sum -c legacy-characterization.sha256 )
+                    BATCH_ID="$(cat /proc/sys/kernel/random/uuid)"
+                    echo "scheduled reconcile batch_id=$BATCH_ID"
+                    set +e
+                    java -Dcashaccount.characterization-doc=/characterization/legacy-characterization.md \
+                         -jar /deployments/app.jar \
+                         --spring.profiles.active=tool \
+                         --tool.command=reconcile \
+                         --tool.input=/export \
+                         --tool.batch-id="$BATCH_ID"
+                    rc=$?
+                    echo "scheduled reconcile batch_id=$BATCH_ID exit=$rc"
+                    # 0 clean and 2 variances-recorded are both COMPLETED runs and the job succeeds;
+                    # anything else - 1, or a JVM that never started - fails the job.
+                    [ "$rc" = 0 ] || [ "$rc" = 2 ]
+                env:
+                  - name: JDBC_KIND
+                    valueFrom: { configMapKeyRef: { name: <release>-config, key: database.kind } }
+                  - name: JDBC_HOST
+                    valueFrom: { configMapKeyRef: { name: <release>-config, key: database.host } }
+                  - name: JDBC_PORT
+                    valueFrom: { configMapKeyRef: { name: <release>-config, key: database.port } }
+                  - name: JDBC_DB
+                    valueFrom: { configMapKeyRef: { name: <release>-config, key: database.db } }
+                  - name: JDBC_SSL
+                    valueFrom: { configMapKeyRef: { name: <release>-config, key: database.ssl } }
+                  - name: JDBC_ID
+                    valueFrom: { secretKeyRef: { name: <release>-credentials, key: database.id } }
+                  - name: JDBC_PASSWORD
+                    valueFrom: { secretKeyRef: { name: <release>-credentials, key: database.password } }
+                volumeMounts:
+                  - { name: export, mountPath: /export, readOnly: true }
+                  - { name: characterization, mountPath: /characterization, readOnly: true }
+            volumes:
+              - name: export
+                persistentVolumeClaim: { claimName: <export-pvc>, readOnly: true }
+              - name: characterization
+                configMap: { name: cash-account-characterization }
+  ```
+
+  — or as the same command under the operator's existing scheduler on a host with database access,
+  where in-cluster jobs are not permitted. Both write the same rows and produce the same evidence, and
+  which one is used is recorded alongside the cadence.
+
+  Each run's batch id and **numeric** exit code are captured, because a gate reads the rows *and* the
+  code, and Kubernetes reduces both `1` and `2` to the same failed Job. The wrapper therefore echoes the
+  code and then classifies it: `0` (clean) and `2` (variances recorded — the normal outcome once traffic
+  is flowing) are completed runs and the job succeeds; anything else fails the job, which is what makes
+  a failed Job mean "this run produced nothing to adjudicate" rather than "this run found something".
+  `backoffLimit: 0` keeps a failed run from being silently retried under a second batch id. Read both
+  per run:
+
+  ```bash
+  kubectl -n <namespace> get jobs --selector app.kubernetes.io/name=cash-account-scheduled-reconcile \
+    -o custom-columns=JOB:.metadata.name,SUCCEEDED:.status.succeeded,FAILED:.status.failed
+  kubectl -n <namespace> logs job/<job-name> | grep 'scheduled reconcile batch_id='
+  ```
+
+  A missing `exit=` line is itself a finding: the container died before the tool returned. Gate (g3)
+  then catches the same condition from the database side, which is the check that does not depend on a
+  log surviving.
+
+  Two properties of that manifest are deliberate. It **is not a chart object and is not added to the
+  chart**: no scheduled-job template exists for this service, and Prohibition 3's stop-and-flag rule
+  covers chart *templates* — an operator-applied CronJob changes no template, no image of the running
+  service and no routing value. And it holds **no credential of its own**: it reads the same configMap
+  and secret keys the service's own pod reads
+  (`infra/stocktrader-operator/helm-charts/stocktrader/templates/cash-account.yaml:L84-L119`), so
+  nothing here widens who can reach the database.
 
 ### Actions
 
@@ -706,25 +1269,150 @@ by whether gate (e) has been applied.
    ```
 
    *Gate:* `variance_count = 0` on the reconcile run, **zero** `migration_reconciliation` rows with
-   status `VARIANCE`, and the Step 0 catalog query re-run with the `cashaccount` rows byte-identical to
-   `step0-catalog-baseline.txt`.
+   status `VARIANCE`, and both Step 0 catalog queries re-run against the Step 3(b) row of their gate
+   table: the `cashaccount` rows byte-identical to `step0-catalog-baseline.txt`, and `cash_account`
+   present in the schema that reports `on_search_path = t` — this load's target — and in no schema
+   besides that one and `cash_account_rehearsal`.
 
 3. **(c) Validate before routing.** For every owner in the final legacy export, read the institutional
    account view and compare its total with the exported balance. No caller is routed yet, so the target
    is **static** — which is what makes an exhaustive comparison both possible and conclusive here, and
    impossible ten minutes later. Reach the service directly rather than through broker, because broker
-   still points at the legacy system:
+   still points at the legacy system.
+
+   **There is no Service to reach yet, and creating one is not available at this gate.** A single flag,
+   `cashAccount.enabled`, wraps the *whole* of `templates/cash-account.yaml`: the guard opens at `L15`
+   and closes on the file's last line, after the Service, so while the flag is `false` neither the
+   Deployment nor the `<release>-cash-account-service` exists, and `kubectl port-forward svc/…` answers
+   `services "<release>-cash-account-service" not found`. Turning the flag on to create it would **be**
+   gate (e): the same apply sets `CASH_ACCOUNT_ENABLED` for broker and portfolio, routing callers to a
+   target this gate has not yet validated. Editing the template to split the two is a
+   [stop-and-flag](../README.md#stop-and-flag) condition, not a runbook step.
+
+   So validate through a **throwaway validation pod** the operator creates directly. It is not a chart
+   object — no template is added or edited and **no chart value changes**, so the Step 0 snapshot still
+   describes the release exactly — and it reads its configuration from the release's own ConfigMap and
+   Secret, so no credential is retyped into a shell:
 
    ```bash
-   kubectl port-forward svc/<release>-cash-account-service 8080:8080 -n <namespace> &
-   curl -s -H "Authorization: Bearer <token>" \
-        http://localhost:8080/cash-account/institutional/accounts/<OWNER>
+   kubectl apply -n <namespace> -f - <<'YAML'
+   apiVersion: v1
+   kind: Pod
+   metadata:
+     name: cash-account-cutover-validation
+     labels:
+       # Deliberately NOT app: cash-account. That is the Service selector the chart uses, so a pod
+       # carrying it would start taking caller traffic the moment gate (e) creates the Service.
+       app: cash-account-cutover-validation
+   spec:
+     restartPolicy: Never
+     containers:
+       - name: cash-account
+         # The digest reference recorded in step0-image-digest.txt: the image gate (e) will deploy,
+         # so what is validated here and what serves callers later are the same bytes.
+         image: <registry>/cash-account@sha256:<hex>
+         env:
+           - name: AUTH_TYPE
+             valueFrom: { configMapKeyRef: { name: <release>-config, key: auth.type } }
+           - name: JDBC_KIND
+             valueFrom: { configMapKeyRef: { name: <release>-config, key: database.kind } }
+           - name: JDBC_HOST
+             valueFrom: { configMapKeyRef: { name: <release>-config, key: database.host } }
+           - name: JDBC_PORT
+             valueFrom: { configMapKeyRef: { name: <release>-config, key: database.port } }
+           - name: JDBC_DB
+             valueFrom: { configMapKeyRef: { name: <release>-config, key: database.db } }
+           - name: JDBC_SSL
+             valueFrom: { configMapKeyRef: { name: <release>-config, key: database.ssl } }
+           - name: JWT_ISSUER
+             valueFrom: { configMapKeyRef: { name: <release>-config, key: jwt.issuer } }
+           - name: JWT_AUDIENCE
+             valueFrom: { configMapKeyRef: { name: <release>-config, key: jwt.audience } }
+           # Required whenever the release runs AUTH_TYPE=oidc: that mode has no other verification
+           # key source, so the service refuses to start on a blank value rather than accept
+           # unverified tokens — the pod would never reach Ready and this gate would be unusable.
+           # Optional, exactly as the chart marks it, so a basic/ldap release is unaffected.
+           - name: OIDC_JWKS_URL
+             valueFrom:
+               configMapKeyRef: { name: <release>-config, key: oidc.jwksUrl, optional: true }
+           # Carried so the validation workload is configured like the Deployment gate (e) creates,
+           # rather than falling back to the built-in default endpoint.
+           - name: CURRENCY_API_URL
+             valueFrom:
+               configMapKeyRef: { name: <release>-config, key: cashAccount.exchangeRateUrl }
+           - name: JDBC_ID
+             valueFrom: { secretKeyRef: { name: <release>-credentials, key: database.id } }
+           - name: JDBC_PASSWORD
+             valueFrom: { secretKeyRef: { name: <release>-credentials, key: database.password } }
+           # Gate (b) already applied the schema to the production search path. A pod that exists to
+           # read does not need DDL rights over the tables it is reading.
+           - name: SPRING_SQL_INIT_MODE
+             value: "never"
+         ports:
+           - containerPort: 8080
+         readinessProbe:
+           httpGet: { path: /actuator/health/readiness, port: 8080 }
+           periodSeconds: 15
+   YAML
+   kubectl wait -n <namespace> --for=condition=Ready \
+     pod/cash-account-cutover-validation --timeout=180s
    ```
 
-   The response carries `availableBalance`, `reservedBalance` and `totalBalance`.
+   The ConfigMap and Secret names are the chart's defaults (`global.configMapName` and
+   `global.secretName` render `<release>-config` and `<release>-credentials`); if the Step 0 snapshot
+   shows overrides, use the snapshot's names. Add `cert_defaultTrustStore` from ConfigMap key
+   `ssl.certs` if the release sets `global.specifyCerts`, and an `imagePullSecrets` entry naming
+   `global.pullSecretName` if it sets `global.pullSecret` — the same two conditions the chart applies to
+   the real Deployment. The readiness probe is the chart's own path, which is what makes
+   `kubectl wait --for=condition=Ready` mean "the application answers" rather than "the container
+   started".
+
+   **The variable list above is every deployment input the application reads, and it is complete on
+   purpose.** A validation pod missing one of them is not a smaller version of the real workload but a
+   differently configured one, and the difference shows up as a gate that cannot pass: on an
+   `AUTH_TYPE=oidc` release an absent `OIDC_JWKS_URL` fails start-up outright, so the pod never becomes
+   Ready and the comparison never runs. `SPRING_SQL_INIT_MODE` is the single deliberate difference from
+   the deployed Deployment. `TRACE_SPEC`, `REDIS_URL`, `KAFKA_*` and `CQRS_ENABLED` are absent because
+   this service does not consume them at all.
+
+   Extract the owner set from the final export's `cashaccounty.csv` into `step3-owners.nul` with the
+   CSV reader in [Operator command safety](#operator-command-safety), and take the token from the
+   `curl` config file defined there. An owner may legitimately contain `/`, `;`, `&`, `?`, `#` or `%`,
+   so an owner pasted into a URL is an owner that can change the request being made:
+
+   ```bash
+   kubectl port-forward -n <namespace> pod/cash-account-cutover-validation 8080:8080 &
+   : > step3-validation.tsv
+   while IFS= read -r -d '' owner; do
+     seg=$(ca_urlencode "$owner")
+     body=$(curl -sS --config ./ca-auth.conf \
+                 --url "http://localhost:8080/cash-account/institutional/accounts/$seg" \
+                 -w '\n%{http_code}') || body=$'\n000'
+     status=${body##*$'\n'}
+     json=$(printf '%s' "${body%$'\n'*}" | tr -d '\n\t')
+     printf '%s\t%s\t%s\n' "$seg" "$status" "$json" >> step3-validation.tsv
+   done < step3-owners.nul
+   ```
+
+   The loop records a line per owner instead of stopping at the first failure, so a single `404`
+   leaves a complete comparison to sign off rather than a truncated one. Each response carries
+   `availableBalance`, `reservedBalance` and `totalBalance`. The owner is written in its encoded form
+   and the body is stripped of tabs and newlines, so one owner is exactly one record — a raw owner or a
+   reformatted body could otherwise split a line and silently drop an owner from the comparison.
+
+   Delete the pod as the closing action of this gate, before (e) is applied — a validation pod left
+   running would still be holding a database connection and answering requests after the real
+   Deployment appears, with nothing in the release describing it:
+
+   ```bash
+   kubectl delete -n <namespace> pod/cash-account-cutover-validation --wait=true
+   kubectl get pod -n <namespace> cash-account-cutover-validation   # must answer NotFound
+   ```
 
    *Gate:* for every owner, `totalBalance` equals the exported balance and `reservedBalance` is `0.00`;
-   the owner set matches the export exactly, with no extra and no missing owner.
+   the owner set matches the export exactly, with no extra and no missing owner; the validation pod is
+   gone; and `helm get values <release>` (or the CR) still matches `step0-values-snapshot.yaml`
+   verbatim, proving the validation changed nothing a caller can reach.
 
 4. **(d) Record the ledger watermark.**
 
@@ -746,7 +1434,8 @@ by whether gate (e) has been applied.
    | Value | Set to | Why |
    | --- | --- | --- |
    | `cashAccount.enabled` | `true` | Deploys the service and sets `CASH_ACCOUNT_ENABLED` for broker and portfolio (`…/templates/broker.yaml:L103-L104`; `…/templates/cash-account.yaml:L15`) |
-   | `cashAccount.image.repository` / `cashAccount.image.tag` | The registry path and the **digest** recorded in Step 0 | The digest is the only reference that cannot be re-pointed after validation |
+   | `cashAccount.image.repository` | `<registry>/cash-account@sha256` — the first of the two values recorded in `step0-image-digest.txt`, verbatim | The digest is the only reference that cannot be re-pointed after validation, and the chart joins these two fields with a colon (`…/templates/cash-account.yaml:L65`), so the reference is carried as `repository` = the `@sha256` prefix and `tag` = the hex. The whole `sha256:<hex>` in `tag` renders an invalid reference and the pod never starts — see [`../README.md#carrying-the-digest-through-the-charts-fixed-repositorytag-rendering`](../README.md#carrying-the-digest-through-the-charts-fixed-repositorytag-rendering) |
+   | `cashAccount.image.tag` | The 64-character hex digest, with **no** `sha256:` prefix — the second recorded value, verbatim | As above; the pair renders `<registry>/cash-account@sha256:<hex>` |
    | `cashAccount.url` | `http://{{ .Release.Name }}-cash-account-service:8080/cash-account` — the chart default — **if the snapshot differs** | This is the path the controllers are mapped at; broker reads it as `CASH_ACCOUNT_URL` (`…/templates/broker.yaml:L97-L102`) |
    | `cashAccount.exchangeRateUrl` | Unchanged | Reaches the service as `CURRENCY_API_URL` (`…/templates/cash-account.yaml:L156-L160`) |
    | `database.*` | **Not changed by this cutover** | The release is already on PostgreSQL as a Step 0 prerequisite, signed off separately, because these values are shared with portfolio |
@@ -754,9 +1443,18 @@ by whether gate (e) has been applied.
 
    No chart **template** is edited, at this gate or any other.
 
-   *Gate:* the applied values diff against the snapshot contains **only** the rows above, and the new
-   pod passes its startup, readiness and liveness probes (`/actuator/startup`,
-   `/actuator/health/readiness`, `/actuator/health/liveness` on port 8080 —
+   *Gate:* the applied values diff against the snapshot contains **only** the rows above; the
+   **rendered** image is the digest form, not the two values that produced it —
+
+   ```bash
+   kubectl get deployment <release>-cash-account -n <namespace> \
+     -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+   ```
+
+   must print `<registry>/cash-account@sha256:<hex>`, which is checked rather than assumed because the
+   invalid mapping differs from the valid one by a single character and fails as an image-pull error
+   rather than as a values error; and the new pod passes its startup, readiness and liveness probes
+   (`/actuator/startup`, `/actuator/health/readiness`, `/actuator/health/liveness` on port 8080 —
    `…/templates/cash-account.yaml:L204-L222`).
 
 6. **(f) Roll broker and portfolio** so they pick up `CASH_ACCOUNT_ENABLED` and `CASH_ACCOUNT_URL`.
@@ -769,48 +1467,234 @@ by whether gate (e) has been applied.
 7. **(g) Confirm routing, then observe the first scheduled reconcile.** One read through broker for an
    owner whose balance is known from the final export:
 
+   Read the owner from the same NUL-delimited list rather than typing it, encode it as one path
+   segment, and take the token from the `curl` config file — [Operator command
+   safety](#operator-command-safety) applies here exactly as it does at gate (c), and broker's own
+   `{owner}` path segment is no more forgiving of an unencoded `/` than this service's:
+
    ```bash
-   curl -s -H "Authorization: Bearer <token>" http://<broker-host>:9080/broker/<OWNER>
+   IFS= read -r -d '' owner < step3-owners.nul
+   curl -sS --config ./ca-auth.conf \
+        --url "http://<broker-host>:9080/broker/$(ca_urlencode "$owner")"
    ```
 
    The `cashAccountBalance` and `cashAccountCurrency` fields in broker's response are populated from
    this service's `balance` and `currency`, so a correct value proves the whole path.
 
-   Then let the first scheduled reconcile run and adjudicate its output against `W`. The reconcile
-   compares the frozen legacy export with the target as it is **now**; callers are writing, so a raw
-   comparison would flag every legitimate post-routing write as a variance. `W` is the adjudication
-   rule: a variance row is genuine only if the owner has no ledger activity above the watermark.
+   Then let the first scheduled reconcile run, and adjudicate it with the **three** checks below. They
+   answer different questions and none of them is optional: (g1) was the migration correct at the
+   watermark, (g2) is every difference the run reports accounted for by the ledger, and (g3) did the run
+   actually complete against the accepted baseline.
+
+   Why three, and why none of them is the reconciler's own output read straight: the reconciler compares
+   the frozen export against the target as it is **now**, it takes no watermark argument, and — the part
+   that matters — it writes **no row at all** for an owner whose current state agrees with the export. A
+   balance loaded wrongly at `W` and carried to the exported figure by later traffic therefore produces
+   no variance row to triage, and the run looks clean. After gate (f), neither the run's exit code (`2`
+   on any run that records a variance) nor its row set is a verdict on the migration.
+
+   **(g1) The frozen export against the state at `W`.** This is the migration verdict, and it is
+   exhaustive over both sides rather than over whatever the reconciler emitted. Every balance change
+   writes a `ledger_entry` row in the same transaction as the change and the `ledger_entry_immutable`
+   trigger forbids rewriting one, so an owner's last row at or below `W` *is* its state at `W`; gate (b)
+   loaded into an empty production schema, so every exported owner has a `MIGRATION_LOAD` row at or
+   below `W`. Save this as `step3-asof-w.sql` and run it from the directory holding the checksummed
+   frozen export — `\copy` reads the file on the operator's side, and the temporary table needs no
+   privilege beyond the connection's own:
 
    ```sql
-   SELECT v.owner, v.variance_kind, v.status,
-          v.legacy_balance, v.migrated_balance, v.variance,
-          count(l.entry_id) AS post_watermark_entries
-     FROM migration_reconciliation v
-     JOIN migration_run r ON r.run_id = v.run_id
-     LEFT JOIN ledger_entry l ON l.owner = v.owner AND l.entry_id > <W>
-    WHERE r.batch_id = '<uuid>'
-      AND v.status = 'VARIANCE'
-    GROUP BY v.owner, v.variance_kind, v.status,
-             v.legacy_balance, v.migrated_balance, v.variance
-    ORDER BY v.owner;
+   CREATE TEMP TABLE frozen_export (owner TEXT, balance NUMERIC(9,2), currencyc TEXT);
+   \copy frozen_export FROM 'cashaccounty.csv' WITH (FORMAT csv, HEADER true)
+
+   WITH export_norm AS (
+       -- The export's own conventions: CHAR padding is trimmed and the owner key is uppercased, which is
+       -- how the loader filed these owners; an empty unquoted field arrived as NULL.
+       SELECT upper(btrim(owner)) AS owner, balance, upper(btrim(currencyc)) AS currency
+         FROM frozen_export
+   ),
+   as_of_w AS (
+       SELECT DISTINCT ON (owner)
+              owner, entry_id, event_type, currency, available_after, reserved_after
+         FROM ledger_entry
+        WHERE entry_id <= <W>
+        ORDER BY owner, entry_id DESC
+   ),
+   state_at_w AS (
+       -- An owner whose last row at or below W is ACCOUNT_DELETED did not exist at W.
+       SELECT * FROM as_of_w WHERE event_type <> 'ACCOUNT_DELETED'
+   ),
+   compared AS (
+       -- FULL OUTER JOIN, so an owner missing from either side is a row rather than a silent omission.
+       SELECT COALESCE(e.owner, s.owner) AS owner,
+              e.balance AS export_balance, s.available_after AS balance_at_w,
+              e.currency AS export_currency, s.currency AS currency_at_w,
+              s.reserved_after AS reserved_at_w, s.entry_id AS entry_id_at_w,
+              CASE
+                WHEN e.owner IS NULL                         THEN 'EXTRA_AT_W'
+                WHEN e.balance IS NULL OR e.currency IS NULL THEN 'EXPORT_INCOMPLETE'
+                WHEN s.owner IS NULL                         THEN 'MISSING_AT_W'
+                WHEN s.available_after <> e.balance          THEN 'BALANCE_AT_W'
+                WHEN s.currency <> e.currency                THEN 'CURRENCY_AT_W'
+                WHEN s.reserved_after <> 0                   THEN 'RESERVED_AT_W'
+                ELSE 'MATCHED'
+              END AS verdict
+         FROM export_norm e
+         FULL OUTER JOIN state_at_w s ON s.owner = e.owner
+   )
+   SELECT owner, verdict, export_balance, balance_at_w, export_currency, currency_at_w,
+          reserved_at_w, entry_id_at_w
+     FROM compared
+    WHERE verdict <> 'MATCHED'
+    ORDER BY verdict, owner;
    ```
 
-   *Gate:* every row returned has `post_watermark_entries > 0` — that is, every variance is explained
-   by a caller write above the watermark. A row with `post_watermark_entries = 0` is a genuine variance
-   and a rollback criterion.
+   *Gate:* **no rows.** Every verdict is a defect at the watermark and none of them is explainable by
+   later traffic — `MISSING_AT_W`, an exported owner the load never applied; `EXTRA_AT_W`, an owner the
+   target held that the export does not, in a schema gate (b) required to be empty; `BALANCE_AT_W` and
+   `CURRENCY_AT_W`, the load applied the wrong figure; `RESERVED_AT_W`, funds on hold at the watermark,
+   which gate (c) required to be zero; `EXPORT_INCOMPLETE`, a NULL balance or currency in the export
+   itself, which gate (b) required it not to carry.
+
+   This answer is **fixed**: `W` does not move and the ledger cannot be rewritten, so the query returns
+   the same rows tomorrow. Run it with every scheduled reconcile all the same — as an invariant rather
+   than a measurement. A row appearing later means history itself changed, which the trigger exists to
+   prevent.
+
+   **(g2) Every reported difference accounted for against the ledger.** With (g1) clean the migration
+   was right at `W`, so each difference a run reports has to come from post-watermark traffic. This
+   check confirms that it did, by comparing the owner's **current** state with its **latest** ledger
+   row. It does not ask whether some row exists above `W`: the existence of a later row says nothing
+   about whether the current figure is the one that row recorded. Save it as `step3-adjudicate.sql`:
+
+   ```sql
+   WITH latest AS (
+       SELECT DISTINCT ON (owner)
+              owner, entry_id, event_type, currency, available_after, reserved_after
+         FROM ledger_entry
+        ORDER BY owner, entry_id DESC
+   ),
+   judged AS (
+       SELECT v.owner, v.variance_kind, v.legacy_value, v.migrated_value,
+              v.legacy_balance, v.migrated_balance,
+              a.available_balance AS current_balance, a.currency AS current_currency,
+              l.entry_id AS latest_entry_id, l.event_type AS latest_event_type,
+              l.available_after AS latest_available_after, l.currency AS latest_currency,
+              CASE
+                -- Rows that describe the export or the load itself, not an account's movement: no caller
+                -- write can account for them, and gate (b) required the export to produce none.
+                WHEN COALESCE(v.legacy_value, '') IN
+                     ('NULL_IN_LEGACY', 'INVALID_IN_LEGACY', 'MISSING_IN_LEGACY')
+                  OR COALESCE(v.migrated_value, '') = 'RESERVATIONS_OUTSTANDING'
+                  OR v.variance_kind IN ('RATE_SOURCE', 'TRANSACTION_COUNT')
+                  THEN 'SOURCE_ROW'
+                -- Neither an account row nor any ledger history: the load never applied this owner,
+                -- which is the same defect (g1) reports as MISSING_AT_W.
+                WHEN a.owner IS NULL AND l.owner IS NULL THEN 'NEVER_HELD'
+                -- The account is gone and its last event says so.
+                WHEN a.owner IS NULL AND l.event_type = 'ACCOUNT_DELETED' THEN 'LEDGER_EXPLAINED'
+                -- The account is exactly what its last event recorded, in all three figures.
+                WHEN a.owner IS NOT NULL
+                 AND a.available_balance = l.available_after
+                 AND a.reserved_balance  = l.reserved_after
+                 AND a.currency          = l.currency
+                  THEN 'LEDGER_EXPLAINED'
+                ELSE 'DRIFT'
+              END AS verdict
+         FROM migration_reconciliation v
+         JOIN migration_run r     ON r.run_id = v.run_id
+         LEFT JOIN cash_account a ON a.owner = v.owner
+         LEFT JOIN latest l       ON l.owner = v.owner
+        WHERE r.batch_id = '<uuid>'
+          AND r.mode = 'RECONCILE'
+          AND v.status = 'VARIANCE'
+   )
+   SELECT owner, variance_kind, legacy_value, migrated_value, legacy_balance, migrated_balance,
+          current_balance, current_currency,
+          latest_entry_id, latest_event_type, latest_available_after, latest_currency, verdict
+     FROM judged
+    ORDER BY CASE verdict WHEN 'LEDGER_EXPLAINED' THEN 1 ELSE 0 END, variance_kind, owner;
+   ```
+
+   *Gate:* every row's verdict is `LEDGER_EXPLAINED`; `verdict` is the last column, and the query sorts
+   the other three first. Each of them fails the gate:
+
+   - **`DRIFT`** — the account does not match its own last ledger event: a state change that wrote no
+     event, an account row removed without an `ACCOUNT_DELETED` event, or an account with no ledger
+     history at all. That contradicts the audit guarantee rather than a migration figure, and it is a
+     stop condition in its own right.
+   - **`NEVER_HELD`** — the target has neither an account row nor any ledger history for the owner, so
+     the load never applied it; (g1) reports the same defect as `MISSING_AT_W`.
+   - **`SOURCE_ROW`** — the export or the load produced a finding that gate (b) had already ruled out,
+     so it is news whichever way it is read.
+
+   **(g3) The run itself.** An empty (g2) output means "nothing to explain" only if the run happened;
+   otherwise it means nothing was measured. Confirm the run before reading its rows:
+
+   ```sql
+   SELECT r.run_id, r.batch_id, r.mode, r.status, r.characterization_status,
+          r.legacy_record_count, r.migrated_record_count, r.variance_count,
+          r.started_at, r.finished_at
+     FROM migration_run r
+    WHERE r.batch_id = '<uuid>';
+   ```
+
+   *Gate:* **exactly one** row, with `mode = 'RECONCILE'`, `status` in (`CLEAN`, `VARIANCE`),
+   `finished_at` not null, and `characterization_status = 'ACCEPTED'`. A `FAILED` or `RUNNING` row, or
+   none at all, is a run that did not complete. `DRAFT` means the job could not read the data owner's
+   accepted characterization document, and Step 1's rule — a `DRAFT` baseline is never accepted against
+   a real export — holds here too, because these runs read the real frozen export.
+
+   **Evaluating the three without losing a status.** Run them as a block that fails loudly rather than
+   as a pipeline whose count hides a connection error. `psql` takes its password from `~/.pgpass` or an
+   interactive prompt, never from the command line:
+
+   ```bash
+   set -euo pipefail
+   PSQL="psql -h <host> -p <port> -U <id> -d <database> -v ON_ERROR_STOP=1 -q -At"
+
+   # (g3) first: exactly one completed reconcile run for this batch, on an ACCEPTED baseline.
+   $PSQL -c "SELECT count(*) FROM migration_run
+              WHERE batch_id = '<uuid>' AND mode = 'RECONCILE'
+                AND status IN ('CLEAN','VARIANCE') AND finished_at IS NOT NULL
+                AND characterization_status = 'ACCEPTED'" > step3-run-<n>.txt
+   test "$(cat step3-run-<n>.txt)" = 1
+
+   # (g1) the export against the state at W: no rows at all.
+   $PSQL -f step3-asof-w.sql > step3-asof-w-<n>.txt
+   test ! -s step3-asof-w-<n>.txt
+
+   # (g2) every reported difference explained by the ledger: no other verdict.
+   $PSQL -f step3-adjudicate.sql > step3-reconcile-<n>.txt
+   test "$(grep -cv 'LEDGER_EXPLAINED$' step3-reconcile-<n>.txt || true)" = 0
+   ```
+
+   Under `set -e` a failing `test` stops the block and names the check that failed, and because no
+   `psql` runs inside a pipeline, a connection or SQL error stops it too instead of printing a `0` that
+   reads as a pass. `-q` matters for the same reason: without it the temporary table and the `\copy`
+   write `CREATE TABLE` and `COPY <n>` onto standard output, and `step3-asof-w-<n>.txt` would never be
+   empty even on a clean run. Repeat the block for every later scheduled run, numbering the three files.
+
+   One note on the reconciler's rows, for reading (g2): its balance and currency checks are
+   **independent** and each writes at most one row, so an owner may appear twice; each row is judged the
+   same way, against that owner's latest ledger event, so two rows for one owner agree by construction.
 
 ### Evidence to capture
 
 | Item | What it is |
 | --- | --- |
 | `step3-freeze.txt` | The time the CICS transaction was disabled and by whom |
-| `step3-export.sha256` | Checksums of the fresh final export |
+| `step3-export.sha256` | Checksums of the fresh final export — both tiers of Step 1, since gate (b) reuses that procedure: the raw transfer hashes compared with the source side, and the tool-input hashes that are compared with nothing |
 | `step3-migration-run.txt` | The `migration_run` and `migration_reconciliation` rows for gate (b)'s batch, and both exit codes |
-| `step3-catalog-after.txt` | The catalog query re-run at gate (b), diffed against the Step 0 baseline |
-| `step3-validation.txt` | Gate (c): the per-owner comparison of `totalBalance` against the exported balance, with the owner-set comparison |
+| `step3-catalog-after.txt` | Both catalog queries re-run at gate (b), diffed against the Step 0 baseline, with the schema each relation was found in |
+| `step3-validation.tsv` | Gate (c): one record per owner — encoded owner, status, response body — compared against the exported balance, with the owner-set comparison. Its companion `step3-owners.nul` is the owner list it was driven from, together with the image reference the validation pod ran and the `NotFound` confirming it was deleted before (e) |
 | `step3-watermark.txt` | `W`, stored with the Step 0 snapshot |
 | `step3-values-diff.txt` | The applied values diffed against `step0-values-snapshot.yaml` / `step0-cr-snapshot.yaml` |
-| `step3-routing.txt` | The broker read from gate (g) and the adjudicated scheduled-reconcile output |
+| `step3-routing.txt` | The broker read from gate (g), confirming the path end to end |
+| `step3-run-<n>.txt` | Gate (g3) per scheduled reconcile: the completed-run count, which must read `1`. Numbered from `1`, the run gate (g) observed |
+| `step3-asof-w-<n>.txt` | Gate (g1) per scheduled reconcile: the frozen export against the state at `W`, which must be empty |
+| `step3-reconcile-<n>.txt` | Gate (g2) per scheduled reconcile: every `VARIANCE` row of that run with its verdict, all of which must read `LEDGER_EXPLAINED`; with the job's `batch_id` and `exit=` log line |
+| `step3-characterization.sha256` | The checksum of the `ACCEPTED` characterization document the schedule was given, tying its runs to the revision the data owner signed off |
+| `step3-schedule.txt` | The scheduled reconcile as it was actually set up: cadence, realization (CronJob or host scheduler), input and baseline mounts with their checksum files, owner, and the time it was retired |
 
 ### Sign-off required
 
@@ -847,10 +1731,23 @@ the state back would silently discard them. In order:
    SELECT owner, reserved_balance FROM cash_account WHERE reserved_balance <> 0;
    ```
 
+   Release each one by reading the ids out of the first query as data — the same discipline as gate
+   (c), and the token again from the `curl` config file of [Operator command
+   safety](#operator-command-safety). `psql` takes its password from `PGPASSWORD` in the environment,
+   never from `argv`:
+
    ```bash
+   psql -h <host> -p <port> -U <id> -d <database> -tAc \
+        "SELECT reservation_id FROM cash_reservation WHERE state = 'HELD'" \
+     | tr '\n' '\0' > step3-held.nul
+
    kubectl port-forward svc/<release>-cash-account-service 8080:8080 -n <namespace> &
-   curl -s -X POST -H "Authorization: Bearer <token>" \
-     http://localhost:8080/cash-account/institutional/reservations/<reservationId>/release
+   while IFS= read -r -d '' rid; do
+     [ -n "$rid" ] || continue
+     curl -sS -X POST --config ./ca-auth.conf \
+          --url "http://localhost:8080/cash-account/institutional/reservations/$(ca_urlencode "$rid")/release" \
+          -o /dev/null -w "$rid %{http_code}\n"
+   done < step3-held.nul | tee step3-releases.txt
    ```
 
    Both queries must return no rows before step 2 below. The operator sees the same condition as
@@ -868,19 +1765,40 @@ the state back would silently discard them. In order:
    routing is the snapshot's own `CASH_ACCOUNT_URL` and enablement — which is the entire reason Step 0
    captures the live snapshot instead of trusting the repository's defaults.
 
-3. **Confirm quiescence.** No new `ledger_entry` row for 60 seconds:
+3. **Confirm quiescence.** No `ledger_entry` row appended for 60 seconds:
 
    ```sql
-   SELECT (SELECT count(*) FROM ledger_entry
-            WHERE recorded_at > now() - interval '60 seconds') AS recent_entries,
-          (SELECT COALESCE(max(entry_id), 0) FROM ledger_entry)  AS high_water;
+   SELECT COALESCE(max(entry_id), 0) AS high_water FROM ledger_entry;
    ```
 
-   Run it twice, 60 seconds apart: `recent_entries` must be `0` both times and `high_water` must be the
-   same value in both. The two columns are deliberately scoped differently — the count is windowed and
-   the high-water mark is table-wide — because a windowed maximum would read `0` the moment the window
-   is empty and would look like quiescence regardless. Deriving a replay file from a range that is
-   still growing produces a file that is already wrong when it is replayed.
+   Run it twice, 60 seconds apart: `high_water` must be the **same value in both**. Deriving a replay
+   file from a range that is still growing produces a file that is already wrong when it is replayed,
+   which is the only thing this gate exists to prevent.
+
+   **Why the high-water mark is the whole check.** `entry_id` is `GENERATED ALWAYS AS IDENTITY` and the
+   ledger is append-only — `UPDATE` and `DELETE` are rejected by the `ledger_entry_immutable` trigger
+   ([`../src/main/resources/schema/cash-account-schema.sql`](../src/main/resources/schema/cash-account-schema.sql))
+   — so an unchanged maximum across the interval *is* "no row was appended", and nothing a count could
+   add is missing from it. The cost differs sharply, on the one table in this schema that only ever
+   grows: `max(entry_id)` is answered by an index-only backward scan of the primary key, reading a
+   handful of pages whatever the ledger's size, while `count(*) … WHERE recorded_at > now() - interval
+   '60 seconds'` has no index to lead with — the sole `recorded_at` index is
+   `(owner, recorded_at DESC, entry_id DESC)`, whose leading column is the owner — so it scans the
+   entire ledger, and twice, once per sample. Measured on a 200 000-row ledger on PostgreSQL 12: the
+   windowed count is a parallel sequential scan touching 2 667 shared buffers in 24 ms and growing with
+   the table; the high-water mark is an index-only scan touching 4 buffers in 0.09 ms and does not.
+
+   If positive confirmation that no session is mid-transaction is also wanted, `pg_stat_activity` shows
+   it. Read it as corroboration and never as the gate: a role without `pg_monitor` sees the `state` of
+   other roles' sessions as NULL, so this query can report `0` while another role writes.
+
+   ```sql
+   SELECT count(*) AS active_sessions
+     FROM pg_stat_activity
+    WHERE datname = current_database()
+      AND pid <> pg_backend_pid()
+      AND state <> 'idle';
+   ```
 
 4. **Export the closed range above the watermark and checksum it.**
 
@@ -925,19 +1843,38 @@ the state back would silently discard them. In order:
    | Field | Derivation |
    | --- | --- |
    | `seq` | Numbers the output from 1, in the emitted order |
-   | `owner` | The owner the line hands back. One line per owner touched after the watermark |
-   | `op` | `X` when that owner's **last** ledger row in the range is `ACCOUNT_DELETED`; `A` when the owner did not exist in the final legacy export; otherwise `U` |
+   | `owner` | The owner the line hands back. **Exactly one line per owner** touched after the watermark, whatever that owner's history in the range |
+   | `op` | `X` when that owner's **last** ledger row in the range is `ACCOUNT_DELETED`; otherwise `A` when the owner is absent from **this cutover's** final legacy export and `U` when it is present. The `X` test is applied first |
    | `balance` | The owner's **absolute** end state — `available_after` from that last row. Never a sum, never a delta |
    | `currency` | `currency` from that same last row |
    | `first_entry_id` / `last_entry_id` | The closed ledger range the line summarizes, inclusive at both ends; equal when the owner has one row in the range |
-   | `incarnation_id` | Ties the line to one account life, so a line can never be applied to a different incarnation of the same owner name |
+   | `incarnation_id` | The incarnation of that same **last** row: the account life the balance belongs to, so the hand-back can never be applied to an earlier life of the same owner name |
 
-   Ordering is by **ascending `last_entry_id`**, and `seq` simply numbers that order. Every line's
-   `reserved_after` must be `0.00`; **a non-zero `reserved_after` makes the derivation fail** rather
-   than emit a line for that owner — which is what step 1 above protects against. The file follows the
-   delimited conventions of the export format (UTF-8, LF, header line, comma-delimited, two-place
+   Ordering is by **ascending `last_entry_id`**, and `seq` simply numbers that order. The file follows
+   the delimited conventions of the export format (UTF-8, LF, header line, comma-delimited, two-place
    decimals). **No checksum line is embedded**: the checksum is recorded beside the file in the
    evidence, so the CSV stays free of comment syntax and every line remains a parseable record.
+
+   **One line per owner, not per account life.** The grouping key is the owner alone. An owner deleted
+   and created again above the watermark has ledger rows under two `incarnation_id`s, and grouping on
+   the pair would emit two lines for it — `X` for the deleted life and `U` for the recreated one.
+   Replayed in that order legacy deletes its row and then finds nothing to update, so legacy ends with
+   **no** row for an owner the target still holds a balance for. The owner's last row therefore decides
+   everything: the operation, the balance, the currency and the incarnation. `RollbackReplayFileTest`
+   carries that case as `RYAN` (deleted at entry 109, created again at 110, one `U` line stamped with
+   the second incarnation).
+
+   **The reservation rule is read off that last row too, never off the range.** Step 1 above releases
+   every `HELD` reservation, so a correct rollback reaches this point with nothing held; the check here
+   is that the owner's **end state** holds nothing. It is not `max(reserved_after)` over the range: the
+   ledger is append-only, so the rows that recorded a hold released or settled weeks ago are still
+   there, and a rule read over all of them would refuse to hand back any owner that has ever had a
+   hold — which is every owner with ordinary institutional activity. A non-zero `reserved_after` on the
+   last row is a real violation: the file carries one available balance per owner and legacy has no
+   reservation concept, so the held amount would vanish from the hand-back. That **aborts the
+   derivation before any file is written**, naming the owner and the entry, rather than dropping the
+   owner's line. `RollbackReplayFileTest` carries that case as `ERIC` (held and released at 111-112,
+   held and settled at 113-114: one line, and the same range with funds still held on entry 114 fails).
 
    **Why absolute state, and never `C`/`D`.** Replaying the end state through the legacy `A`/`U`/`X`
    codes reproduces the target's state exactly and is **independent of exchange rates**. A credit/debit
@@ -945,57 +1882,165 @@ the state back would silently discard them. In order:
    a rate differed from the one the target used — so it would be a rate-sensitive reconstruction of a
    number that is already known exactly. No rate, and no per-transaction detail, is replayed.
 
-   The query below implements the contract against the production schema. Check its output against the
-   table above before handing it to the mainframe team: it is a convenience, and the contract is the
-   authority.
+   The script below implements the contract against the production schema. Check its output against
+   the table above before handing it to the mainframe team: it is a convenience, and the contract is
+   the authority. Run it from the evidence directory, with `cashaccounty.csv` of gate (b)'s **final**
+   export present there; every object it creates is `TEMP`, so the production schema is unchanged by
+   it, and both `\copy` commands are client-side like step 4's `TO STDOUT` — no database file-write
+   privilege is involved and the file lands where the operator is working. Substitute three recorded
+   values before running: `<W>` from `step3-watermark.txt`, and the accepted final load's run id and
+   batch id from `step3-migration-run.txt`. The quoted heredoc passes them through untouched, so an
+   unsubstituted placeholder fails loudly rather than matching nothing.
 
    ```bash
-   psql -h <host> -p <port> -U <id> -d <database> -v ON_ERROR_STOP=1 -q \
-        > step3-rollback-replay.csv <<'SQL'
-   COPY (WITH ranged AS (
-            SELECT owner, incarnation_id, entry_id, event_type,
-                   available_after, reserved_after, currency
-              FROM ledger_entry
-             WHERE entry_id > <W>
-         ),
-         bounds AS (
-            SELECT owner, incarnation_id,
-                   min(entry_id) AS first_entry_id,
-                   max(entry_id) AS last_entry_id,
-                   max(reserved_after) AS max_reserved_after
-              FROM ranged
-             GROUP BY owner, incarnation_id
-         )
-         SELECT row_number() OVER (ORDER BY b.last_entry_id) AS seq,
-                b.owner AS owner,
-                CASE WHEN last_row.event_type = 'ACCOUNT_DELETED' THEN 'X'
-                     WHEN NOT EXISTS (SELECT 1 FROM ledger_entry m
-                                       WHERE m.owner = b.owner
-                                         AND m.entry_id <= <W>
-                                         AND m.event_type = 'MIGRATION_LOAD') THEN 'A'
-                     ELSE 'U' END AS op,
-                last_row.available_after::text AS balance,
-                last_row.currency AS currency,
-                b.first_entry_id AS first_entry_id,
-                b.last_entry_id AS last_entry_id,
-                b.incarnation_id AS incarnation_id
-           FROM bounds b
-           JOIN ledger_entry last_row ON last_row.entry_id = b.last_entry_id
-          WHERE b.max_reserved_after = 0
-          ORDER BY b.last_entry_id)
-     TO STDOUT WITH (FORMAT csv, HEADER true);
+   psql -h <host> -p <port> -U <id> -d <database> -v ON_ERROR_STOP=1 <<'SQL'
+   -- The owner set of THIS cutover's final legacy export, staged for the A-versus-U decision.
+   CREATE TEMP TABLE final_export_account (owner text, balance text, currencyc text);
+   \copy final_export_account FROM 'cashaccounty.csv' WITH (FORMAT csv, HEADER true)
+   CREATE TEMP TABLE final_export_owner AS
+       SELECT DISTINCT upper(btrim(owner)) AS owner FROM final_export_account;
+
+   -- The owner set gate (b)'s accepted load actually applied, read from that run's own rows.
+   CREATE TEMP TABLE final_load_owner AS
+       SELECT DISTINCT owner FROM ledger_entry
+        WHERE event_type = 'MIGRATION_LOAD' AND run_id = '<gate (b) load run id>';
+
+   -- Abort unless the staged file IS that export: equal cardinality is not equal membership, and a
+   -- same-sized wrong export inverts A and U for the owners it disagrees about.
+   DO $staged$
+   DECLARE loaded_not_staged text; staged_not_loaded text;
+   BEGIN
+       IF NOT EXISTS (SELECT 1 FROM migration_run
+                       WHERE run_id = '<gate (b) load run id>'
+                         AND batch_id = '<gate (b) batch id>'
+                         AND mode = 'LOAD'
+                         AND status = 'CLEAN') THEN
+           RAISE EXCEPTION 'run % is not a CLEAN LOAD run of batch %',
+               '<gate (b) load run id>', '<gate (b) batch id>'
+               USING HINT = 'name the accepted final load recorded in step3-migration-run.txt';
+       END IF;
+
+       SELECT string_agg(owner, ', ' ORDER BY owner) INTO loaded_not_staged
+         FROM (SELECT owner FROM final_load_owner EXCEPT SELECT owner FROM final_export_owner) d;
+       SELECT string_agg(owner, ', ' ORDER BY owner) INTO staged_not_loaded
+         FROM (SELECT owner FROM final_export_owner EXCEPT SELECT owner FROM final_load_owner) d;
+
+       IF loaded_not_staged IS NOT NULL OR staged_not_loaded IS NOT NULL THEN
+           RAISE EXCEPTION 'staged export is not the export gate (b) loaded: loaded but not staged [%];'
+               ' staged but not loaded [%]',
+               COALESCE(loaded_not_staged, 'none'), COALESCE(staged_not_loaded, 'none')
+               USING HINT = 'stage the checksummed final export of gate (b); no file is written';
+       END IF;
+   END
+   $staged$;
+
+   CREATE TEMP VIEW rollback_replay AS
+   WITH ranged AS (
+           SELECT owner, incarnation_id, entry_id, event_type,
+                  available_after, reserved_after, currency
+             FROM ledger_entry
+            WHERE entry_id > <W>
+        ),
+        bounds AS (
+           SELECT owner,
+                  min(entry_id) AS first_entry_id,
+                  max(entry_id) AS last_entry_id
+             FROM ranged
+            GROUP BY owner                      -- one line per owner, never per account life
+        ),
+        final_state AS (
+           SELECT b.owner, b.first_entry_id, b.last_entry_id,
+                  r.event_type, r.available_after, r.reserved_after,
+                  r.currency, r.incarnation_id  -- the LAST row's incarnation, balance and currency
+             FROM bounds b
+             JOIN ranged r ON r.owner = b.owner AND r.entry_id = b.last_entry_id
+        )
+   SELECT row_number() OVER (ORDER BY f.last_entry_id) AS seq,
+          f.owner AS owner,
+          CASE WHEN f.event_type = 'ACCOUNT_DELETED' THEN 'X'
+               WHEN NOT EXISTS (SELECT 1 FROM final_export_owner e
+                                 WHERE e.owner = f.owner) THEN 'A'
+               ELSE 'U' END AS op,
+          f.available_after::text AS balance,
+          f.currency AS currency,
+          f.first_entry_id AS first_entry_id,
+          f.last_entry_id AS last_entry_id,
+          f.incarnation_id AS incarnation_id,
+          f.reserved_after AS final_reserved_after
+     FROM final_state f;
+
+   -- Abort before any file exists if an owner's END STATE still holds funds. Not a filter: a dropped
+   -- line is an owner whose money is never handed back, so this must stop the run instead.
+   DO $guard$
+   DECLARE outstanding text;
+   BEGIN
+       SELECT string_agg(format('%s (last entry %s, ledger reserved_after %s, account reserved_balance %s)',
+                                r.owner, r.last_entry_id, r.final_reserved_after,
+                                COALESCE(a.reserved_balance, 0)), '; ' ORDER BY r.owner)
+         INTO outstanding
+         FROM rollback_replay r
+         LEFT JOIN cash_account a ON a.owner = r.owner
+        WHERE r.final_reserved_after <> 0 OR COALESCE(a.reserved_balance, 0) <> 0;
+       IF outstanding IS NOT NULL THEN
+           RAISE EXCEPTION 'rollback replay derivation aborted: reserved funds outstanding for %', outstanding
+               USING HINT = 'release every HELD reservation (step 1 above) and re-run; no file is written';
+       END IF;
+   END
+   $guard$;
+
+   \copy (SELECT seq, owner, op, balance, currency, first_entry_id, last_entry_id, incarnation_id FROM rollback_replay ORDER BY seq) TO 'step3-rollback-replay.csv' WITH (FORMAT csv, HEADER true)
    SQL
+   echo "derivation exit=$?"
    ```
 
-   Two notes on that query. The `A` case tests for the absence of a `MIGRATION_LOAD` row at or below
-   `W`: gate (b) writes exactly one such row per loaded owner, so its absence *is* "the owner did not
-   exist in the final legacy export", read from the ledger instead of from a file. And the
-   `WHERE b.max_reserved_after = 0` filter is the guard, not an optimization — if it drops a line, the
-   derivation has **failed** for that owner and the run must stop, because a silently missing owner is
-   an owner whose money is not handed back. Verify the count:
+   Four notes on that script, each answering a way the derivation can be silently wrong.
+
+   - **`GROUP BY owner`, and the last row supplies the incarnation.** Grouping on
+     `(owner, incarnation_id)` emits two lines for an owner deleted and created again above the
+     watermark, and replaying them hands legacy a deletion followed by an update of nothing.
+   - **The guard reads `final_reserved_after`, not `max(reserved_after)`.** The ledger keeps every hold
+     that was ever taken, so a maximum over the range rejects owners whose funds were released or
+     settled long ago. It also checks live `cash_account.reserved_balance`, which is the same condition
+     the operator saw as `reservedBalance` in step 1. With `ON_ERROR_STOP=1` the `RAISE` aborts the
+     script before the `\copy`, so a violation leaves **no** file rather than a partial one — confirm
+     `derivation exit=0` and the file's presence together.
+   - **`A` is decided by this cutover's own export, staged above.** Not by the absence of a
+     `MIGRATION_LOAD` row at or below `W`: the ledger outlives accounts and incarnations, so a load
+     from an earlier attempt or an earlier migration of the same owner name makes a genuinely new
+     account look pre-existing and emits `U` — and legacy then has no row to update. The staged set is
+     the file whose checksum is in the Step 3 evidence, which is what ties the decision to this
+     cutover. Which export is staged therefore decides every `A` and every `U`, so the script proves
+     it is gate (b)'s by **exact set comparison, in both directions**, and aborts otherwise: an owner
+     the load applied but the staged file omits would be emitted `A` and legacy would reject the add it
+     already has, while an owner the staged file carries but the load never applied would be emitted
+     `U` and legacy would have no row to update. A count comparison cannot see either — staged
+     `{A, C}` and loaded `{A, B}` both count 2 — which is why the two `EXCEPT` differences, not
+     cardinality, are what raise. The loaded set comes from the `MIGRATION_LOAD` rows of the **run id**
+     recorded in `step3-migration-run.txt`, not from the batch id: a load retried after a failure is a
+     new `run_id` under the same `batch_id`, so a batch can hold several `LOAD` runs and only the
+     accepted `CLEAN` one defines the set — which the script asserts before comparing. Those rows are a
+     complete picture of the export because gate (b) loaded into a schema with no `cash_account` rows,
+     so the loader inserted every exported owner and wrote one row for each (an unchanged owner writes
+     no row, and there were none). Verify the staged file against its recorded checksum before running,
+     too, since a truncated copy of the right export is a set difference this comparison then reports:
+
+     ```bash
+     grep -q "$(sha256sum cashaccounty.csv | cut -d' ' -f1)" step3-export.sha256 \
+       || echo 'staged export does not match the gate (b) checksum evidence'
+     ```
+
+     The staging, the assertions and the `\copy` are one psql session on purpose: `final_export_owner`
+     and `final_load_owner` are `TEMP` tables and do not outlive it.
+   - **`available_after::text`, not `to_char(...)`.** The column is `NUMERIC(9,2)`, so its text form is
+     already the two-place decimal the contract requires, including `0.00`; a `to_char` format mask
+     renders that value as `.00` and fails the reader's anchored decimal pattern.
+
+   Verify the line count against the owners actually in the range — owners, not owner/incarnation
+   pairs, because the pair count exceeds the required line count exactly when an owner was deleted and
+   recreated, and would approve a file with two lines for it:
 
    ```sql
-   SELECT count(DISTINCT (owner, incarnation_id)) AS owners_in_range
+   SELECT count(DISTINCT owner) AS owners_in_range
      FROM ledger_entry WHERE entry_id > <W>;
    ```
 
@@ -1020,8 +2065,17 @@ the state back would silently discard them. In order:
 
 #### Rollback criteria, each executable
 
-- **Any `VARIANCE` row in a scheduled reconcile** that the watermark adjudication of gate (g) does not
-  explain (`post_watermark_entries = 0`).
+- **Any row from gate (g1)** — the frozen export against the state at `W` — on any scheduled run. Each
+  such row is a migration defect that was present at the watermark, and no later activity on that owner
+  excuses it.
+- **Any gate (g2) row whose verdict is not `LEDGER_EXPLAINED`**: a `DRIFT` row (an account that does not
+  match its own last ledger event) or a `SOURCE_ROW` row (a finding about the export or the load that
+  gate (b) had ruled out).
+- **A scheduled reconcile that did not complete** — gate (g3) failing: no `migration_run` row for the
+  batch, a `FAILED` or `RUNNING` row, or `characterization_status = 'DRAFT'`. An empty adjudication from
+  a run that never happened is not a clean result.
+- **A missed scheduled reconcile**, once the cadence recorded before gate (e) has lapsed and the run is
+  not made good: an unevaluated criterion is a failed one, as with any gate here.
 - **Any failed gate** in (a)-(g).
 - **The error-rate rule**, evaluated from the service's Prometheus scrape (`/metrics`):
 
@@ -1087,6 +2141,15 @@ preconditions are hard for that reason.
 - **The agreed post-cutover rollback window has elapsed** with clean scheduled reconciles throughout.
   The window is what makes Step 3's hand-back available; retiring the legacy assets ends it, so the
   window must be over rather than merely uneventful so far.
+
+  "Clean throughout" is checkable, not impressionistic. For every run the cadence recorded before gate
+  (e) called for — **with no run missing** — the three files of [Step 3(g)](#actions-3) exist and each
+  passes its own gate: `step3-run-<n>.txt` reads `1`, so the run completed on an `ACCEPTED` baseline;
+  `step3-asof-w-<n>.txt` is **empty**, so the frozen export still matches the state at `W`; and every
+  row of `step3-reconcile-<n>.txt` carries the verdict `LEDGER_EXPLAINED`. An empty adjudication from a
+  run that did not happen counts as a missing run, not a clean one. The scheduled reconcile is then
+  retired, before the first retirement action below, and the time of its removal is recorded with the
+  rest of its evidence.
 
 ### Actions
 
@@ -1164,7 +2227,7 @@ never modified, here or anywhere else in this migration. Nothing under
 | `step4-target-export.sha256` | Checksums of the `ledger_entry`, `cash_reservation` and `cash_account` exports |
 | `step4-retention-location.txt` | Where each retained artifact is stored, under whose control, and its expiry date per the answer above |
 | `step4-retirements.txt` | Per-asset retirement confirmation, in execution order with timestamps: CICS transaction, plan, package, each table, the cluster |
-| `step4-reconciles.txt` | The clean scheduled reconciles across the elapsed rollback window |
+| `step4-reconciles.txt` | The window's roll-up of the Step 3(g) evidence: one line per scheduled run with its batch id, exit code, completed-run check, (g1) row count and (g2) verdict counts — showing the cadence held with no run missing, every (g1) file empty and every (g2) row `LEDGER_EXPLAINED`; with the time the schedule was retired |
 
 ### Sign-off required
 

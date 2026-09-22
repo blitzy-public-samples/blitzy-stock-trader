@@ -185,6 +185,25 @@ class VsamHistoryRecordDecoderTest {
         // here would add nothing and would breach the test budget of AAP 0.7.6.
         assertThat(records).hasSize(EXPECTED_FIXTURE_RECORDS);
         assertThat(records).extracting(VsamHistoryRecord::name).startsWith(MIXED_CASE_NAME, UPPER_CASE_NAME);
+
+        // THE OTHER HALF OF "THE TAIL IS PADDING": a tail that is neither EBCDIC blank nor 0x00 is not
+        // harmless residue but the first evidence that the file was never framed at the declared length -- a
+        // 57-byte export read as 100-byte records, or a transfer that inserted separators -- and a mis-framed
+        // export decodes into plausible-looking values at the wrong offsets instead of failing. The byte is
+        // planted at the LAST position of the frame, the one a check that inspected only the first tail byte
+        // would miss, and the failure has to name that offset because it is what an operator compares against
+        // the layout.
+        byte[] residueInTail = padded.clone();
+        int lastOffsetOfFrame = LegacyExportFormat.HISTORY_PADDED_RECORD_LENGTH - 1;
+        residueInTail[lastOffsetOfFrame] = "X".getBytes(LEGACY_CHARSET)[0];
+        assertThat(LegacyExportFormat.isPaddingByte(residueInTail[lastOffsetOfFrame]))
+                .as("the byte this test plants in the tail must not be padding, or the rejection proves nothing")
+                .isFalse();
+        assertThatThrownBy(() -> decoderFor(LegacyExportFormat.HISTORY_PADDED_RECORD_LENGTH)
+                .decodeRecord(residueInTail, 1))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining(String.valueOf(lastOffsetOfFrame))
+                .hasMessageContaining(String.valueOf(LegacyExportFormat.HISTORY_RECORD_LENGTH));
     }
 
     @Test

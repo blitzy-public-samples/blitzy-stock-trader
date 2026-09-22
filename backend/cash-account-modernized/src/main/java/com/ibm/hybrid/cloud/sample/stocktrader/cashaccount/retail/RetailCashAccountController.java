@@ -99,23 +99,38 @@ public class RetailCashAccountController {
     // both key on, and CashAccountErrorCode is a closed set that AAP 0.6.2 fixes - it holds no mismatch condition,
     // so rejecting a divergent body owner would mean widening an enum this contract pins.
     //
+    // WHY THE BODY IS REQUIRED. AAP 0.6.2 defines both writes as carrying body {owner, balance, currency}, and PUT
+    // as an ABSOLUTE overwrite of the balance and the currency. Treating that payload as optional made a body-less
+    // PUT indistinguishable from a caller asking for 0.00 in the base currency, so a request carrying no
+    // instruction at all silently emptied an account. A missing (or JSON-null) body is now Spring's
+    // HttpMessageNotReadableException, which error/ApiExceptionHandler renders as 400 INVALID_AMOUNT in the single
+    // ApiError shape, and no caller loses anything: broker always sends an entity on create and never calls the
+    // update method at all
+    // [backend/broker/src/main/java/com/ibm/hybrid/cloud/sample/stocktrader/broker/BrokerService.java:L357-L365].
+    //
+    // The DEFAULTS INSIDE the body stay, because they are legacy behaviour rather than convenience, and README.md's
+    // retail contract table states each of them together with the fact that a body of {} therefore overwrites an
+    // account with 0.00 in the base currency: an omitted or null balance is 0.00, since the COMMAREA field
+    // WS-BALANCE PIC 9(7)V99 [backend/cash-account-cobol/COBOL/CASH00.cbl:L56] could not be null and an unset
+    // field arrived as zeros; an omitted, null or blank currency is the configured base currency, which broker
+    // itself already substitutes before calling [.../broker/BrokerService.java:L83, L357-L365].
+    //
     // The owner travels raw. domain/OwnerNormalizer, reached through the service, is the single place that trims,
-    // uppercases and rejects a blank or over-32-character owner as 400 INVALID_OWNER; a null balance and a null or
-    // blank currency are defaulted there too, to zero and to the configured USD (AAP 0.4.6). Trimming or defaulting
-    // here would leave the shadow replay path, which never passes through this controller, judged against different
-    // input handling.
+    // uppercases and rejects a blank or over-32-character owner as 400 INVALID_OWNER, and the two defaults above
+    // are applied there as well (AAP 0.4.6). Trimming or defaulting here would leave the shadow replay path, which
+    // never passes through this controller, judged against different input handling.
     @PostMapping("/{owner}")
     public CashAccountResponse createCashAccount(@PathVariable("owner") String owner,
-            @RequestBody(required = false) CashAccountResponse body) {
+            @RequestBody CashAccountResponse body) {
 
-        return service.create(owner, balanceOf(body), currencyOf(body));
+        return service.create(owner, body.balance(), body.currency());
     }
 
     @PutMapping("/{owner}")
     public CashAccountResponse updateCashAccount(@PathVariable("owner") String owner,
-            @RequestBody(required = false) CashAccountResponse body) {
+            @RequestBody CashAccountResponse body) {
 
-        return service.update(owner, balanceOf(body), currencyOf(body));
+        return service.update(owner, body.balance(), body.currency());
     }
 
     @DeleteMapping("/{owner}")
@@ -123,13 +138,21 @@ public class RetailCashAccountController {
         return service.delete(owner);
     }
 
-    // amount is bound as text and parsed below rather than declared as a BigDecimal parameter, because the caller's
-    // own signature is @QueryParam("amount") double
+    // amount is bound as text and parsed below rather than declared as a BigDecimal parameter, and not because the
+    // framework could not parse it. The caller's own signature is @QueryParam("amount") double
     // [backend/broker/src/main/java/com/ibm/hybrid/cloud/sample/stocktrader/broker/client/CashAccountClient.java:L83,
-    // L90]. The wire value is therefore whatever Double.toString produced, which includes the scientific form
-    // 1.0E7 - a form Spring's string-to-BigDecimal converter refuses while new BigDecimal(String) accepts it.
-    // Letting the binder refuse it would answer 400 for a value the contract owes 422 AMOUNT_OUT_OF_RANGE, decided
-    // by domain/Money behind the service.
+    // L90], so the wire value is whatever Double.toString produced, including the scientific form 1.0E7 - which
+    // Spring's own String-to-BigDecimal conversion accepts too, since it delegates to new BigDecimal(String).
+    //
+    // The reason is WHERE the decision is taken. AAP 0.6.2 fixes this shape - "amount bound from its string form
+    // to BigDecimal" - and what it buys is one explicit parse, in this file, that no configuration elsewhere can
+    // reinterpret: a Formatter or ConversionService registered by some later WebMvcConfigurer would otherwise own
+    // the conversion of every money parameter, free to apply a locale-sensitive or grouping-aware parse or a
+    // scaling step, and domain/Money must be the module's single truncation point (AAP 0.12.5). It also makes
+    // blank and non-numeric text one condition with one answer, 400 INVALID_AMOUNT, where a declared parameter
+    // reports a present-but-empty ?amount= through the MISSING-parameter channel
+    // (MissingServletRequestParameterException raised after conversion to null) - the same status and code as it
+    // happens, but describing a value the caller did send as one it did not.
     @PutMapping("/{owner}/debit")
     public CashAccountResponse debit(@PathVariable("owner") String owner,
             @RequestParam(name = "amount") String amount) {
@@ -165,15 +188,5 @@ public class RetailCashAccountController {
             // an operator reading a stack trace needs; the message is left null so the code's own wording is used.
             throw CashAccountException.of(CashAccountErrorCode.INVALID_AMOUNT, null, cause);
         }
-    }
-
-    // A missing body is read as a fully absent payload rather than refused, because the legacy COMMAREA always
-    // presented both fields and the service's defaulting is what the contract promises for either of them.
-    private static BigDecimal balanceOf(CashAccountResponse body) {
-        return body == null ? null : body.balance();
-    }
-
-    private static String currencyOf(CashAccountResponse body) {
-        return body == null ? null : body.currency();
     }
 }

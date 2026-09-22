@@ -144,11 +144,17 @@ public class CashAccountProperties {
 
         // Adopted, not invented: this is the allowed_currencies CHECK the estate's own PostgreSQL initialization
         // already enforces on its never-built cashaccount table
-        // [infra/stocktrader-setup/azure/modules/postgres_init/init_schema.sql.tmpl:L7], and it is also the set the
-        // Frankfurter API serves - so a code accepted here is a code that can actually be converted. Insertion
-        // order is preserved so the value reads back in the documented ISO order rather than a hash order.
-        // Trimming and upper-casing on the way in is a convenience local to this package; every consumer still
-        // normalizes its own input, so no correctness claim rests on it.
+        // [infra/stocktrader-setup/azure/modules/postgres_init/init_schema.sql.tmpl:L7]. It is the ESTATE
+        // allowlist and NOT the set the exchange-rate provider serves: that provider publishes a 30-code subset,
+        // omitting BGN as of 2026-09-22, so an accepted code is not by itself a convertible one and a code the
+        // provider does not publish surfaces as 503 EXCHANGE_RATE_UNAVAILABLE on the credit/debit path. The
+        // reasoning for keeping BGN, and the per-deployment way to narrow the list, are recorded once in
+        // application.yml beside the property, which is this policy's single authority - this default exists so
+        // that a context binding no property source still yields a fully populated, validated object (above all
+        // the ApplicationContextRunner in DataSourceGuardConfigTest), never as a second source of truth.
+        // Insertion order is preserved so the value reads back in the documented ISO order rather than a hash
+        // order. Trimming and upper-casing on the way in is a convenience local to this package; every consumer
+        // still normalizes its own input, so no correctness claim rests on it.
         @NotEmpty
         private Set<String> acceptedCurrencies = DEFAULT_ACCEPTED_CURRENCIES;
 

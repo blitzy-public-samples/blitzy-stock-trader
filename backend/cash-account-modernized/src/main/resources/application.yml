@@ -69,6 +69,23 @@ spring:
       # Ledger and reservation timestamps are TIMESTAMPTZ, so pinning the JDBC zone keeps a written instant equal to
       # the instant read back whatever local zone the pod happens to carry.
       hibernate.jdbc.time_zone: UTC
+      # Hibernate's default is one round trip per row, so a migration load that stages a whole DB2 unload and a
+      # whole VSAM history into legacy_rate_table and legacy_history pays N round trips for N rows. The value bounds
+      # how many statements share a round trip and decides nothing about correctness — a smaller number is slower and
+      # a larger one holds more unsent statements, and neither changes what lands. 50 is the estate-neutral default,
+      # and migration/load/LegacyLoader plus migration/reconcile/ReconciliationService use the same number for
+      # cashaccount.migration.batch-chunk-size below, so a flush maps onto whole JDBC batches instead of
+      # straddling them. The request path is unaffected in substance: a retail write flushes a single row, which is a batch of
+      # one, and ledger_entry's BIGINT GENERATED ALWAYS AS IDENTITY key makes Hibernate issue its inserts singly in
+      # any case because it needs the generated entry_id immediately.
+      hibernate.jdbc.batch_size: 50
+      # Ordering is what makes a batch a batch: within one flush Hibernate groups the statements of an entity type
+      # together, so a staging pass produces batched INSERTs rather than an alternating sequence that breaks the
+      # batch on every type change. It reorders statements inside a flush only, never across one, and the one
+      # foreign key in the schema (migration_reconciliation.run_id → migration_run) is satisfied by an explicit
+      # flush of the run row before the first finding is written, not by this ordering.
+      hibernate.order_inserts: true
+      hibernate.order_updates: true
 
   jackson:
     # No float or double may touch a money path, and a balance must reach the wire as plain decimal text: broker's
@@ -123,17 +140,39 @@ management:
   # the main connector.
 
 cashaccount:
+  migration:
+    # How many rows a bulk load applies or stages, and how many owners a bulk reconcile compares, before the
+    # persistence context is flushed and cleared. It exists because a runbook bulk step supplies whole DB2
+    # unloads and a whole VSAM history: with no bound, one load would hold every account entity, every ledger
+    # row and every staged row it has written until the transaction ends, which is an out-of-memory failure
+    # halfway through a migration window rather than a slow run. It is a trade-off and not a correctness
+    # parameter - the same rows land whatever it is, because the whole load remains one transaction
+    # (AAP 0.6.3) - so a wrong value costs round trips and resident rows: too small flushes more often than
+    # the JDBC batch can fill, too large defeats the bound it exists to impose. 50 matches
+    # spring.jpa.properties.hibernate.jdbc.batch_size above, so a flush is whole JDBC batches; the two are
+    # meant to move together. It sits here rather than under tool.* because MigrationToolRunner rejects any
+    # tool.* command-line option outside the seven it declares, which would make the knob unreachable at the
+    # moment an operator needs it; --cashaccount.migration.batch-chunk-size=<rows> overrides it per invocation.
+    # Read by migration/load/LegacyLoader and migration/reconcile/ReconciliationService, and by nothing on the
+    # request path - the deployed service never loads.
+    batch-chunk-size: 50
+
   jdbc:
     # Guarded rather than defaulted for convenience. database.kind is chart-global and is still db2 in the
     # repository (.../values.yaml:L74-L81), so config/DataSourceGuardConfig fails start-up with an explicit message
     # for any value other than postgres instead of half-starting against a store this schema was never written for.
     # Moving the release to PostgreSQL is a signed-off runbook Step 0 prerequisite, not a change this file makes.
     kind: ${JDBC_KIND:postgres}
-    # The chart injects host, port and database from non-optional configMap keys
-    # (.../templates/cash-account.yaml:L89-L103); the defaults below serve only a hand-started local run.
-    host: ${JDBC_HOST:localhost}
+    # Host and database carry no fallback. The chart injects both from non-optional configMap keys
+    # (.../templates/cash-account.yaml:L89-L103), so a convenience default cannot help a real deployment and would
+    # instead let a process started without that configMap reach a local database while its probes stayed green -
+    # the ledger writing somewhere nobody is reconciling. The empty default resolves to a blank value on purpose:
+    # it routes straight into config/DataSourceGuardConfig, which refuses to start and names the missing variable,
+    # whereas a bare ${JDBC_HOST} would fail placeholder resolution with a message that names no remedy. Only the
+    # port keeps its 5432, which is PostgreSQL's own listening port rather than a guess about this estate.
+    host: ${JDBC_HOST:}
     port: ${JDBC_PORT:5432}
-    database: ${JDBC_DB:trader}
+    database: ${JDBC_DB:}
     # Mirrors portfolio's <variable name="JDBC_SSL" defaultValue="false"/>
     # (backend/portfolio/src/main/liberty/config/includes/postgres.xml:L2).
     ssl: ${JDBC_SSL:false}
@@ -158,11 +197,26 @@ cashaccount:
     # Connect and read budget for FrankfurterExchangeRateClient. A slow rate provider must surface as
     # 503 EXCHANGE_RATE_UNAVAILABLE with the balance untouched, never as a request that outlives its caller.
     timeout: PT2S
-    # The accepted-currency set, adopted verbatim from the allowed_currencies CHECK the estate already enforces on
-    # its never-built cashaccount table
-    # (infra/stocktrader-setup/azure/modules/postgres_init/init_schema.sql.tmpl:L7), which is also the set
-    # Frankfurter serves. Anything outside it is rejected with 400 INVALID_CURRENCY rather than stored and then
+    # THE single authority for the accepted-currency policy. retail/RetailCashAccountService,
+    # migration/reconcile/ReconciliationService and fx/FrankfurterExchangeRateClient all bind this key - with
+    # Binder, because a YAML sequence reaches the Environment as indexed keys and no ${...} placeholder can
+    # aggregate those - so narrowing it here, or through CASHACCOUNT_FX_ACCEPTED_CURRENCIES with no chart change,
+    # narrows every one of them at once. The first two hold no set of their own and fail at start-up if this key
+    # is missing or empty; the FX client keeps a shipped copy that applies only when no property source carries
+    # the key at all. Anything outside the set is rejected with 400 INVALID_CURRENCY rather than stored and then
     # found unconvertible.
+    #
+    # It is the ESTATE allowlist, adopted verbatim from the allowed_currencies CHECK the estate already enforces on
+    # its never-built cashaccount table
+    # (infra/stocktrader-setup/azure/modules/postgres_init/init_schema.sql.tmpl:L7) - NOT the set the exchange-rate
+    # provider serves, which is a 30-code subset of it: as of 2026-09-22 the configured provider's currencies
+    # endpoint omits BGN, and GET /latest?from=USD&to=BGN answers 404. Acceptance is therefore not a promise of
+    # convertibility. BGN is kept rather than dropped because this list also decides what a legacy export may be
+    # LOADED with (migration/reconcile/ReconciliationService rejects an out-of-set currency as CURRENCY /
+    # INVALID_IN_LEGACY and does not migrate the account): dropping it would silently strand a BGN-denominated
+    # legacy account, while keeping it costs at most a loud 503 EXCHANGE_RATE_UNAVAILABLE on a cross-currency
+    # credit or debit, with the balance unchanged and no ledger row. A deployment whose accounts must all be
+    # convertible narrows the list to the codes its provider publishes.
     accepted-currencies: [
       AUD, BGN, BRL, CAD, CHF, CNY, CZK, DKK, EUR, GBP, HKD, HUF, IDR, ILS, INR, ISK,
       JPY, KRW, MXN, MYR, NOK, NZD, PHP, PLN, RON, SEK, SGD, THB, TRY, USD, ZAR

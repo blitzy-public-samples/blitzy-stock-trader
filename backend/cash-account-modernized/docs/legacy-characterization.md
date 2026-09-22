@@ -3,8 +3,13 @@
 This is the behavioral baseline for the program the `cash-account-modernized` service replaces. It
 exists because the replacement's reconciliation logic has to reproduce legacy arithmetic exactly, and
 that arithmetic cannot be guessed: it is a property of specific COBOL picture clauses and a specific
-`COMPUTE` statement. Every claim below is derived from a direct read of the legacy source and carries
-an inline `file:line` citation so a reviewer can check the claim rather than trust it.
+`COMPUTE` statement. Every claim below **about this program** is derived from a direct read of the
+legacy source and carries an inline `file:line` citation so a reviewer can check the claim rather
+than trust it. A second, smaller category is separated from it rather than mixed into it: what a Db2
+or CICS return code *means* is product behavior that no file in this repository states, so the three
+`SQLCODE` rows of section 7.1 and open item 9.9 that rest on it are labelled product semantics and
+cited to their IBM documentation instead of to a source line. Nothing else in the document is of that
+kind, and no claim about what `CASH00` did rests on it.
 
 ## 0. How to read this document
 
@@ -12,9 +17,11 @@ Citation shorthand: unqualified `Lnnn` references are lines of `COBOL/CASH00.cbl
 citation names its file. All legacy paths are relative to `backend/cash-account-cobol/`, which is a
 read-only characterization source — it is opened and cited here and modified nowhere.
 
-Nothing in this document rests on prior documentation, on a generated summary, or on the
-modernization plan. Where the source cannot settle a question, section 9 records it as an open item
-with what would settle it; no plausible value is substituted for a source-derived one. Nothing here
+Nothing in this document rests on prior documentation of this program, on a generated summary, or on
+the modernization plan; the IBM product documentation cited in section 7.1 and open item 9.9 is the
+one external source, and it is cited for what a return code means, never for anything this program
+does. Where the source cannot settle a question, section 9 records it as an open item with what
+would settle it; no plausible value is substituted for a source-derived one. Nothing here
 reports evidence from a live system: no DB2 for z/OS table, no VSAM data set and no CICS region was
 read to write it, and the migration, dual-run, cutover and decommission steps it refers to are
 described in [`operational-runbook.md`](operational-runbook.md) as handoffs, not as work performed.
@@ -46,8 +53,11 @@ sections 4, 5 and 8; the fixtures under
 [`../src/test/resources/fixtures/legacy-export/matched/`](../src/test/resources/fixtures/legacy-export/matched/)
 and `../src/test/resources/fixtures/shadow/` encode the expected values section 1 derives. Build and
 configuration context is in the [module README](../README.md). The subsection headings in section 1
-are load-bearing: renaming or merging them breaks the Javadoc references and the `@BeforeAll` guards
-that point at them.
+are load-bearing, and checked rather than merely declared so: each constant's Javadoc quotes its
+heading verbatim, `CharacterizationDocPresentTest` asserts those heading lines as well as section 1's
+arithmetic citations, and the heading assertion sits inside the very guard the reconciliation
+integration tests call from their `@BeforeAll` methods. Renaming or merging a heading therefore fails
+the build instead of silently orphaning every reference to it.
 
 ## 1. What `amount` resolves to in the credit/debit computation
 
@@ -388,7 +398,10 @@ an empty rate so that both variance paths are exercised before any real export i
 
 Every behavior established above, labeled with what the replacement does about it. "Deliberately
 changed" means an authorized improvement with the legacy behavior recorded; "not replicated" means the
-behavior is a property of the legacy platform that the target has no equivalent for.
+behavior is a property of the legacy platform that the target has no equivalent for. A row whose
+disposition rests on what the calling estate does rather than on the six sources of section 0 is
+marked an estate-seam fact and cites that caller's own file and line, so the table never presents a
+broker behavior as something read from the legacy program.
 
 | Legacy behavior | Disposition | Reason / replacement |
 |---|---|---|
@@ -397,7 +410,7 @@ behavior is a property of the legacy platform that the target has no equivalent 
 | `truncate2(stored ± RATES × amount)` with one truncation of the final result (L222, L256) | PRESERVED | `Money.applyRate` keeps the full-precision product, adds, then scales once with `RoundingMode.DOWN` (sections 1.4, 1.8) |
 | Case-insensitive owner identity with upper-case storage (L141, L155, L178) | PRESERVED | `OwnerNormalizer` (section 2) |
 | Balance range 0.00 – 9,999,999.99 (L17; `DB2-DDL/DB2DDL.jcl:L48`) | PRESERVED | `NUMERIC(9,2)` columns and `Money` bounds; widening is an open item (9.8) |
-| Default currency when the caller omits one | PRESERVED | The caller already defaults to `USD`; the service defaults again rather than storing a blank `CHAR(8)` (L57) |
+| Default currency when the caller omits one | PRESERVED (estate-seam fact) | The caller already defaults to `USD` — `DEFAULT_CURRENCY` (`backend/broker/src/main/java/com/ibm/hybrid/cloud/sample/stocktrader/broker/BrokerService.java:L83`), applied on the create path at `BrokerService.java:L359`, which is broker's behavior rather than a fact of the six sources; the service defaults again rather than storing a blank `CHAR(8)` (L57) |
 | A state change is always recorded (L111-L131) | PRESERVED as the ledger | One `ledger_entry` per transition, in the same transaction as the balance change |
 | An amount with more than two decimals | DELIBERATELY CHANGED (decision recorded) | Scaled `DOWN` to 2; the legacy input path is not in the repository (sections 1.9, 9.4) |
 | Nullable `CHAR(8)` currency, rate keyed on its first five characters (L213, L217-L218) | DELIBERATELY CHANGED | The API accepts only trimmed, upper-case codes from the accepted set; imports trim padding and classify nulls and out-of-set values as variances (section 5.1) |
@@ -423,6 +436,14 @@ behavior is a property of the legacy platform that the target has no equivalent 
 | `WS-ASKTIME` (L21), `WS-DATE` (L22), `WS-TIME` (L23) | PRESERVED in effect | Consumed only to stamp the audit record (L112-L113, L120-L121); the ledger's timestamp serves the same purpose |
 
 ## 7. Status-code derivation and the dispatch table
+
+Every status that replaces a characterized legacy outcome is derived here rather than chosen: 7.1
+takes each condition the program could reach and states what its one return field reported, which is
+what a status and a stable error code have to replace; 7.2 maps the six request codes onto the
+endpoints that carry them. The replacement's target-only conditions — the reservation, idempotency
+and authentication codes a single-balance program with no reservations and no token had no analogue
+for — derive from nothing here and belong to its own closed error model, listed in the
+[module README](../README.md).
 
 ### 7.1 Why the return channel was lossy, condition by condition
 
@@ -456,9 +477,36 @@ this masks a `-305`.
 | `C`/`D` rate row missing | rate `SELECT` 100, then `UPDATE` 0 | **Return code 0** with `RATES` uninitialized (`COBOL/DCLFRANK.cpy:L22`) — undefined arithmetic committed under a success status | `503 EXCHANGE_RATE_UNAVAILABLE` with `Retry-After`, balance unchanged, no ledger row |
 | `C`/`D` computed | 0 | Truncated, unsigned result stored (L222/L256, L225/L259): absolute value on a negative result, high-order digits dropped on overflow | `200`, or `422 INSUFFICIENT_FUNDS` / `422 AMOUNT_OUT_OF_RANGE` |
 | `C`/`D` null in the rate row | `-305` at the rate `SELECT`, then `UPDATE` 0 | Success reported; the update commits with an undefined `RATES` (section 5.1) | `503 EXCHANGE_RATE_UNAVAILABLE`; the export's null rate is a `RATE_SOURCE` variance |
-| Deadlock, timeout or resource unavailable (`-911`, `-913`, `-904`) | negative | Digits only; CICS backs the unit of work out | `503 DATASTORE_UNAVAILABLE` with `Retry-After` |
+| Deadlock or timeout, unit of work already rolled back (`-911`) | negative | Digits only; Db2 had rolled the unit of work back before the program regained control, so whatever the paragraph had written so far was already undone (SQLSTATE 40001) | `503 DATASTORE_UNAVAILABLE` with `Retry-After` |
+| Deadlock or timeout, unit of work left open (`-913`) | negative | Digits only; the statement failed and nothing was rolled back — the commit-or-rollback decision stayed with the application, and whether a CICS caller saw this or `-911` is decided by the region's `DROLLBACK` attachment attribute, which this repository does not contain (SQLSTATE 57033; open item 9.9) | `503 DATASTORE_UNAVAILABLE` with `Retry-After` |
+| Resource unavailable (`-904`) | negative | Digits only; a required resource was unavailable rather than contended, so no rollback is implied and this is not a lock-contention outcome at all (SQLSTATE 57011) | `503 DATASTORE_UNAVAILABLE` with `Retry-After` |
 | Unrecognized request code | untouched — no statement ran in this task | Success-looking code, COMMAREA echoed, history row written (section 3) | `404 UNSUPPORTED_PATH` / `405 UNSUPPORTED_METHOD` |
 | Any other negative code | negative | Digits only | `500 INTERNAL` |
+
+Those three rows state what the codes mean — Db2 for z/OS product semantics, SQLSTATE 40001, 57033
+and 57011, from the IBM Db2 for z/OS documentation, *Codes* → SQL codes `-904`, `-911` and `-913`,
+and labelled as such per section 0. The six sources settle something narrower and more useful: where
+such a code could arrive, and whether the caller ever saw it. The program declares no `WHENEVER` and
+tests `SQLCODE = 0` in six places (L143, L157, L171, L194, L212, L246), and each of those guards
+only its own paragraph's **first** SQL statement, so the two cases are not alike:
+
+- On that guarded first statement, any of the three codes takes the `ELSE` branch, whose `WS-MSG`
+  is discarded unread (section 6), and `MOVE SQLCODE TO WS-RETCODE` (L104) hands the code back as
+  unsigned digits.
+- On any **later** statement in the paragraph nothing is checked. The success branch had already
+  been entered, so the paragraph still composes its success message — `'ACCOUNT UPDATED'` (L180),
+  `'ACCOUNT CREDITED'` (L233) — and whether the failing code reaches the caller at all depends on
+  position: `U`'s `UPDATE` (L174-L179) and `X`'s `DELETE` (L195-L198) are the last statements their
+  paragraphs execute, so their errors survive to L104 beside that success message, while `C`/`D`'s
+  rate `SELECT` (L214-L219, L248-L253) is followed by an `UPDATE` (L227-L231, L260-L264) whose own
+  `SQLCODE` overwrites it — the same masking section 5.1 walks for `-305`.
+
+The program therefore distinguished none of the three, and the return field could not tell a
+rolled-back unit of work from one still open, nor either from the success message composed beside
+it. The replacement splits them by cause instead: a lock conflict raised by the target's own row
+locks is `409 CONCURRENT_MODIFICATION` with `Retry-After: 1`, and an unreachable or timed-out
+datastore is `503 DATASTORE_UNAVAILABLE` with `Retry-After: 5` — so no caller has to infer a
+rollback from a digit string.
 
 The replacement has no analogue of the "last statement wins" masking: each characterized failure
 raises before its transaction commits, and one exception handler maps it to exactly one status and one
@@ -604,6 +652,30 @@ right default for parity. Whether it suits the institutional volumes the new res
 intended to serve is a business question this repository does not answer. What would settle it: a
 stated ceiling from the requesting organization. Widening it later is one DDL change plus the bounds
 in `Money`, and does not affect parity for values inside the current range.
+
+### 9.9 Whether a deadlock or timeout reached the caller as `-911` or as `-913`
+
+Both codes are reachable and they are different outcomes: `-911` is returned after the unit of work
+has already been rolled back (SQLSTATE 40001), `-913` reports the same deadlock or timeout with the
+unit of work still open and the commit-or-rollback decision still the application's (SQLSTATE 57033)
+— Db2 for z/OS product semantics, from the IBM Db2 for z/OS documentation, *Codes* → SQL codes
+`-911` and `-913`, and labelled as product semantics per section 0. Which of the two an application
+running under CICS sees is set by the `DROLLBACK` attribute of the Db2 attachment's
+`DB2CONN`/`DB2ENTRY` definition: `YES`, the default, makes the CICS Db2 attachment facility issue a
+syncpoint rollback and return `-911`, while `NO` initiates no rollback and returns `-913` — IBM CICS
+Transaction Server for z/OS documentation, *DB2CONN* and *DB2ENTRY* resource definitions, the
+`DROLLBACK` attribute. No such
+definition is in this repository — the legacy module holds exactly nine files (the six sources of
+section 0 plus `README.md`, `LICENSE` and `architecture-diagram.png`) and none of them declares a
+`DB2CONN`, a `DB2ENTRY` or an RCT entry. The package binds `ENABLE(BATCH,CICS)`
+(`DB2-DDL/DB2BIND.jcl:L26`), so the same package reached through a batch connection has its unit of
+work rolled back by Db2 itself while under CICS the attachment attribute decides — which is why this
+is a region-configuration fact and not a program fact. What would settle it: the `DROLLBACK`
+attribute of the region's own `DB2CONN`/`DB2ENTRY` definitions, read from those definitions — or, in
+a region predating resource definition online, the equivalent `ROLBE` parameter of its RCT entry.
+Meanwhile nothing in the replacement depends on the answer:
+it runs one transaction per request that either commits whole or rolls back whole, so no caller is
+ever left asking whether its work survived.
 
 ## 10. Acceptance
 

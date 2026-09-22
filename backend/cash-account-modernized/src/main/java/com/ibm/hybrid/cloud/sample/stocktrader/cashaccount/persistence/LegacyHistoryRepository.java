@@ -20,34 +20,20 @@ import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.migration.reconcile.L
 
 import org.springframework.data.jpa.repository.JpaRepository;
 
-import java.util.Collection;
-import java.util.List;
-import java.util.UUID;
-
-/** Data access to the run-scoped {@code legacy_history} staging rows of an exported legacy audit file. */
-// Migration-source staging only: the loader writes these rows and the reconciler and the shadow comparator
-// read them back, never the request path, which is why the balance the legacy system held is reconstructed
-// here and not served from here. Nothing reads the KSDS itself — the single application-level access in the
-// legacy estate is the EXEC CICS WRITE at backend/cash-account-cobol/COBOL/CASH00.cbl:L126-L131 — so this
-// read path exists only because the export makes one possible.
+/** Write surface for the run-scoped {@code legacy_history} staging rows of an exported legacy audit file. */
+// Migration-source staging only, and staging here is written and never read back: migration/load's
+// LegacyLoader batches the decoded export through the inherited saveAll and records what it staged on the
+// run's MigrationRun summary, while reconcile/ReconciliationService and migration/shadow/ShadowComparator
+// re-read the export files from the run's input directory and compare those against the live tables. No
+// shipped caller reads these rows, so no read is declared here - the staging assertions that do read them
+// are test-scope, on support/LegacyHistoryTestQueries in the test tree. Nothing reads the KSDS either:
+// the single application-level access in the legacy estate is the EXEC CICS WRITE at
+// backend/cash-account-cobol/COBOL/CASH00.cbl:L126-L131, and the export is only what made the rows
+// readable at all.
+//
+// JpaRepository rather than the bare Repository marker that persistence/LedgerEntryRepository uses, because
+// a bulk load needs saveAll's batching and staging carries no append-only invariant to protect: these rows
+// are derived from a file that can be re-staged under a fresh run_id, unlike ledger_entry, whose audit
+// trail an inherited delete would let a caller destroy.
 public interface LegacyHistoryRepository extends JpaRepository<LegacyHistory, LegacyHistory.Key> {
-
-    List<LegacyHistory> findByRunId(UUID runId);
-
-    // Joins run through the uppercased owner_key and never through the raw name: CASH00.cbl:L111 and L119
-    // move the caller's name into the record and the key with no case folding, so "John" and "JOHN" under
-    // one stamp were two legitimate KSDS keys that both belong to the primary key, while the account table
-    // stores owners uppercase (L155). EBCDIC collation also differs from UTF-8, so legacy and migrated rows
-    // are matched on this normalized key rather than on ordinal position or sort order.
-    List<LegacyHistory> findByRunIdAndOwnerKey(UUID runId, String ownerKey);
-
-    long countByRunId(UUID runId);
-
-    // A count of staged rows is a lower bound on what the legacy system actually processed, never a total:
-    // EXEC CICS IGNORE CONDITION DUPREC (CASH00.cbl:L124) silently discarded a second record for the same
-    // owner within one second, so a target count above this one is an accepted exception and only a target
-    // count below it is a real variance. The request code reaches the record at L114 ahead of a write that
-    // follows the EVALUATE unconditionally, so reads and unrecognized codes are staged too; the code set
-    // that excludes them is the caller's to pass, keeping this interface free of those literals.
-    long countByRunIdAndRequestCodeIn(UUID runId, Collection<String> requestCodes);
 }

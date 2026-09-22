@@ -20,12 +20,18 @@ package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.fx;
 // and then ran the COMPUTE and the UPDATE unconditionally [backend/cash-account-cobol/COBOL/CASH00.cbl:L214-L231],
 // so a missing row's SQLCODE 100 was overwritten by the UPDATE's SQLCODE 0 and a balance computed from the
 // uninitialized RATES host variable [backend/cash-account-cobol/COBOL/DCLFRANK.cpy:L22] was committed under a
-// success code. Failing closed instead is intentional, and being unchecked is what enforces it: the caller's
-// transaction rolls back, so the balance is left unchanged and no ledger row is written.
+// success code. Failing closed instead is intentional: the balance is left unchanged and no ledger row is written
+// because retail/RetailCashAccountService resolves the rate before the write transaction opens, so no mutation has
+// begun and there is nothing to roll back. Being unchecked is what keeps this propagating out of pricing instead of
+// inviting a caller to swallow it and continue.
 //
-// Deliberately not a CashAccountException subclass, which keeps the fx package free of the HTTP error taxonomy: the
-// service layer translates this into EXCHANGE_RATE_UNAVAILABLE, so error/ApiExceptionHandler never renders it
-// directly and there is exactly one route from a rate failure to the 503 response.
+// Deliberately not a CashAccountException subclass: this type carries no status and no error code, so an
+// undeterminable rate reaches the service layer as a transport-level fact and RetailCashAccountService translates it
+// into EXCHANGE_RATE_UNAVAILABLE - error/ApiExceptionHandler never renders it directly, which leaves exactly one
+// route from a rate failure to the 503 response. That neutrality belongs to this type rather than to the package
+// around it: FrankfurterExchangeRateClient does reach for the taxonomy in one deliberate place, raising
+// CashAccountException(INVALID_CURRENCY) for a code it will not serve, which stays a 400 precisely so a rejected
+// input is never re-dressed as a transient 503 that invites a retry.
 /** Signals that no exchange rate could be determined; the caller translates it to 503 EXCHANGE_RATE_UNAVAILABLE. */
 public class ExchangeRateUnavailableException extends RuntimeException {
 

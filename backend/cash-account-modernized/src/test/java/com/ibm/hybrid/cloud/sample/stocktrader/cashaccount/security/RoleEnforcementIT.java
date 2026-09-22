@@ -88,7 +88,7 @@ public class RoleEnforcementIT extends PostgresTestSupport {
 
     // TestRestTemplate, not the MicroProfile client of support/BrokerClientFactory: that client throws a
     // WebApplicationException on a 4xx, so the rejected-request assertions this class exists for could only be
-    // written as exception handling, and the response BODY - the ApiError shape three of these five scenarios
+    // written as exception handling, and the response BODY - the ApiError shape four of these seven scenarios
     // turn on - would have to be recovered from the exception. TestRestTemplate returns 401 and 403 as ordinary
     // responses. Driving the real client interface is contract/RetailContractIT's job.
     @Autowired
@@ -193,6 +193,59 @@ public class RoleEnforcementIT extends PostgresTestSupport {
                     String.class, INSTITUTIONAL_OWNER);
 
             assertApiError(response, HttpStatus.FORBIDDEN, "FORBIDDEN");
+        }
+
+        @Test
+        void unqualifiedInstitutionalPathIsReadAsARetailOwner() throws JsonProcessingException {
+            // The exact two-segment path is what Spring MVC dispatches to the retail @GetMapping("/{owner}") as
+            // the owner INSTITUTIONAL - no institutional route is that short - so the read-only rule has to be the
+            // one that decides it. A 403 here would mean the institutional wildcard was consulted for a path that
+            // never reaches an institutional handler (AAP 0.7.5 rule order).
+            ResponseEntity<String> response = strictRest.exchange("/cash-account/institutional", HttpMethod.GET,
+                    new HttpEntity<>(jsonHeaders(JwtTestTokens.stockViewerToken())), String.class);
+
+            // Not the assertApiError helper: that one asserts the ownerless payload, and this 404 is the retail
+            // read's own ACCOUNT_NOT_FOUND, which names the owner it could not find.
+            assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+
+            JsonNode error = json(response.getBody());
+            assertThat(error.path("code").asText()).isEqualTo("ACCOUNT_NOT_FOUND");
+            assertThat(error.path("owner").asText()).isEqualTo("INSTITUTIONAL");
+        }
+
+        @Test
+        void headOnTheRetailAccountIsAuthorizedExactlyAsGet() {
+            // Spring MVC answers HEAD from the @GetMapping handler, so a HEAD here IS the retail read with its
+            // body suppressed: it has to be admitted and refused on exactly the roles GET is. Two requests in one
+            // method because the parity, not either status alone, is the property under test. A HEAD response
+            // carries no body by definition, so only the status - and the content type the read still declares -
+            // can be asserted; the ApiError payload of a rejection is covered through GET above. Void.class, not
+            // String.class: HttpURLConnection has no stream to offer for a bodiless response, and asking for one
+            // would fail these requests as an I/O error instead of reporting the status they answered with.
+            String withoutAnyGroup = JwtTestTokens.tokenFor(JwtTestTokens.USER_UNPRIVILEGED);
+
+            ResponseEntity<Void> refused = strictRest.exchange("/cash-account/{owner}", HttpMethod.HEAD,
+                    new HttpEntity<>(jsonHeaders(withoutAnyGroup)), Void.class, READ_OWNER);
+
+            assertThat(refused.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+
+            // Seeded through this context rather than the enclosing one so the request under test and its
+            // precondition are decided by the same filter chain; a conflict is success for the same reason it is
+            // in seedAccount - the container outlives either context.
+            ResponseEntity<String> seed = strictRest.exchange("/cash-account/{owner}", HttpMethod.POST,
+                    new HttpEntity<>(accountBody(READ_OWNER, SEED_BALANCE),
+                            jsonHeaders(JwtTestTokens.stockTraderToken())),
+                    String.class, READ_OWNER);
+            assertThat(seed.getStatusCode()).isIn(HttpStatus.OK, HttpStatus.CONFLICT);
+
+            ResponseEntity<Void> admitted = strictRest.exchange("/cash-account/{owner}", HttpMethod.HEAD,
+                    new HttpEntity<>(jsonHeaders(JwtTestTokens.stockViewerToken())), Void.class, READ_OWNER);
+
+            assertThat(admitted.getStatusCode()).isEqualTo(HttpStatus.OK);
+
+            MediaType contentType = admitted.getHeaders().getContentType();
+            assertThat(contentType).isNotNull();
+            assertThat(contentType.isCompatibleWith(MediaType.APPLICATION_JSON)).isTrue();
         }
     }
 

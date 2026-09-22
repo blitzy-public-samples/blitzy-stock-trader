@@ -16,6 +16,7 @@
 
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.support;
 
+import org.springframework.boot.test.autoconfigure.actuate.observability.AutoConfigureObservability;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.test.context.ActiveProfiles;
 import org.testcontainers.containers.PostgreSQLContainer;
@@ -25,6 +26,12 @@ import org.testcontainers.utility.DockerImageName;
 /** Base class giving every {@code *IT} in this module one disposable PostgreSQL instance on the test profile. */
 @Testcontainers(disabledWithoutDocker = true)
 @ActiveProfiles("test")
+// Inherited by every subclass context, like @ActiveProfiles above, so no *IT declares it: the test slice sets
+// management.defaults.metrics.export.enabled=false, which would leave the component-scanned
+// config/MetricsScrapeController without the PrometheusMeterRegistry its constructor demands. Measured: without
+// this, the contexts survive only on application.yml naming management.prometheus.metrics.export.enabled, a
+// deployment property the test tree does not own. A @SpringBootTest not extending this class needs its own.
+@AutoConfigureObservability
 public abstract class PostgresTestSupport {
 
     // Pinned to the major version the estate provisions [infra/stocktrader-setup/azure/modules/postgres/main.tf:L23],
@@ -39,8 +46,8 @@ public abstract class PostgresTestSupport {
     // because @ServiceConnection derives all three, which is why application-test.yml sets no spring.datasource.*.
     //
     // max_connections is raised from PostgreSQL's default 100 because this single instance serves every *IT's
-    // Spring context at once (Spring's test-context cache keeps each one's Hikari pool open until the JVM exits);
-    // application-test.yml caps each pool as well, and this headroom keeps a future *IT from rediscovering
+    // Spring context at once (Spring's test-context cache keeps each one's Hikari pool open until the JVM exits),
+    // each pool stays at Hikari's default size, and this headroom is what keeps a future *IT from rediscovering
     // "FATAL: sorry, too many clients already". fsync=off is the container class's own default, kept for speed.
     @ServiceConnection
     protected static final PostgreSQLContainer<?> POSTGRES =

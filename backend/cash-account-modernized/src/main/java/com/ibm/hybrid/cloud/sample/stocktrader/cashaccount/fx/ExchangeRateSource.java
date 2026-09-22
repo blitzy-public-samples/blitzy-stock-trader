@@ -23,7 +23,10 @@ import java.math.BigDecimal;
 // That table is a migration-source artifact, not a target-state dependency - target state is a live lookup at the
 // chart-injected CURRENCY_API_URL. Putting the lookup behind an interface is what lets the migration tooling replay
 // legacy arithmetic from the staged rate rows while the request path uses the live rate, with no branch in either
-// caller and no staged-table code on the deployed classpath.
+// caller. One jar serves both the web service and the tool CLI, so the staged-table implementation ships on the
+// deployed classpath either way; what contains it is that it is never instantiated as a bean in the default
+// (deployed) application context - profile activation plus the single-bean assertion below, not the contents of the
+// jar - so no request path can reach it.
 //
 // Implementations are chosen by Spring profile, never by qualifier: FrankfurterExchangeRateClient carries no
 // @Profile and is therefore the only bean in the deployed profile, while LegacyRateTableSource and

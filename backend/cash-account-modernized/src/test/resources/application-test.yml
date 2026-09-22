@@ -28,19 +28,6 @@ cashaccount:
     # sweep-versus-settle cases; tests drive the sweep directly, so it is moved aside, not disabled.
     expiry-sweep-interval: PT1H
 
-spring:
-  datasource:
-    hikari:
-      # Every *IT class is its own cached Spring context (each carries a distinct @DynamicPropertySource key), and
-      # Spring's test-context cache keeps all of them open for the whole Failsafe run against the ONE shared
-      # container in support/PostgresTestSupport. Hikari's default is 10 eagerly held connections per pool, so a
-      # dozen contexts exhaust PostgreSQL's max_connections and the last context to start fails with
-      # "FATAL: sorry, too many clients already". No test needs more than three concurrent connections
-      # (ReservationLifecycleIT's two-thread races plus the readiness db check), so the pool is capped here;
-      # the deployed pool size in application.yml is untouched.
-      maximum-pool-size: 5
-      minimum-idle: 1
-
 management:
   endpoint:
     health:
@@ -55,6 +42,9 @@ management:
 #   security.all-authenticated-hold-stocktrader - stays the deployed true, broker's ALL_AUTHENTICATED_USERS
 #     -> StockTrader parity grant (server.xml:L56-L60); RoleEnforcementIT selects both modes per context.
 #   spring.datasource.url / username / password - from the postgres:12.22-alpine @ServiceConnection container.
+#   spring.datasource.hikari.* - no spring.datasource.* key belongs in this overlay at all; the pool stays at the
+#     framework default because support/PostgresTestSupport raises the shared container's max_connections above the
+#     ceiling every cached *IT context's default pool can reach together, so a cap here would constrain nothing.
 #   spring.sql.init.* (separator ';;'), jpa.hibernate.ddl-auto, jpa.open-in-view, server.port, the actuator
 #     exposure list, the health groups and the Jackson BigDecimal features - inherited; LedgerImmutabilityIT
 #     needs the inherited sql.init to re-apply the schema across a context restart.

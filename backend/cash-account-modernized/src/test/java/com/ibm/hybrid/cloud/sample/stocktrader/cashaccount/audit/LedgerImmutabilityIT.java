@@ -13,7 +13,6 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.Banner;
 import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.builder.SpringApplicationBuilder;
-import org.springframework.boot.test.autoconfigure.actuate.observability.AutoConfigureObservability;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.dao.DataAccessException;
@@ -27,9 +26,6 @@ import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.support.JwtTestTokens
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.support.PostgresTestSupport;
 
 /** Proves the database-level append-only guard on {@code ledger_entry} survives repeated schema application. */
-// config/MetricsScrapeController takes a PrometheusMeterRegistry by constructor, and the test slice switches metrics
-// export off unless a test asks for it, which would fail this context on a missing bean rather than on its subject.
-@AutoConfigureObservability
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE)
 class LedgerImmutabilityIT extends PostgresTestSupport {
 

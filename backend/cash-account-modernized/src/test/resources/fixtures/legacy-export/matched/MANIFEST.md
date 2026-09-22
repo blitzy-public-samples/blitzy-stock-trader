@@ -28,7 +28,7 @@ reader needs in order to trust these four files.
 |---|---|---|---|
 | `cashaccounty.csv` | Six-account export, header `owner,balance,currencyc` per `DCLCASH.cpy:L8-L12` / `DB2DDL.jcl:L47-L49` | Uppercase storage: the legacy insert stores `UPPER(:CUST-NAME-TEXT)` (`CASH00.cbl:L155`), so a real account export holds **no** lowercase owner — every row here is uppercase. Fixed-point ceiling `NUMERIC(9,2)` / `PIC 9(7)V99` (`DB2DDL.jcl:L48`, `CASH00.cbl:L17`), which `ERIC 1234567.89` exercises at full seven-digit width | Six `cash_account` rows, zero variance |
 | `frankfurt1.csv` | Three rate rows, header `currnkey,currnbase,amount,rates,loaddt` per `DCLFRANK.cpy:L10` / `DB2DDL.jcl:L56-L59`: `USD 1.00`, `EUR 0.92`, `GBP 0.79`, all `loaddt 2024-01-15` | §0.4.1: `AMOUNT` and `CURRNBASE` are fetched by the credit and debit `SELECT` (`CASH00.cbl:L215`, `L249`) but referenced by **no** `COMPUTE` and no `MOVE` — the caller's COMMAREA amount is the multiplicand, so both columns are inert here and are staged only. Rate ceiling 9.99 from `NUMERIC(3,2)` (`DB2DDL.jcl:L58`) / `PIC S9(1)V9(2) COMP-3` (`DCLFRANK.cpy:L12`, `L22`) | Three `legacy_rate_table` rows under the run id, zero variance |
-| `history.csv` | Eight-record delimited conversion of the KSDS, header `name,event_date,event_time,request_code,balance,currency,retcode` | The history write is **unconditional** — it follows `END-EVALUATE` (`CASH00.cbl:L102`) with no guard (`L111-L131`), so reads are audited too, which is why two of the eight rows are `Q`. Raw caller casing: `MOVE WS-NAME TO WS-VR-NAME` applies no case folding (`CASH00.cbl:L111`). Sign-dropped status channel: `MOVE SQLCODE TO WS-VR-RETCODE` renders the code into `X(10)` (`CASH00.cbl:L117`, field at `L45`), so success is the nine digits `000000000` | Eight `legacy_history` rows under the run id, zero variance |
+| `history.csv` | Eight-record delimited conversion of the KSDS, header `name,event_date,event_time,request_code,balance,currency,retcode` | The history write is **unconditional** — it follows `END-EVALUATE` (`CASH00.cbl:L102`) with no guard (`L111-L131`), so reads are audited too, which is why two of the eight rows are `Q`. Raw caller casing: `MOVE WS-NAME TO WS-VR-NAME` applies no case folding (`CASH00.cbl:L111`), which rows 1 and 2 carry as `John` and `JOHN` **sharing one stamp** — `20240115` `091500` — so the raw name is the only field separating their two 29-byte keys (§3). Sign-dropped status channel: `MOVE SQLCODE TO WS-VR-RETCODE` renders the code into `X(10)` (`CASH00.cbl:L117`, field at `L45`), so success is the nine digits `000000000` | Eight `legacy_history` rows under the run id, zero variance |
 | `history.cp037.bin` | The same eight rows as fixed-length IBM037 records — the binary twin of `history.csv` | §0.11.2 open item: `CASH00` writes a 57-byte record (`CASH00.cbl:L38-L45`) into a cluster defined `RECSZ(100 100)` (`DEFKSDS.jcl:L11`). The CICS FILE definition that would settle which length the data set actually holds is not in the repository, so this fixture deliberately uses the **padded 100-byte** shape and the decoder takes a *declared* length (`tool.history-record-length`) rather than inferring one | Decodes identically to `history.csv` |
 
 ## 2. `history.cp037.bin` — byte facts
@@ -37,7 +37,7 @@ Eight records of **100 bytes** each (57 data bytes + 43 bytes of EBCDIC space `0
 bytes**, no trailing newline.
 
 ```
-sha256  bb400ee499d6e7d611427782afc58497cb7bb3b0c182c0497adbfc8c6c552c97
+sha256  4c2146fdbff851ceaf812169d70ba5ad44f3b923b9435b9d5e0a0931b60bc241
 ```
 
 | Offset | Length | Field | Legacy picture |
@@ -90,11 +90,21 @@ code — `LegacyExportFormat.COUNTED_REQUEST_CODES` and `isSuccessRetcode` — l
 rows countable. Per AAP §0.4.6 the target ledger records state changes only; the `Q` rows are staged
 in `legacy_history` for reference and are not a gap.
 
-**Both `John` and `JOHN` must survive the load.** `MOVE WS-NAME TO WS-VR-NAME` applies no case
-folding (`CASH00.cbl:L111`), so `John`+stamp and `JOHN`+stamp are two distinct, valid 29-byte KSDS
-keys — which is exactly what rows 1 and 2 encode. `legacy_history`'s primary key is the raw key
-`(run_id, name, event_date, event_time)` with a separately derived uppercased `owner_key` for joins,
-and `LoaderIT` asserts both rows persist. **Never deduplicate or case-fold them.**
+**Both `John` and `JOHN` must survive the load, and they share one stamp on purpose.** Rows 1 and 2
+carry the *same* `event_date` and `event_time` (`20240115` `091500`) and differ only in the casing of
+the name. That is the whole point: the KSDS key is `name + event_date + event_time`
+(`WS-VSAM-KEY`, `CASH00.cbl:L47-L50`; `KEYS(29 0)`, `DEFKSDS.jcl:L14`), so with the stamp held
+identical the raw name is the only field left keeping the two keys apart — `LoaderIT` then fails if
+staging ever folds the casing, because the export's two rows would arrive as one. Giving the pair two
+different seconds would keep the rows apart by itself and prove nothing about the name, which is why
+`091501` is deliberately absent from this file. The pair is legal legacy state, not a contrived one:
+`MOVE WS-NAME TO WS-VR-NAME` applies no case folding (`CASH00.cbl:L111`) and a `Q` request has
+already replaced `WS-NAME` with the database's upper-case `OWNER` (`CASH00.cbl:L144`), so one physical
+owner genuinely appears under two casings; and `EXEC CICS IGNORE CONDITION DUPREC`
+(`CASH00.cbl:L124`) drops a duplicate of the *same* key only, which these two are not. In the target,
+`legacy_history`'s primary key is that raw key `(run_id, name, event_date, event_time)` with a
+separately derived uppercased `owner_key` for joins. **Never deduplicate, case-fold, or re-separate
+these two rows by editing a stamp.**
 
 **`JOHN` and `RAUNAK` deliberately diverge from the estate stub.** The owner names come from the stub
 JSON at `backend/broker/src/main/liberty/config/includes/none.xml:L58`, whose totals are
@@ -110,7 +120,7 @@ the sibling shadow fixtures land on clean, hand-checkable numbers (§5 below).
 - `LoaderIT` sees **6** `cash_account` rows and **6** `MIGRATION_LOAD` `ledger_entry` rows carrying
   the `run_id`; `legacy_history` and `legacy_rate_table` populated under that `run_id`;
   `history.cp037.bin` decoding identically to `history.csv`; and **both** the `John` and `JOHN`
-  history keys surviving.
+  history keys surviving at the one stamp they share.
 - **No `migration_reconciliation` row is written for a matching owner.** `ReconciliationStatus` fixes
   that `MATCHED` is not persisted per agreeing owner, which is why this variant yields *zero* rows
   rather than six `MATCHED` ones — the assertion is a row count, not a status filter.

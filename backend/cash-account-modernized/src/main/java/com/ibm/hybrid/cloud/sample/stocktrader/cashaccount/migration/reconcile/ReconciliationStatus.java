@@ -34,7 +34,8 @@ public enum ReconciliationStatus {
      * {@code shadow.ShadowComparator} persist a row only for a condition that needs recording, which
      * is what makes the acceptance criteria decidable -- "zero {@code VARIANCE} rows" for the matched
      * fixtures and "exactly the seeded rows" for the seeded ones, asserted over the deterministic set
-     * {@code MigrationReconciliationRepository.findByRunIdOrderByReconciliationIdAsc} returns. One
+     * the test tree's {@code MigrationReconciliationTestQueries.findByRunIdOrderByReconciliationIdAsc}
+     * returns. One
      * row per agreeing owner would bury the seeded rows in that set and make the assertion depend on
      * fixture size. {@code MATCHED} is therefore the value an operator sets when reclassifying a
      * reviewed row, and the value {@code countByRunIdAndStatus(runId, MATCHED)} reports.</p>

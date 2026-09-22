@@ -18,26 +18,20 @@ package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.persistence;
 
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.migration.reconcile.MigrationReconciliation;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.migration.reconcile.ReconciliationStatus;
-import java.util.List;
 import java.util.UUID;
 import org.springframework.data.jpa.repository.JpaRepository;
 
-/** Data access for {@code migration_reconciliation}: the recorded differences of one tooling run. */
+/** Data access for {@code migration_reconciliation}: the append path for one run's findings and their count. */
 public interface MigrationReconciliationRepository extends JpaRepository<MigrationReconciliation, Long> {
 
-    // Ordered by the generated identity, which is insertion order, because row order here is evidence
-    // order: the acceptance criteria are "zero rows" for a matched fixture and "exactly the seeded rows"
-    // for a seeded one, and an assertion can only read a set as exact if the query fixes both its scope
-    // and its sequence. Scoping by run alone would leave ordering to the database, where PostgreSQL is
-    // free to return rows in any sequence without an ORDER BY. The scope is the run rather than the batch
-    // because a reconcile writes its findings under its own run_id, source-validation rows included.
-    List<MigrationReconciliation> findByRunIdOrderByReconciliationIdAsc(UUID runId);
-
-    List<MigrationReconciliation> findByRunIdAndStatus(UUID runId, ReconciliationStatus status);
-
-    // Counted in the database rather than by sizing the list above, since this number is consumed as a
-    // number: with VARIANCE it is what ReconciliationService writes into migration_run.variance_count and
-    // what makes MigrationToolRunner exit 2 instead of 0, so a run carrying only ACCEPTED_EXCEPTION rows
-    // stays clean and exits 0.
+    // The only read the service ships, and it is consumed as a NUMBER: with VARIANCE it is what
+    // ReconciliationService writes into migration_run.variance_count and what makes MigrationToolRunner exit 2
+    // instead of 0, so a run carrying only ACCEPTED_EXCEPTION rows stays clean and exits 0. Counted in the
+    // database rather than by sizing a list, so a run with many findings costs one number.
+    //
+    // The row-returning finders that read a run's findings back live in the test tree, on
+    // support/MigrationReconciliationTestQueries: the rows are evidence an operator reads through SQL or a
+    // report, and the only code that reads them is the integration tests asserting the exact row sets of AAP
+    // 0.10.3 - so a list-returning finder here would be shipped data-access surface with no shipped caller.
     long countByRunIdAndStatus(UUID runId, ReconciliationStatus status);
 }

@@ -48,7 +48,11 @@ public interface LegacyRateTableRepository extends JpaRepository<LegacyRateTable
     // reintroduce exactly the defect both paths were built to eliminate.
     Optional<LegacyRateTable> findByRunIdAndCurrnkey(UUID runId, String currnkey);
 
+    // The whole of one run's staged table, for a caller that will ask about several keys and would otherwise
+    // issue a statement per key: reconcile/ReconciliationService reads one load run's table once to judge
+    // live-rate differences against the rates that load actually staged. It stays bounded by what the legacy
+    // catalog could hold - one row per CURRNKEY CHAR(5) (DB2DDL.jcl:L54-L62), against an accepted set of 31
+    // codes (AAP 0.7.2) - which is why reading it whole is cheaper than the lookups it replaces. Run-scoped,
+    // like every read here, because two runs of one batch stage their own copies under their own run_id.
     List<LegacyRateTable> findByRunId(UUID runId);
-
-    boolean existsByRunIdAndCurrnkey(UUID runId, String currnkey);
 }

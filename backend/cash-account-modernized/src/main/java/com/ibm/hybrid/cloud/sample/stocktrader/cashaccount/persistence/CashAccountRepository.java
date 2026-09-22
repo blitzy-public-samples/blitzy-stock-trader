@@ -48,12 +48,15 @@ public interface CashAccountRepository extends JpaRepository<CashAccount, String
     // that unit-wide eclipselink.pessimistic-lock setting to this one query so plain reads stay lock-free; the
     // same file's cache.shared.default=false is why no second-level or query cache is introduced alongside it.
     //
-    // PESSIMISTIC_WRITE reaches PostgreSQL as FOR NO KEY UPDATE, the rendering Hibernate's dialect gives every
-    // write lock, so the logged SQL reads weaker than it is: that mode conflicts with itself and with any
-    // UPDATE or DELETE of the row, leaving only a foreign-key reference on the weaker KEY SHARE lock - and no
-    // table references cash_account.
+    // PESSIMISTIC_WRITE reaches PostgreSQL as "for no key update", unqualified by any alias - the clause
+    // observed in the emitted SQL, and rendered by PostgreSQLSqlAstTranslator.getForUpdate() in
+    // hibernate-core 6.5.3.Final. Reading it off PostgreSQLDialect.getWriteLockString instead answers
+    // " for update", which is the pre-6 lock-string path this query does not take; the emitted clause is the
+    // one that decides. It sounds weaker than it locks: FOR NO KEY UPDATE conflicts with itself, with FOR
+    // SHARE and FOR UPDATE, and with any UPDATE or DELETE of the row, leaving only the FOR KEY SHARE a
+    // foreign-key check takes - and no table references cash_account.
     //
-    // No jakarta.persistence.lock.timeout hint accompanies it: PostgreSQL's FOR UPDATE expresses only NOWAIT
+    // No jakarta.persistence.lock.timeout hint accompanies it: PostgreSQL's row locks express only NOWAIT
     // and SKIP LOCKED, so a positive wait would be silently ignored. Blocking is therefore left to the server,
     // whose own deadlock detection surfaces as CannotAcquireLockException - which the error package already
     // renders as 409 CONCURRENT_MODIFICATION, never a 500, so nothing is caught or translated here.
@@ -61,5 +64,11 @@ public interface CashAccountRepository extends JpaRepository<CashAccount, String
     @Query("select a from CashAccount a where a.owner = :owner")
     Optional<CashAccount> findByOwnerForUpdate(@Param("owner") String owner);
 
+    // A courtesy check, never the guard. Two concurrent creates of one owner can both see false here, so the
+    // authority on whether an account exists is the owner primary key, and the inherited saveAndFlush has to reach
+    // the database as an INSERT for that authority to speak: domain/CashAccount declares a nullable @Version so
+    // Spring Data recognizes an unwritten account and persists it, instead of merging it into whichever row a
+    // concurrent create had just committed. RetailCashAccountService.create translates the resulting
+    // pk_cash_account violation - and only that one - into 409 ACCOUNT_ALREADY_EXISTS.
     boolean existsByOwner(String owner);
 }

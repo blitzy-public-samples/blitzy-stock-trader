@@ -107,20 +107,29 @@ public final class Money implements Comparable<Money> {
      * default truncation, and every parity fixture uses two-decimal amounts so no expected value depends on
      * the choice.
      *
-     * The validation order is deliberate: the value is scaled first and the bounds are then judged on the
-     * stored form, because the stored form is what a balance column would have to hold. A negative amount is
-     * a caller error (400 INVALID_AMOUNT) while an amount past the ceiling is a rejected outcome
-     * (422 AMOUNT_OUT_OF_RANGE), and only the scaled value can distinguish -0.001, which normalizes to 0.00
-     * and is accepted, from -0.01, which does not.
+     * WHY THE SIGN IS JUDGED ON THE VALUE AS THE CALLER WROTE IT, BEFORE ANY SCALING OR CONSTRUCTION. A
+     * negative amount is a caller error and AAP 0.6.2 binds "missing, negative or non-numeric amount" to
+     * 400 INVALID_AMOUNT, so normalization must not be able to erase the very condition it is normalizing
+     * for. Truncating first can erase it: every raw value in the open interval (-0.01, 0) - a mistyped or
+     * wrongly signed -0.001 - normalizes to 0.00, which is a legal amount. A retail debit would then answer
+     * 200 and append a zero-amount DEBIT row, and a settle, whose request body carries no Bean Validation,
+     * would be read as the legal zero settlement that consumes nothing and releases the entire hold. The
+     * sign is a property of the caller's value rather than of the stored form, so it is decided on the raw
+     * BigDecimal, and as the floor is 0.00 the sign test is that same bound on the un-normalized value.
+     *
+     * The ceiling is judged on the stored form instead, and the asymmetry is deliberate: an amount past it
+     * is a rejected outcome (422 AMOUNT_OUT_OF_RANGE), not a malformed request, and what the NUMERIC(9,2)
+     * column could hold is decided by the two decimals the value would be stored with - 9999999.994 fits
+     * after truncation, 10000000.00 does not.
      */
     public static Money of(BigDecimal raw) {
         if (raw == null) {
             throw CashAccountException.of(CashAccountErrorCode.INVALID_AMOUNT);
         }
-        Money candidate = new Money(raw);
-        if (candidate.amount.compareTo(MIN_VALUE) < 0) {
+        if (raw.signum() < 0) {
             throw CashAccountException.of(CashAccountErrorCode.INVALID_AMOUNT);
         }
+        Money candidate = new Money(raw);
         if (candidate.amount.compareTo(MAX_VALUE) > 0) {
             throw CashAccountException.of(CashAccountErrorCode.AMOUNT_OUT_OF_RANGE);
         }

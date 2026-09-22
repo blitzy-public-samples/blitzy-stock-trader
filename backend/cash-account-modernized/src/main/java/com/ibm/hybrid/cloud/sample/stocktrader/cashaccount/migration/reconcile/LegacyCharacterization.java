@@ -27,8 +27,9 @@ import java.math.RoundingMode;
  * would be a second characterization, free to diverge from this one without anything failing.
  * docs/legacy-characterization.md section 1 is the declared source, and each constant names the
  * subsection it comes from so a reviewer can check the claim against the legacy source instead of
- * trusting it. Those subsection headings are load-bearing: the document says so, and renaming one
- * breaks the reference from here.
+ * trusting it. Those subsection headings are load-bearing: each reference below quotes one verbatim,
+ * and CharacterizationDocPresentTest asserts those heading lines, so renaming or merging one fails the
+ * build instead of leaving the reference here pointing at a section that no longer exists.
  *
  * Why this is deliberately independent of domain/Money, which declares a coinciding scale of 2 and
  * rounding of DOWN: Money describes the *target's* money type, whose NUMERIC(9,2) ceiling is a
@@ -56,7 +57,7 @@ public final class LegacyCharacterization {
      * (CASH00.cbl:L222, L256) and COBOL discards the excess fractional digits when storing a
      * higher-precision intermediate result into the two-decimal {@code WS-CALC}.
      *
-     * <p>See docs/legacy-characterization.md, section "1.4 Constant: rounding is RoundingMode.DOWN".
+     * <p>See docs/legacy-characterization.md, section "1.4 Constant: rounding is `RoundingMode.DOWN`".
      * With a two-decimal {@code RATES} and a two-decimal amount the product carries up to four
      * decimals, so this truncation is reached on ordinary input rather than in an edge case.</p>
      */

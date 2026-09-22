@@ -37,6 +37,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.function.Consumer;
 
 /** Reads the delimited half of a legacy export - a DB2 UNLOAD/DSNTIAUL text file - into this package's record types. */
 // Hand-written instead of delegated to a CSV library because no CSV library appears in this module's
@@ -187,244 +188,202 @@ public final class DelimitedExportReader {
 
     /** Reads every data line of a delimited export, checking first that its header names the required columns. */
     public List<DelimitedRow> readRows(Path file, List<String> requiredColumns) {
+        List<DelimitedRow> rows = new ArrayList<>();
+        streamRows(file, requiredColumns, rows::add);
+        return List.copyOf(rows);
+    }
+
+    /**
+     * Hands every data line of a delimited export to {@code sink}, one row at a time.
+     *
+     * @return the number of data rows read, the header line excluded
+     */
+    // THE BOUNDED FORM, AND THE ONE EVERY OTHER READ HERE IS BUILT ON. A bulk export is a whole DB2 UNLOAD
+    // of a production table (AAP 0.12.1), so no read may hold the file's characters, its delimited rows and
+    // its typed records at once: one record is parsed, handed to the sink and released before the next is
+    // read, which makes this reader's footprint one record rather than one file. The List-returning methods
+    // collect over this, so a caller that genuinely wants a list holds exactly one representation of it.
+    public long streamRows(Path file, List<String> requiredColumns, Consumer<DelimitedRow> sink) {
         Objects.requireNonNull(file, "A delimited export path is required");
         Objects.requireNonNull(requiredColumns,
                 "A required-column list is needed; pass an empty list to read a file without a column check");
-        ParsedFile parsed = parse(file);
-        requireColumns(parsed, requiredColumns);
-        return parsed.rows();
+        Objects.requireNonNull(sink, "A row consumer is required to stream a delimited export");
+        try (RecordCursor cursor = new RecordCursor(file)) {
+            Header header = readHeader(cursor);
+            requireColumns(header, requiredColumns);
+            return streamBody(cursor, header, sink);
+        }
     }
 
     /** Reads an exported STOCKTRD.CASHACCOUNTY, or a target-state file in that same column shape. */
     public List<LegacyCashAccountRecord> readCashAccounts(Path file) {
-        List<DelimitedRow> rows = readRows(file, LegacyExportFormat.CASH_ACCOUNT_COLUMNS);
-        List<LegacyCashAccountRecord> accounts = new ArrayList<>(rows.size());
-        for (DelimitedRow row : rows) {
-            accounts.add(new LegacyCashAccountRecord(
-                    row.requireText(LegacyExportFormat.CASH_ACCOUNT_OWNER_COLUMN),
-                    row.decimal(LegacyExportFormat.CASH_ACCOUNT_BALANCE_COLUMN),
-                    row.text(LegacyExportFormat.CASH_ACCOUNT_CURRENCY_COLUMN)));
-        }
+        List<LegacyCashAccountRecord> accounts = new ArrayList<>();
+        streamCashAccounts(file, accounts::add);
         return List.copyOf(accounts);
+    }
+
+    /**
+     * Hands every row of an exported STOCKTRD.CASHACCOUNTY to {@code sink}, one record at a time.
+     *
+     * @return the number of account rows read
+     */
+    public long streamCashAccounts(Path file, Consumer<LegacyCashAccountRecord> sink) {
+        Objects.requireNonNull(sink, "An account-record consumer is required to stream an account export");
+        return streamRows(file, LegacyExportFormat.CASH_ACCOUNT_COLUMNS, row -> sink.accept(cashAccount(row)));
     }
 
     /** Reads an exported STOCKTRD.FRANKFURT1 rate table, staged for reconciliation and nothing else. */
     public List<LegacyRateRecord> readRates(Path file) {
-        Objects.requireNonNull(file, "A rate-table export path is required");
-        ParsedFile parsed = parse(file);
-        // Either legacy spelling of the base-currency column is accepted because the two legacy
-        // artifacts disagree and this repository cannot say which describes the deployed catalog: the
-        // copybook and the program's SELECT name CURRNBASE (DCLFRANK.cpy:L10) while the shipped DDL
-        // declares cyrrnbase (DB2DDL.jcl:L56), so as written the program would not precompile against
-        // that DDL (AAP 0.11.2). The resolved spelling replaces the declared one in the required set, so
-        // the column shape still has a single home.
-        String baseColumn = resolveBaseColumn(parsed);
-        List<String> required = new ArrayList<>(LegacyExportFormat.RATE_COLUMNS.size());
-        for (String column : LegacyExportFormat.RATE_COLUMNS) {
-            required.add(LegacyExportFormat.RATE_BASE_COLUMN.equals(column) ? baseColumn : column);
-        }
-        requireColumns(parsed, required);
-
-        List<LegacyRateRecord> rates = new ArrayList<>(parsed.rows().size());
-        for (DelimitedRow row : parsed.rows()) {
-            rates.add(new LegacyRateRecord(
-                    row.requireText(LegacyExportFormat.RATE_KEY_COLUMN),
-                    row.text(baseColumn),
-                    row.decimal(LegacyExportFormat.RATE_AMOUNT_COLUMN),
-                    row.decimal(LegacyExportFormat.RATE_RATES_COLUMN),
-                    row.date(LegacyExportFormat.RATE_LOAD_DATE_COLUMN, LegacyExportFormat.LOADDT_FORMAT)));
-        }
+        List<LegacyRateRecord> rates = new ArrayList<>();
+        streamRates(file, rates::add);
         return List.copyOf(rates);
+    }
+
+    /**
+     * Hands every row of an exported STOCKTRD.FRANKFURT1 rate table to {@code sink}, one record at a time.
+     *
+     * @return the number of rate rows read
+     */
+    // Its own cursor rather than a call to streamRows, because the required-column set of this one file is
+    // not known until its header has been read: the base-currency column carries either legacy spelling.
+    public long streamRates(Path file, Consumer<LegacyRateRecord> sink) {
+        Objects.requireNonNull(file, "A rate-table export path is required");
+        Objects.requireNonNull(sink, "A rate-record consumer is required to stream a rate-table export");
+        try (RecordCursor cursor = new RecordCursor(file)) {
+            Header header = readHeader(cursor);
+            // Either legacy spelling of the base-currency column is accepted because the two legacy
+            // artifacts disagree and this repository cannot say which describes the deployed catalog: the
+            // copybook and the program's SELECT name CURRNBASE (DCLFRANK.cpy:L10) while the shipped DDL
+            // declares cyrrnbase (DB2DDL.jcl:L56), so as written the program would not precompile against
+            // that DDL (AAP 0.11.2). The resolved spelling replaces the declared one in the required set, so
+            // the column shape still has a single home.
+            String baseColumn = resolveBaseColumn(header);
+            List<String> required = new ArrayList<>(LegacyExportFormat.RATE_COLUMNS.size());
+            for (String column : LegacyExportFormat.RATE_COLUMNS) {
+                required.add(LegacyExportFormat.RATE_BASE_COLUMN.equals(column) ? baseColumn : column);
+            }
+            requireColumns(header, required);
+            return streamBody(cursor, header, row -> sink.accept(rate(row, baseColumn)));
+        }
     }
 
     /** Reads a delimited conversion of the legacy VSAM history, yielding the records its binary decoder yields. */
     public List<VsamHistoryRecord> readHistory(Path file) {
-        List<DelimitedRow> rows = readRows(file, LegacyExportFormat.HISTORY_COLUMNS);
-        List<VsamHistoryRecord> history = new ArrayList<>(rows.size());
-        for (DelimitedRow row : rows) {
-            // The name keeps the caller's own casing and is never folded: CASH00.cbl:L111 moves WS-NAME
-            // into the record with no case change, so "John"+stamp and "JOHN"+stamp are two separate
-            // valid 29-byte KSDS keys and legacy_history keys on the raw name. Folding here would
-            // collapse two real records into one. The date and time stay raw text because resolving them
-            // to an instant needs the CICS region's zone, which arrives as tool.legacy-timezone and is
-            // applied by load/LegacyLoader.
-            history.add(new VsamHistoryRecord(
-                    row.requireText(LegacyExportFormat.HISTORY_NAME_COLUMN),
-                    row.requireText(LegacyExportFormat.HISTORY_DATE_COLUMN),
-                    row.requireText(LegacyExportFormat.HISTORY_TIME_COLUMN),
-                    row.requireText(LegacyExportFormat.HISTORY_REQUEST_CODE_COLUMN),
-                    row.decimal(LegacyExportFormat.HISTORY_BALANCE_COLUMN),
-                    row.text(LegacyExportFormat.HISTORY_CURRENCY_COLUMN),
-                    row.text(LegacyExportFormat.HISTORY_RETCODE_COLUMN)));
-        }
+        List<VsamHistoryRecord> history = new ArrayList<>();
+        streamHistory(file, history::add);
         return List.copyOf(history);
+    }
+
+    /**
+     * Hands every row of a delimited history conversion to {@code sink}, one record at a time.
+     *
+     * @return the number of history rows read
+     */
+    public long streamHistory(Path file, Consumer<VsamHistoryRecord> sink) {
+        Objects.requireNonNull(sink, "A history-record consumer is required to stream a history export");
+        return streamRows(file, LegacyExportFormat.HISTORY_COLUMNS, row -> sink.accept(history(row)));
+    }
+
+    private static LegacyCashAccountRecord cashAccount(DelimitedRow row) {
+        return new LegacyCashAccountRecord(
+                row.requireText(LegacyExportFormat.CASH_ACCOUNT_OWNER_COLUMN),
+                row.decimal(LegacyExportFormat.CASH_ACCOUNT_BALANCE_COLUMN),
+                row.text(LegacyExportFormat.CASH_ACCOUNT_CURRENCY_COLUMN));
+    }
+
+    private static LegacyRateRecord rate(DelimitedRow row, String baseColumn) {
+        return new LegacyRateRecord(
+                row.requireText(LegacyExportFormat.RATE_KEY_COLUMN),
+                row.text(baseColumn),
+                row.decimal(LegacyExportFormat.RATE_AMOUNT_COLUMN),
+                row.decimal(LegacyExportFormat.RATE_RATES_COLUMN),
+                row.date(LegacyExportFormat.RATE_LOAD_DATE_COLUMN, LegacyExportFormat.LOADDT_FORMAT));
+    }
+
+    // The name keeps the caller's own casing and is never folded: CASH00.cbl:L111 moves WS-NAME into the
+    // record with no case change, so "John"+stamp and "JOHN"+stamp are two separate valid 29-byte KSDS keys
+    // and legacy_history keys on the raw name. Folding here would collapse two real records into one. The
+    // date and time stay raw text because resolving them to an instant needs the CICS region's zone, which
+    // arrives as tool.legacy-timezone and is applied by load/LegacyLoader.
+    private static VsamHistoryRecord history(DelimitedRow row) {
+        return new VsamHistoryRecord(
+                row.requireText(LegacyExportFormat.HISTORY_NAME_COLUMN),
+                row.requireText(LegacyExportFormat.HISTORY_DATE_COLUMN),
+                row.requireText(LegacyExportFormat.HISTORY_TIME_COLUMN),
+                row.requireText(LegacyExportFormat.HISTORY_REQUEST_CODE_COLUMN),
+                row.decimal(LegacyExportFormat.HISTORY_BALANCE_COLUMN),
+                row.text(LegacyExportFormat.HISTORY_CURRENCY_COLUMN),
+                row.text(LegacyExportFormat.HISTORY_RETCODE_COLUMN));
+    }
+
+    // The header is the first record of the file and is consumed from the same cursor the body is read
+    // from, so a file is opened and walked exactly once however it is read.
+    private static Header readHeader(RecordCursor cursor) {
+        RawRecord headerRecord = cursor.next();
+        if (headerRecord == null) {
+            throw new IllegalArgumentException("The delimited export " + cursor.file()
+                    + " holds no lines; its first line must be a header naming the columns");
+        }
+        List<String> names = new ArrayList<>(headerRecord.fields().size());
+        for (RawField cell : headerRecord.fields()) {
+            names.add(cell.text());
+        }
+        Map<String, Integer> index;
+        try {
+            index = LegacyExportFormat.indexHeader(names);
+        } catch (IllegalArgumentException unusable) {
+            throw new IllegalArgumentException(describeHeader(cursor.file(), headerRecord.lineNumber())
+                    + " cannot be indexed: " + unusable.getMessage(), unusable);
+        }
+        return new Header(cursor.file(), headerRecord.lineNumber(), List.copyOf(names), index);
     }
 
     // Fields are keyed by the header's column names and never by ordinal position: EBCDIC and ASCII
     // collate differently (AAP 0.12.2), so neither column order nor row order survives the conversion as
-    // meaning and a re-ordered export must still load into the columns it names. The file's physical row
-    // order is preserved in the returned list because it is the file's order, never because a consumer
-    // may rely on it - reconciliation joins on the normalized owner key.
-    private static ParsedFile parse(Path file) {
-        List<RawRecord> records = readRawRecords(file);
-        if (records.isEmpty()) {
-            throw new IllegalArgumentException("The delimited export " + file
-                    + " holds no lines; its first line must be a header naming the columns");
-        }
-        RawRecord headerRecord = records.get(0);
-        List<String> header = new ArrayList<>(headerRecord.fields().size());
-        for (RawField cell : headerRecord.fields()) {
-            header.add(cell.text());
-        }
-        Map<String, Integer> headerIndex;
-        try {
-            headerIndex = LegacyExportFormat.indexHeader(header);
-        } catch (IllegalArgumentException unusable) {
-            throw new IllegalArgumentException(
-                    describeHeader(file, headerRecord.lineNumber()) + " cannot be indexed: " + unusable.getMessage(),
-                    unusable);
-        }
-
-        List<DelimitedRow> rows = new ArrayList<>(records.size() - 1);
-        for (int position = 1; position < records.size(); position++) {
-            RawRecord record = records.get(position);
-            if (record.fields().size() != header.size()) {
-                throw new IllegalArgumentException("The row on " + describeLine(file, record.lineNumber())
-                        + " carries " + record.fields().size() + " fields but the header names " + header.size()
-                        + " columns " + headerIndex.keySet() + "; a name-keyed read needs one field per column");
+    // meaning and a re-ordered export must still load into the columns it names. Rows reach the sink in the
+    // file's physical order because that is the order they are read in, never because a consumer may rely on
+    // it - reconciliation joins on the normalized owner key.
+    private static long streamBody(RecordCursor cursor, Header header, Consumer<DelimitedRow> sink) {
+        long rows = 0;
+        for (RawRecord record = cursor.next(); record != null; record = cursor.next()) {
+            if (record.fields().size() != header.names().size()) {
+                throw new IllegalArgumentException("The row on " + describeLine(header.file(), record.lineNumber())
+                        + " carries " + record.fields().size() + " fields but the header names "
+                        + header.names().size() + " columns " + header.index().keySet()
+                        + "; a name-keyed read needs one field per column");
             }
             Map<String, String> values = new LinkedHashMap<>();
-            for (Map.Entry<String, Integer> column : headerIndex.entrySet()) {
+            for (Map.Entry<String, Integer> column : header.index().entrySet()) {
                 values.put(column.getKey(), value(record.fields().get(column.getValue())));
             }
-            rows.add(new DelimitedRow(file, record.lineNumber(), values));
+            sink.accept(new DelimitedRow(header.file(), record.lineNumber(), values));
+            rows++;
         }
-        return new ParsedFile(file, headerRecord.lineNumber(), header, headerIndex, List.copyOf(rows));
+        return rows;
     }
 
     private static String value(RawField field) {
         return !field.quoted() && LegacyExportFormat.isNull(field.text()) ? null : field.text();
     }
 
-    private static void requireColumns(ParsedFile parsed, List<String> requiredColumns) {
+    private static void requireColumns(Header header, List<String> requiredColumns) {
         for (String column : requiredColumns) {
             try {
-                LegacyExportFormat.columnIndex(parsed.headerIndex(), column);
+                LegacyExportFormat.columnIndex(header.index(), column);
             } catch (IllegalArgumentException missing) {
                 throw new IllegalArgumentException(
-                        describeHeader(parsed.file(), parsed.headerLine()) + ": " + missing.getMessage(), missing);
+                        describeHeader(header.file(), header.lineNumber()) + ": " + missing.getMessage(), missing);
             }
         }
     }
 
-    private static String resolveBaseColumn(ParsedFile parsed) {
+    private static String resolveBaseColumn(Header header) {
         try {
-            return LegacyExportFormat.resolveRateBaseColumn(parsed.header());
+            return LegacyExportFormat.resolveRateBaseColumn(header.names());
         } catch (IllegalArgumentException unresolved) {
             throw new IllegalArgumentException(
-                    describeHeader(parsed.file(), parsed.headerLine()) + ": " + unresolved.getMessage(), unresolved);
+                    describeHeader(header.file(), header.lineNumber()) + ": " + unresolved.getMessage(), unresolved);
         }
-    }
-
-    private static List<RawRecord> readRawRecords(Path file) {
-        List<RawRecord> records = new ArrayList<>();
-        try (PushbackReader reader = new PushbackReader(
-                new BufferedReader(new InputStreamReader(Files.newInputStream(file), StandardCharsets.UTF_8)), 1)) {
-            List<RawField> fields = new ArrayList<>();
-            StringBuilder field = new StringBuilder();
-            boolean quotedField = false;
-            boolean inQuotes = false;
-            boolean recordOpen = false;
-            boolean atStartOfFile = true;
-            int line = 1;
-            int recordLine = 1;
-            int read;
-            while ((read = reader.read()) >= 0) {
-                char character = (char) read;
-                if (atStartOfFile) {
-                    atStartOfFile = false;
-                    if (character == BOM) {
-                        continue;
-                    }
-                }
-                if (inQuotes) {
-                    if (character == QUOTE) {
-                        int next = reader.read();
-                        if (next == QUOTE) {
-                            field.append(QUOTE);
-                        } else {
-                            inQuotes = false;
-                            if (next >= 0) {
-                                reader.unread(next);
-                            }
-                        }
-                        continue;
-                    }
-                    if (character == LF) {
-                        line++;
-                    }
-                    field.append(character);
-                    continue;
-                }
-                if (character == QUOTE) {
-                    if (quotedField || field.length() > 0) {
-                        throw new IllegalArgumentException("A quote character appears inside an unquoted field on "
-                                + describeLine(file, line) + "; RFC 4180 requires a field carrying a quote, a comma"
-                                + " or a newline to be quoted, with its embedded quotes repeated");
-                    }
-                    quotedField = true;
-                    inQuotes = true;
-                    recordOpen = true;
-                    continue;
-                }
-                if (character == DELIMITER) {
-                    fields.add(new RawField(field.toString(), quotedField));
-                    field.setLength(0);
-                    quotedField = false;
-                    recordOpen = true;
-                    continue;
-                }
-                if (character == CR || character == LF) {
-                    if (character == CR) {
-                        int next = reader.read();
-                        if (next >= 0 && next != LF) {
-                            reader.unread(next);
-                        }
-                    }
-                    // A physical line holding no characters at all is not a record: a file transfer
-                    // routinely leaves a trailing newline, and treating that as a row would fail the
-                    // field-count check on a file that is in fact well formed. A line beginning with '#'
-                    // is data, though - the export contract reserves the first line for the header and
-                    // defines no comment syntax (AAP 0.12.1).
-                    if (recordOpen) {
-                        fields.add(new RawField(field.toString(), quotedField));
-                        records.add(new RawRecord(recordLine, List.copyOf(fields)));
-                        fields = new ArrayList<>();
-                        field.setLength(0);
-                        quotedField = false;
-                        recordOpen = false;
-                    }
-                    line++;
-                    recordLine = line;
-                    continue;
-                }
-                field.append(character);
-                recordOpen = true;
-            }
-            if (inQuotes) {
-                throw new IllegalArgumentException("A quoted field opened on " + describeLine(file, recordLine)
-                        + " is never closed; RFC 4180 requires a closing quote character");
-            }
-            if (recordOpen) {
-                fields.add(new RawField(field.toString(), quotedField));
-                records.add(new RawRecord(recordLine, List.copyOf(fields)));
-            }
-        } catch (NoSuchFileException absent) {
-            throw new IllegalArgumentException("The delimited export " + file + " does not exist", absent);
-        } catch (IOException unreadable) {
-            throw new UncheckedIOException("The delimited export " + file + " could not be read", unreadable);
-        }
-        return records;
     }
 
     // One normalization authority: a lookup key is produced by the same call that produced the key the
@@ -451,11 +410,171 @@ public final class DelimitedExportReader {
     private record RawRecord(int lineNumber, List<RawField> fields) {
     }
 
-    private record ParsedFile(
-            Path file,
-            int headerLine,
-            List<String> header,
-            Map<String, Integer> headerIndex,
-            List<DelimitedRow> rows) {
+    private record Header(Path file, int lineNumber, List<String> names, Map<String, Integer> index) {
+    }
+
+    /** One reader over one delimited export, yielding its raw records one at a time. */
+    // WHY A CURSOR RATHER THAN A LIST OF RECORDS. A record is parsed, returned and forgotten, so the whole
+    // file is never resident and a caller that needs it all pays for exactly one representation of it: the
+    // runbook's bulk step supplies complete DB2 unloads (AAP 0.12.1), where a list of every raw record plus
+    // every delimited row plus every typed record is three copies of a file of unbounded size.
+    //
+    // The scan stays character by character over one PushbackReader, and the reader is opened once per
+    // cursor, because a quoted field may legally carry the delimiter, an escaped quote and a newline - none
+    // of which survives a line-at-a-time read or a String.split - and because the physical line counter has
+    // to advance across those embedded newlines so that an error names the line an operator can open.
+    private static final class RecordCursor implements AutoCloseable {
+
+        private final Path file;
+
+        private final PushbackReader reader;
+
+        // Cross-record state: the physical line the scan has reached and the line the next record starts on.
+        private int line = 1;
+
+        private int recordLine = 1;
+
+        private boolean atStartOfFile = true;
+
+        private RecordCursor(Path file) {
+            this.file = file;
+            try {
+                this.reader = new PushbackReader(new BufferedReader(
+                        new InputStreamReader(Files.newInputStream(file), StandardCharsets.UTF_8)), 1);
+            } catch (NoSuchFileException absent) {
+                throw new IllegalArgumentException("The delimited export " + file + " does not exist", absent);
+            } catch (IOException unreadable) {
+                throw new UncheckedIOException("The delimited export " + file + " could not be read", unreadable);
+            }
+        }
+
+        private Path file() {
+            return file;
+        }
+
+        /** The next record of the file, or {@code null} once every record has been returned. */
+        private RawRecord next() {
+            try {
+                return readRecord();
+            } catch (IOException unreadable) {
+                throw new UncheckedIOException("The delimited export " + file + " could not be read", unreadable);
+            }
+        }
+
+        private RawRecord readRecord() throws IOException {
+            List<RawField> fields = new ArrayList<>();
+            StringBuilder field = new StringBuilder();
+            boolean quotedField = false;
+            boolean inQuotes = false;
+            boolean recordOpen = false;
+            // The field is closed and the scan is between a closing quote and the delimiter or record end
+            // that must follow it. Without this state the character after a closing quote falls through to
+            // the append below, and "ABC"xyz loads as ABCxyz - a value no producer wrote, accepted silently.
+            boolean fieldClosedByQuote = false;
+            int read;
+            while ((read = reader.read()) >= 0) {
+                char character = (char) read;
+                if (atStartOfFile) {
+                    atStartOfFile = false;
+                    if (character == BOM) {
+                        continue;
+                    }
+                }
+                if (inQuotes) {
+                    if (character == QUOTE) {
+                        int next = reader.read();
+                        if (next == QUOTE) {
+                            field.append(QUOTE);
+                        } else {
+                            inQuotes = false;
+                            fieldClosedByQuote = true;
+                            if (next >= 0) {
+                                reader.unread(next);
+                            }
+                        }
+                        continue;
+                    }
+                    if (character == LF) {
+                        line++;
+                    }
+                    field.append(character);
+                    continue;
+                }
+                // Only a delimiter, a record end or end of file may follow a closing quote (RFC 4180). A
+                // doubled quote never reaches here - the branch above consumes it as an escaped quote and
+                // stays inside the field - so anything else is a producer this reader cannot parse rather
+                // than a value it may guess at, and guessing is what would corrupt an imported balance.
+                if (fieldClosedByQuote && character != DELIMITER && character != CR && character != LF) {
+                    throw new IllegalArgumentException("The character '" + character + "' follows the closing"
+                            + " quote of a field on " + describeLine(file, line) + "; RFC 4180 admits only a"
+                            + " delimiter, a record end or end of file after a closing quote, so a field"
+                            + " carrying a quote must repeat it inside the quoted value");
+                }
+                if (character == QUOTE) {
+                    if (quotedField || field.length() > 0) {
+                        throw new IllegalArgumentException("A quote character appears inside an unquoted field on "
+                                + describeLine(file, line) + "; RFC 4180 requires a field carrying a quote, a comma"
+                                + " or a newline to be quoted, with its embedded quotes repeated");
+                    }
+                    quotedField = true;
+                    inQuotes = true;
+                    recordOpen = true;
+                    continue;
+                }
+                if (character == DELIMITER) {
+                    fields.add(new RawField(field.toString(), quotedField));
+                    field.setLength(0);
+                    quotedField = false;
+                    fieldClosedByQuote = false;
+                    recordOpen = true;
+                    continue;
+                }
+                if (character == CR || character == LF) {
+                    if (character == CR) {
+                        int next = reader.read();
+                        if (next >= 0 && next != LF) {
+                            reader.unread(next);
+                        }
+                    }
+                    // A physical line holding no characters at all is not a record: a file transfer
+                    // routinely leaves a trailing newline, and treating that as a row would fail the
+                    // field-count check on a file that is in fact well formed. A line beginning with '#'
+                    // is data, though - the export contract reserves the first line for the header and
+                    // defines no comment syntax (AAP 0.12.1).
+                    if (recordOpen) {
+                        fields.add(new RawField(field.toString(), quotedField));
+                        RawRecord record = new RawRecord(recordLine, List.copyOf(fields));
+                        line++;
+                        recordLine = line;
+                        return record;
+                    }
+                    line++;
+                    recordLine = line;
+                    continue;
+                }
+                field.append(character);
+                recordOpen = true;
+            }
+            if (inQuotes) {
+                throw new IllegalArgumentException("A quoted field opened on " + describeLine(file, recordLine)
+                        + " is never closed; RFC 4180 requires a closing quote character");
+            }
+            // The last record of a file that ends without a newline. recordOpen is false on the next call,
+            // because the reader stays at end of file, which is what ends the iteration.
+            if (recordOpen) {
+                fields.add(new RawField(field.toString(), quotedField));
+                return new RawRecord(recordLine, List.copyOf(fields));
+            }
+            return null;
+        }
+
+        @Override
+        public void close() {
+            try {
+                reader.close();
+            } catch (IOException unclosable) {
+                throw new UncheckedIOException("The delimited export " + file + " could not be closed", unclosable);
+            }
+        }
     }
 }

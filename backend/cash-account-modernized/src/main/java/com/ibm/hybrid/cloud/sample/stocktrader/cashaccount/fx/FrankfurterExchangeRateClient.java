@@ -83,9 +83,12 @@ public class FrankfurterExchangeRateClient implements ExchangeRateSource {
             "ISK", "JPY", "KRW", "MXN", "MYR", "NOK", "NZD", "PHP", "PLN", "RON", "SEK", "SGD", "THB", "TRY", "USD",
             "ZAR");
 
-    // Two attempts, no backoff: the caller is a synchronous retail credit or debit holding a cash_account row lock,
-    // so waiting between attempts spends someone else's request budget. Bounded by the client's own connect and read
-    // timeouts, the worst case stays inside the caller's patience.
+    // Two attempts, no backoff. Both attempts happen before the account row is locked - the caller resolves the rate
+    // on an unlocked read and only then opens the write transaction that takes the row under PESSIMISTIC_WRITE
+    // (retail/RetailCashAccountService.applyRateChange) - so a retry spends the caller's own synchronous request
+    // budget and nobody else's. Two rather than more because the pair of connect and read timeouts already bounds
+    // the worst case (cashaccount.fx.timeout, PT2S, applied to both phases in config/FxClientConfig), and no backoff
+    // because sleeping before an immediate transport retry adds latency without improving its odds.
     private static final int MAX_ATTEMPTS = 2;
 
     private static final String QUERY_PARAM_FROM = "from";
@@ -105,8 +108,19 @@ public class FrankfurterExchangeRateClient implements ExchangeRateSource {
      *                    injects it as {@code CURRENCY_API_URL} from configMap key
      *                    {@code cashAccount.exchangeRateUrl}
      *                    (infra/stocktrader-operator/helm-charts/stocktrader/templates/cash-account.yaml:L156-L160,
-     *                    value at .../values.yaml:L147). Declared with no fallback so a release that fails to supply
-     *                    it fails at start-up rather than silently reaching a host this code chose
+     *                    value at .../values.yaml:L147). The {@code @Value} carries no inline fallback so this class
+     *                    never chooses a host of its own; the resolution cascade is owned by configuration instead -
+     *                    {@code cashaccount.fx.url} reads {@code CURRENCY_API_URL} and falls back to the value
+     *                    application.yml ships, which is the chart's own default (application.yml:L154, mirrored by
+     *                    {@code config.CashAccountProperties.Fx}). Omitting the environment variable therefore lands
+     *                    on that default rather than failing. An unusable endpoint still stops start-up, but ahead
+     *                    of this constructor rather than inside it: a value that resolves blank -
+     *                    {@code CURRENCY_API_URL} set to the empty string, which wins over the placeholder default
+     *                    because the variable exists - is rejected by the {@code @NotBlank} on
+     *                    {@code config.CashAccountProperties.Fx.url}, whose validated bean the injected
+     *                    {@code fxRestClient} depends on, and a property that no property source supplies at all
+     *                    fails placeholder resolution. {@code requireEndpoint} is defence in depth for the direct
+     *                    constructions below, which bypass both
      * @param environment source of the accepted-currency list, read through {@link Binder} because the property is
      *                    written as a YAML sequence, which cannot be bound by {@code @Value}
      */
@@ -210,12 +224,17 @@ public class FrankfurterExchangeRateClient implements ExchangeRateSource {
         return rate;
     }
 
-    // Logged here, once, at the single point every failure funnels through, so an outage cannot be reported twice or
-    // not at all. The cause's type but not its stack trace: a rate outage repeats on every request, and the type
-    // carries the diagnosis - refused, timed out - without multiplying the log volume of someone else's outage. The
-    // reason stays a short phrase and never names the endpoint or carries a response body.
+    // DEBUG and not WARN, deliberately: the single WARN for a web-path failure is emitted by
+    // error/ApiExceptionHandler when it renders the 503, which is the only place that also holds the owner and the
+    // request context. This line is the single point every failure funnels through, so it records the pair, the short
+    // reason and the cause's TYPE - refused, timed out - for opt-in diagnosis, rather than doubling the WARN volume
+    // of a provider outage that repeats on every request. Never the cause's stack trace, and the reason stays a short
+    // phrase that never names the endpoint or carries a response body. A tool-profile run has no exception handler
+    // and loses nothing either, because there the same failure is evidence rather than a log record: the service's
+    // EXCHANGE_RATE_UNAVAILABLE reaches migration/shadow/ShadowComparator, which writes it as a REJECTED_BY_TARGET
+    // row of migration_reconciliation and counts it in the run summary.
     private ExchangeRateUnavailableException unavailable(String from, String to, String reason, Throwable cause) {
-        LOGGER.warn("Exchange rate lookup for {}->{} failed: {}{}", from, to, reason, causeSuffix(cause));
+        LOGGER.debug("Exchange rate lookup for {}->{} failed: {}{}", from, to, reason, causeSuffix(cause));
         return ExchangeRateUnavailableException.forPair(from, to, reason, cause);
     }
 

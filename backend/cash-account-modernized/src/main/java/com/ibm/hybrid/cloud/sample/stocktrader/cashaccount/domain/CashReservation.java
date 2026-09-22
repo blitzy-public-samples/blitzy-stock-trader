@@ -26,6 +26,8 @@ import jakarta.persistence.Table;
 import jakarta.persistence.Version;
 import java.math.BigDecimal;
 import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
+import java.time.temporal.ChronoUnit;
 import java.util.Locale;
 import java.util.UUID;
 
@@ -254,8 +256,12 @@ public class CashReservation {
         reservation.amount = amount.amount();
         reservation.settledAmount = null;
         reservation.state = ReservationState.HELD;
-        reservation.expiresAt = expiresAt;
-        OffsetDateTime now = OffsetDateTime.now();
+        // All three stamps pass through storedInstant for the reason recorded on it, and the two below are one
+        // instant rather than two clock readings: a replay rebuilds the original response's updated_at from
+        // created_at (institutional/ReservationResponse.originalHold), which is exact only while a new hold's
+        // two timestamps hold the same value.
+        reservation.expiresAt = storedInstant(expiresAt);
+        OffsetDateTime now = storedInstant(OffsetDateTime.now());
         reservation.createdAt = now;
         reservation.updatedAt = now;
         return reservation;
@@ -387,13 +393,42 @@ public class CashReservation {
      */
     @PrePersist
     void applyTimestampDefaults() {
-        OffsetDateTime now = OffsetDateTime.now();
+        OffsetDateTime now = storedInstant(OffsetDateTime.now());
         if (createdAt == null) {
             createdAt = now;
         }
         if (updatedAt == null) {
             updatedAt = now;
         }
+    }
+
+    /*
+     * WHY EVERY TIMESTAMP THIS CLASS STORES IS PUT THROUGH HERE FIRST. These three columns are TIMESTAMPTZ,
+     * which resolves instants to microseconds, and application.yml pins hibernate.jdbc.time_zone to UTC - so
+     * whatever offset and however many nanoseconds a value arrives with, what comes back out of PostgreSQL is
+     * that instant in UTC at microsecond resolution. An unnormalized value therefore makes the in-memory
+     * entity disagree with its own row: a hold created with a caller-supplied expiresAt of
+     * 2099-06-01T14:00:00.123456789+02:00 answers with those nanoseconds and that offset, while every later
+     * read of the same reservation - including the replay of that very hold, which AAP 0.6.2 and 0.7.3
+     * require to return the original response body - answers 2099-06-01T12:00:00.123456Z. Normalizing at
+     * construction removes the disagreement at its source, which a post-flush refresh would only paper over
+     * for the paths that happened to refresh.
+     *
+     * Truncation rather than rounding, and applied before the value is ever sent: pgJDBC rounds sub-microsecond
+     * digits on the way out, so truncating here makes what is sent already exact and leaves that rounding with
+     * nothing to do. The at-most-999ns an expiry moves earlier is immaterial against a TTL measured in hours,
+     * and isExpiredAt judges the same instant either way. domain/LedgerEntry stamps recorded_at with the same
+     * UTC-at-microseconds rule, so the two tables that publish timestamps agree on what an instant is.
+     *
+     * The scope of this rule is what the service stores and publishes, never what it compares: the
+     * idempotency hash is taken from the payload as the caller sent it (AAP 0.7.3), so a retry of a hold that
+     * named an explicit expiry resends that same payload rather than the normalized instant this returns.
+     */
+    private static OffsetDateTime storedInstant(OffsetDateTime value) {
+        if (value == null) {
+            return null;
+        }
+        return value.withOffsetSameInstant(ZoneOffset.UTC).truncatedTo(ChronoUnit.MICROS);
     }
 
     /*
@@ -404,7 +439,7 @@ public class CashReservation {
      * and the column's DEFAULT now() remains the safety net for a row some other tool inserts.
      */
     private void touch() {
-        updatedAt = OffsetDateTime.now();
+        updatedAt = storedInstant(OffsetDateTime.now());
     }
 
     /*
@@ -413,17 +448,27 @@ public class CashReservation {
      * this point - which makes anything unusable here a defect in this module rather than a caller error, and
      * IllegalArgumentException the honest report. Checking it at all is what stops a silent
      * DataIntegrityViolationException at flush, rendered as an opaque 500, from being the first sign.
+     *
+     * WHY THE VALUE IS STORED EXACTLY AS IT ARRIVES, BLANKS AND ALL. request_hash is the SHA-256 of a
+     * canonical payload whose first component is this order reference taken verbatim (AAP 0.7.3, which
+     * compares it exactly), and a repeated Idempotency-Key is judged a replay by that hash alone. Altering
+     * the value on the way into the column - trimming it, folding its case - would make the reference this
+     * reservation returns hash to something other than the digest stored beside it, so a caller replaying
+     * its hold with the reference it was handed back would receive 422 IDEMPOTENCY_KEY_REUSED for the same
+     * request. Storing it unaltered makes the returned value replayable and keeps "  ORD  " and "ORD"
+     * distinct requests, which is the exact comparison the contract specifies. The checks below are
+     * therefore validation only, never normalization: the value must exist and must fit VARCHAR(64), which
+     * HoldRequest's @NotBlank @Size(max = 64) has already established for anything a caller sent.
      */
     private static String requireOrderReference(String raw) {
         if (raw == null || raw.isBlank()) {
             throw new IllegalArgumentException("orderReference is required");
         }
-        String candidate = raw.strip();
-        if (candidate.length() > ORDER_REFERENCE_MAX_LENGTH) {
+        if (raw.length() > ORDER_REFERENCE_MAX_LENGTH) {
             throw new IllegalArgumentException(
                     "orderReference must be at most " + ORDER_REFERENCE_MAX_LENGTH + " characters");
         }
-        return candidate;
+        return raw;
     }
 
     /*

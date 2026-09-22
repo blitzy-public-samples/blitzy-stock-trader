@@ -1,16 +1,37 @@
+/*
+       Copyright 2025 Kyndryl, All Rights Reserved
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+ */
+
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.migration.reconcile;
 
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
 import jakarta.persistence.IdClass;
+import jakarta.persistence.PostLoad;
+import jakarta.persistence.PostPersist;
 import jakarta.persistence.Table;
+import jakarta.persistence.Transient;
 
 import java.io.Serializable;
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.util.Objects;
 import java.util.UUID;
+
+import org.springframework.data.domain.Persistable;
 
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.migration.export.LegacyRateRecord;
 
@@ -29,8 +50,17 @@ import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.migration.export.Lega
 // attribute names - findByRunId(UUID), findByRunIdAndCurrnkey(UUID, String) - which an embedded id would
 // nest out of reach; and Key is a class rather than a record because an @IdClass needs a no-arg
 // constructor, which a record cannot have.
+//
+// WHY Persistable IS IMPLEMENTED. The key is assigned by the caller, so Spring Data's default newness test -
+// "is the identifier null?" - reports every staged row as already existing and its save path merges: one
+// existence SELECT per row before that row's INSERT, on a staging pass whose input is a whole DB2 unload.
+// Declaring newness explicitly makes save() persist instead, which issues no SELECT and keeps the write on
+// the repository path the module's data access is required to run through. An instance that came from the
+// database reports itself as not new (@PostLoad), so this can never turn a genuine update into an insert;
+// a duplicate (run_id, currnkey) then fails on the primary key, which is the right outcome - staging is
+// run-scoped, so a repeat can only mean a malformed export or a defect, never a row to absorb silently.
 @IdClass(LegacyRateTable.Key.class)
-public class LegacyRateTable {
+public class LegacyRateTable implements Persistable<LegacyRateTable.Key> {
 
     @Id
     @Column(name = "run_id", nullable = false, updatable = false)
@@ -74,6 +104,12 @@ public class LegacyRateTable {
     // (DB2DDL.jcl:L59), because staging must be able to hold whatever an export actually produced.
     @Column(name = "loaddt")
     private LocalDate loaddt;
+
+    // Not a column: it records whether this instance has reached the database yet, which is the one thing an
+    // assigned key cannot tell Spring Data. It starts false on a staged(...) instance and is set by the
+    // lifecycle callbacks below, so newness is a fact about the instance rather than a guess about the key.
+    @Transient
+    private boolean persisted;
 
     protected LegacyRateTable() {
         // Required by JPA; every application-side instance comes from staged(...).
@@ -158,6 +194,25 @@ public class LegacyRateTable {
     }
 
     /** Composite identity of a staged rate row: the run that staged it and the legacy five-character key. */
+    @Override
+    public Key getId() {
+        return new Key(runId, currnkey);
+    }
+
+    @Override
+    public boolean isNew() {
+        return !persisted;
+    }
+
+    // Both callbacks, deliberately: @PostLoad covers a row the reconciler or the comparator read back, and
+    // @PostPersist covers the row this staging pass has just inserted, so neither can be offered to save()
+    // a second time as an insert.
+    @PostLoad
+    @PostPersist
+    void markPersisted() {
+        this.persisted = true;
+    }
+
     public static class Key implements Serializable {
 
         private static final long serialVersionUID = 1L;
