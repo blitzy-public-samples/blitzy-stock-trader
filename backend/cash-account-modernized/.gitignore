@@ -1,0 +1,2 @@
+# Maven build output; the umbrella repository carries no .gitignore of its own.
+target/

@@ -1,0 +1,211 @@
+#       Copyright 2025 Kyndryl, All Rights Reserved
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+
+# Default-profile configuration of the modernized cash ledger and the declared source of truth for every key the module binds.
+
+server:
+  port: 8080
+
+  # No server.servlet.context-path, and that omission is load-bearing rather than an oversight. The chart probes
+  # /actuator/startup, /actuator/health/readiness and /actuator/health/liveness at the ROOT of port 8080
+  # (infra/stocktrader-operator/helm-charts/stocktrader/templates/cash-account.yaml:L204-L222) while publishing the
+  # retail base URL to broker as http://<release>-cash-account-service:8080/cash-account
+  # (infra/stocktrader-operator/helm-charts/stocktrader/values.yaml:L146). Both can only hold at once when the
+  # /cash-account prefix lives on the controllers, so a context path here would break every probe at once.
+  #
+  # No server.ssl.* either: the template declares container port 8443
+  # (.../templates/cash-account.yaml:L199-L201) but the chart provisions no key material for this service, so there
+  # is no HTTPS listener to configure and Kubernetes never requires the declared port to be bound.
+
+  # In-flight retail writes each hold a cash_account row lock; draining them beats severing them at SIGTERM.
+  shutdown: graceful
+
+spring:
+  application:
+    name: cash-account-modernized
+
+  datasource:
+    # Credentials only. The JDBC URL is assembled by config/DataSourceGuardConfig out of the cashaccount.jdbc.*
+    # values below, because JDBC_SSL=true has to append ssl=true&sslmode=verify-ca plus EITHER sslrootcert=<temp
+    # PEM> or sslfactory=org.postgresql.ssl.DefaultJavaSSLFactory — a branch no static placeholder can express.
+    # Keys database.id / database.password of the chart secret (.../templates/cash-account.yaml:L110-L119).
+    username: ${JDBC_ID:}
+    password: ${JDBC_PASSWORD:}
+    # Deliberately no spring.datasource.hikari.schema: the Operational Runbook's Step 1 rehearsal supplies
+    # spring.datasource.hikari.schema=cash_account_rehearsal at run time so production tables stay untouched, which
+    # a value pinned here would defeat.
+
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:schema/cash-account-schema.sql
+      # Flyway and Liquibase occur in no pom.xml of this checkout and backend/portfolio hand-applies its
+      # createTables.ddl, so the schema is applied by the mandated framework's own SQL initialization rather than by
+      # introducing a migration tool the estate does not use. Two semicolons because Spring's script runner splits
+      # on a single one, which would sever the ledger_entry_reject() function body and the trigger DO block of
+      # schema/cash-account-schema.sql; every statement in that file therefore ends with ';;'. The separator here
+      # and the terminators there are one contract — changing either alone breaks start-up.
+      separator: ';;'
+
+  jpa:
+    hibernate:
+      # Drift between the entities and schema/cash-account-schema.sql must stop start-up rather than be silently
+      # auto-corrected against a ledger. spring.jpa.defer-datasource-initialization is left at its false default on
+      # purpose: deferring would run this validation before the schema script and fail every cold start.
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      # Ledger and reservation timestamps are TIMESTAMPTZ, so pinning the JDBC zone keeps a written instant equal to
+      # the instant read back whatever local zone the pod happens to carry.
+      hibernate.jdbc.time_zone: UTC
+
+  jackson:
+    # No float or double may touch a money path, and a balance must reach the wire as plain decimal text: broker's
+    # client consumes it and RetailContractIT captures the raw response to assert the literal "balance":1234.56,
+    # which exponent notation would fail. config/JacksonConfig applies the same two settings programmatically; they
+    # are declared here so this file remains the whole, self-describing configuration.
+    deserialization:
+      use-big-decimal-for-floats: true
+    generator:
+      write-bigdecimal-as-plain: true
+    # The error payload carries owner and reservationId only where the condition has them, so absent fields are
+    # omitted rather than rendered null.
+    default-property-inclusion: non_null
+
+management:
+  endpoints:
+    web:
+      exposure:
+        # startup is not optional: the chart's startupProbe hits /actuator/startup with a 60s initial delay, a 30s
+        # period and 3 allowed failures (.../templates/cash-account.yaml:L204-L210) and global.healthCheck is true
+        # by default (.../values.yaml:L54), so a pod missing this endpoint fails its very first deployment. The
+        # endpoint exists only because CashAccountApplication installs a BufferingApplicationStartup(2048).
+        # prometheus backs the scrape annotation below. Nothing broader is exposed — no '*'.
+        include: health,startup,prometheus
+  endpoint:
+    health:
+      # The readiness and liveness groups are only auto-enabled inside a detected Kubernetes environment; the probes
+      # must also answer under `java -jar` and under @SpringBootTest, so enablement is explicit.
+      probes:
+        enabled: true
+      # config/SecurityConfig leaves the probe paths permitAll, so the response must not describe internals.
+      show-details: never
+      group:
+        readiness:
+          # db belongs in readiness: a pod that cannot reach its ledger must leave the Service endpoints. The
+          # exchange-rate API deliberately gets no health indicator, so an FX outage never flaps pods.
+          include: readinessState,db
+        liveness:
+          # livenessState alone. A failing livenessProbe restarts the container
+          # (.../templates/cash-account.yaml:L217-L222), so including db here would turn one database outage into a
+          # rolling crash loop across every pod.
+          include: livenessState
+  prometheus:
+    metrics:
+      export:
+        # Spring Boot 3.x property name (management.metrics.export.prometheus.* is the pre-3.0 form and is inert
+        # here). The chart's scrape annotation carries prometheus.io/port "8080" with no path
+        # (.../templates/cash-account.yaml:L51-L54), which is why config/MetricsScrapeController serves GET /metrics
+        # from this registry in addition to the canonical /actuator/prometheus.
+        enabled: true
+  # No management.server.port: the chart probes and scrapes port 8080 only, so the management endpoints must stay on
+  # the main connector.
+
+cashaccount:
+  jdbc:
+    # Guarded rather than defaulted for convenience. database.kind is chart-global and is still db2 in the
+    # repository (.../values.yaml:L74-L81), so config/DataSourceGuardConfig fails start-up with an explicit message
+    # for any value other than postgres instead of half-starting against a store this schema was never written for.
+    # Moving the release to PostgreSQL is a signed-off runbook Step 0 prerequisite, not a change this file makes.
+    kind: ${JDBC_KIND:postgres}
+    # The chart injects host, port and database from non-optional configMap keys
+    # (.../templates/cash-account.yaml:L89-L103); the defaults below serve only a hand-started local run.
+    host: ${JDBC_HOST:localhost}
+    port: ${JDBC_PORT:5432}
+    database: ${JDBC_DB:trader}
+    # Mirrors portfolio's <variable name="JDBC_SSL" defaultValue="false"/>
+    # (backend/portfolio/src/main/liberty/config/includes/postgres.xml:L2).
+    ssl: ${JDBC_SSL:false}
+    # PEM text of the database server's CA, injected as cert_defaultTrustStore from configMap key ssl.certs and only
+    # when global.specifyCerts is on (.../templates/cash-account.yaml:L179-L186), which defaults to false
+    # (.../values.yaml:L72) — hence the empty default. When present, DataSourceGuardConfig writes it to a private
+    # temp file and appends sslrootcert=<file> so pgJDBC's LibPQFactory verifies the server chain against it; when
+    # absent it appends sslfactory=org.postgresql.ssl.DefaultJavaSSLFactory so trust rides on the JVM cacerts. Both
+    # are the properties portfolio already uses, with sslMode=verify-ca
+    # (backend/portfolio/src/main/liberty/config/includes/postgres.xml:L9-L11).
+    trust-store-pem: ${cert_defaultTrustStore:}
+
+  fx:
+    # Never a hardcoded endpoint: the chart supplies it as CURRENCY_API_URL from cashAccount.exchangeRateUrl
+    # (.../templates/cash-account.yaml:L156-L160), whose value is the default written here (.../values.yaml:L147).
+    # This live lookup replaces the legacy STOCKTRD.FRANKFURT1 rate-table join, which is a migration-source artifact
+    # and not a target-state dependency (backend/cash-account-cobol/COBOL/CASH00.cbl:L213-L219).
+    url: ${CURRENCY_API_URL:https://api.frankfurter.app/latest}
+    # Broker's default account currency, so a same-currency account short-circuits to a rate of exactly 1 with no
+    # network call (backend/broker/src/main/java/com/ibm/hybrid/cloud/sample/stocktrader/broker/BrokerService.java:L357-L365).
+    base-currency: USD
+    # Connect and read budget for FrankfurterExchangeRateClient. A slow rate provider must surface as
+    # 503 EXCHANGE_RATE_UNAVAILABLE with the balance untouched, never as a request that outlives its caller.
+    timeout: PT2S
+    # The accepted-currency set, adopted verbatim from the allowed_currencies CHECK the estate already enforces on
+    # its never-built cashaccount table
+    # (infra/stocktrader-setup/azure/modules/postgres_init/init_schema.sql.tmpl:L7), which is also the set
+    # Frankfurter serves. Anything outside it is rejected with 400 INVALID_CURRENCY rather than stored and then
+    # found unconvertible.
+    accepted-currencies: [
+      AUD, BGN, BRL, CAD, CHF, CNY, CZK, DKK, EUR, GBP, HKD, HUF, IDR, ILS, INR, ISK,
+      JPY, KRW, MXN, MYR, NOK, NZD, PHP, PLN, RON, SEK, SGD, THB, TRY, USD, ZAR
+    ]
+
+  security:
+    # From global.auth (.../templates/cash-account.yaml:L73-L77); the default matches both the chart
+    # (.../values.yaml:L20) and broker's own variable default
+    # (backend/broker/src/main/liberty/config/server.xml:L40), so this service selects the same mode the estate
+    # already runs in rather than introducing a mechanism of its own.
+    auth-type: ${AUTH_TYPE:basic}
+    # Grants StockTrader to every authenticated principal, mirroring the siblings' ALL_AUTHENTICATED_USERS ->
+    # StockTrader binding (backend/broker/src/main/liberty/config/server.xml:L56-L60). Deployed default is true so
+    # any authenticated caller can write exactly as it can through broker today and the GET/write role split stays
+    # latent; false is the supported, documented strict mode in which only the token's groups claim decides.
+    all-authenticated-hold-stocktrader: true
+    jwt:
+      # Same issuer and audience the estate's tokens already carry (.../templates/cash-account.yaml:L161-L170,
+      # .../values.yaml:L207-L209, backend/broker/src/main/liberty/config/server.xml:L41-L42), so broker's
+      # propagated Authorization header validates here without a new identity mechanism.
+      issuer: ${JWT_ISSUER:http://stock-trader.ibm.com}
+      audience: ${JWT_AUDIENCE:stock-trader}
+      # Public certificate of the shared jwtSigner alias only — the private key that siblings ship inside trust.p12
+      # is copied nowhere in this module (backend/broker/src/main/liberty/config/includes/basic.xml:L39-L40). It
+      # stays a property rather than a path baked into code so tests can repoint it at an ephemeral per-JVM key.
+      public-key-location: classpath:security/jwtsigner.pem
+      # Consumed only when auth-type=oidc, mirroring the mpJwt jwksUri attribute broker resolves from the same
+      # variable (backend/broker/src/main/liberty/config/includes/oidc.xml:L16-L21). The chart marks the key optional
+      # (.../templates/cash-account.yaml:L171-L176), so the default is empty.
+      jwks-url: ${OIDC_JWKS_URL:}
+
+  reservation:
+    # A hold that is never settled or released must not strand funds indefinitely; the sweep interval bounds how
+    # long an overdue hold keeps money out of the available balance.
+    default-ttl: PT24H
+    expiry-sweep-interval: PT60S
+
+# Injected by the chart and deliberately unconsumed: TRACE_SPEC (.../templates/cash-account.yaml:L78-L83),
+# REDIS_URL (L120-L124), KAFKA_USER / KAFKA_API_KEY / KAFKA_ADDRESS / KAFKA_CASH_ACCOUNT_TOPIC / KAFKA_BROKER_TOPIC
+# (L125-L155), CQRS_ENABLED (L177-L178) and WLP_LOGGING_CONSOLE_* / WLP_LOGGING_MESSAGE_* (L187-L198). They address
+# Open Liberty and a Java cash-account service that was never built. Binding any of them would declare a Redis,
+# Kafka or CQRS path this module excludes and carries no dependency for.
+
+logging:
+  level:
+    com.ibm.hybrid.cloud.sample.stocktrader.cashaccount: INFO

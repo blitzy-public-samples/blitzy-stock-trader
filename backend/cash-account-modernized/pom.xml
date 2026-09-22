@@ -258,6 +258,13 @@
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
                 <version>3.3.13</version>
+                <!-- The entry point is named explicitly rather than discovered: the AAP fixes it as
+                     CashAccountApplication at the package root, and an explicit Start-Class keeps the
+                     repackaged jar's manifest stable regardless of what else on the classpath carries a
+                     main method (the "tool" profile reuses this same entry point as the migration CLI). -->
+                <configuration>
+                    <mainClass>com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.CashAccountApplication</mainClass>
+                </configuration>
                 <executions>
                     <execution>
                         <id>repackage</id>
