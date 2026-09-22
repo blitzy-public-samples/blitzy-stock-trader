@@ -1,0 +1,662 @@
+/*
+       Copyright 2019-2021 IBM Corp, All Rights Reserved
+       Copyright 2023-2024 Kyndryl, All Rights Reserved
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+ */
+
+package com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.lifecycle;
+
+import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.audit.AuditTimeline;
+import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.control.ControlLimits;
+import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.control.PreTradeControlService;
+import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.dao.OrderStore;
+import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.dao.ReferenceDataStore;
+import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.dao.SeedDataLoader;
+import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.dao.SettlementExceptionStore;
+import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.AuditEvent;
+import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.ClientAccount;
+import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.ControlResult;
+import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.ExceptionStatus;
+import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.Execution;
+import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.Order;
+import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.OrderRequest;
+import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.OrderStatus;
+import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.Position;
+import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.PostTradeStatus;
+import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.RecordSource;
+import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.SettlementException;
+import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.SettlementInstruction;
+import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.StateMachine;
+
+//Arbitrary-precision arithmetic
+import java.math.BigDecimal;
+
+//Time (java.time)
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneOffset;
+
+//Collections
+import java.util.Arrays;
+import java.util.List;
+import java.util.Queue;
+
+//Concurrency
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
+//JUnit 5 Jupiter
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.function.Executable;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
+
+
+/** Unit tests for the order state machine OrderLifecycleService runs from submit to simulated execution */
+public class OrderLifecycleServiceTest {
+
+    private static final String ACTOR = "institutional-trader";
+    private static final String ENTITY_ORDER = "ORDER";
+
+    /* One fixed UTC instant for the whole graph, which is what lets submittedAt, executedAt and
+       every audit timestamp be compared for equality instead of against a tolerance window. No
+       mocking library is needed for it: ClockProducer is the module's only source of time and no
+       service reads Instant.now() inline. */
+    private static final Instant FIXED_INSTANT = Instant.parse("2026-01-15T10:00:00Z");
+    private static final Clock FIXED_CLOCK = Clock.fixed(FIXED_INSTANT, ZoneOffset.UTC);
+
+    /* The configured defaults of META-INF/microprofile-config.properties, restated here rather
+       than read from it: a test that loaded the same file it checks would still pass if an
+       operator lowered a default, and the arithmetic below is only meaningful against a known
+       ceiling. */
+    private static final BigDecimal MAX_ORDER_NOTIONAL = new BigDecimal("1000000.00");
+    private static final BigDecimal MAX_POSITION_NOTIONAL = new BigDecimal("5000000.00");
+    private static final BigDecimal FAT_FINGER_THRESHOLD = new BigDecimal("2500000.00");
+    private static final List<String> RESTRICTED_SYMBOLS = Arrays.asList("RSTRA", "RSTRB");
+    private static final int EXCEPTION_SLA_HOURS = 24;
+
+    private static final String CONTROL_MAX_ORDER_NOTIONAL = "MAX_ORDER_NOTIONAL";
+    private static final String CONTROL_MAX_POSITION_NOTIONAL = "MAX_POSITION_NOTIONAL";
+    private static final String CONTROL_RESTRICTED_SYMBOL = "RESTRICTED_SYMBOL";
+    private static final String CONTROL_FAT_FINGER = "FAT_FINGER";
+    private static final int CONTROL_COUNT = 4;
+
+    private static final int SEEDED_POSITIONS = 5;
+    private static final int DUPLICATE_SUBMITTERS = 8;
+    private static final int LATCH_TIMEOUT_SECONDS = 30;
+
+    private OrderStore orderStore;
+    private ReferenceDataStore referenceData;
+    private AuditTimeline auditTimeline;
+    private OrderLifecycleService service;
+
+
+    @BeforeEach
+    void buildCollaboratorGraph() {
+        orderStore = new OrderStore();
+        referenceData = new ReferenceDataStore();
+        auditTimeline = new AuditTimeline();
+
+        //The exception store is only a collaborator of PostTradeService here: no test in this
+        //class asserts on it, because the exception workflow is not the order state machine.
+        service = lifecycleService(orderStore, new SettlementExceptionStore(), referenceData,
+                auditTimeline);
+        seedReferenceData(referenceData);
+    }
+
+    @Test
+    void testSubmitOrderUnderAllLimitsIsExecuted() {
+        Order order = service.submit(
+                request("API-001", "INST-001", "SYNA", "BUY", 100L, "100.00"), ACTOR);
+
+        assertEquals("ORD-000001", order.getOrderId(), "the first order of a fresh store");
+        assertEquals(OrderStatus.EXECUTED, order.getStatus(), "terminal order status");
+        /* INST-001's firm and counterparty instructions agree, so affirmation finds no break and
+           submit answers with what PostTradeService.onExecuted returned - already settlement-ready
+           rather than merely pending. */
+        assertEquals(PostTradeStatus.SETTLEMENT_READY, order.getPostTradeStatus(),
+                "terminal post-trade status for a client whose settlement instructions agree");
+        assertEquals("SYNA", order.getSymbol(), "stored symbol");
+        assertEquals(100L, order.getQuantity(), "stored quantity");
+        assertAmount("10000.00", order.getNotional(), "notional is quantity x limitPrice");
+        assertEquals(ACTOR, order.getSubmittedBy(), "submittedBy is the actor the caller passed");
+        assertEquals(FIXED_INSTANT, order.getSubmittedAt(), "submittedAt comes from the injected clock");
+        assertEquals(RecordSource.API, order.getSource(),
+                "the two-argument overload is the REST entry point and always records API");
+        assertTrue(order.isSimulated(), "every order labels itself simulated");
+        assertFalse(order.getDisclaimer().isBlank(), "every order carries a non-blank disclaimer");
+        assertNull(order.getRejectionReason(), "an accepted order carries no rejection reason");
+
+        Execution execution = order.getExecution();
+        assertNotNull(execution, "an executed order carries its simulated fill");
+        assertEquals("EXE-000001", execution.getExecutionId(), "the first execution of a fresh store");
+        assertAmount("100.00", execution.getFillPrice(), "the fill is priced at the order's own limitPrice");
+        assertEquals(100L, execution.getFilledQuantity(), "the whole order quantity is filled");
+        assertEquals(FIXED_INSTANT, execution.getExecutedAt(), "executedAt comes from the injected clock");
+        assertEquals("SIMULATED", execution.getVenue(), "no exchange exists, so the venue is SIMULATED");
+        assertTrue(execution.isSimulated(), "every execution labels itself simulated");
+
+        List<ControlResult> results = order.getControlResults();
+        assertEquals(CONTROL_COUNT, results.size(), "all four controls record a result on every order");
+        for (ControlResult result : results) {
+            assertTrue(result.isPassed(), result.getControl() + " must pass: " + result.getReason());
+        }
+
+        Position filled = referenceData.findPosition("INST-001", "SYNA");
+        assertEquals(10100L, filled.getQuantity(), "the fill is applied to the client's position");
+        assertAmount("1010000.00", filled.getPositionNotional(),
+                "the whole resulting quantity is marked at the fill price");
+        assertEquals(OrderStatus.EXECUTED, service.get(order.getOrderId()).getStatus(),
+                "the stored order is the one submit returned");
+    }
+
+    @Test
+    void testRejectOrderExceedingMaxNotional() {
+        /* 1,500,000 breaches MAX_ORDER_NOTIONAL alone: the fat-finger ceiling of 2,500,000 and the
+           resulting position of 25000 x 100.00 = 2,500,000 both sit exactly at or under their
+           limits, so one result fails, the reason has nothing to be joined with, and the
+           evaluation still reports the other three. */
+        Order order = service.submit(
+                request("API-002", "INST-001", "SYNA", "BUY", 15000L, "100.00"), ACTOR);
+
+        assertEquals(OrderStatus.REJECTED, order.getStatus(), "terminal order status");
+        assertNull(order.getExecution(), "a rejected order is never filled");
+        assertNull(order.getPostTradeStatus(),
+                "post-trade state begins at execution, so a rejected order has none");
+        assertEquals(CONTROL_COUNT, order.getControlResults().size(),
+                "a rejection records every control result, not just the failing one");
+        assertFalse(control(order, CONTROL_MAX_ORDER_NOTIONAL).isPassed(),
+                "1500000.00 must breach MAX_ORDER_NOTIONAL");
+        assertTrue(control(order, CONTROL_MAX_POSITION_NOTIONAL).isPassed(),
+                "2500000.00 is inside MAX_POSITION_NOTIONAL");
+        assertTrue(control(order, CONTROL_FAT_FINGER).isPassed(),
+                "1500000.00 is inside FAT_FINGER_NOTIONAL_THRESHOLD");
+        assertTrue(control(order, CONTROL_RESTRICTED_SYMBOL).isPassed(), "SYNA is not restricted");
+
+        String reason = order.getRejectionReason();
+        assertTrue(reason.contains("exceeds MAX_ORDER_NOTIONAL 1000000.00"), "rejectionReason: " + reason);
+        assertFalse(reason.contains("; "), "a single failing control leaves nothing to join: " + reason);
+
+        assertEquals(10000L, referenceData.findPosition("INST-001", "SYNA").getQuantity(),
+                "a rejected order leaves the position exactly as it was");
+    }
+
+    @Test
+    void testRestrictedSymbolIsRejectedAndLeavesNoPosition() {
+        Order order = service.submit(
+                request("API-003", "INST-001", "RSTRA", "BUY", 10L, "10.00"), ACTOR);
+
+        assertEquals(OrderStatus.REJECTED, order.getStatus(), "a restricted symbol is refused");
+        assertFalse(control(order, CONTROL_RESTRICTED_SYMBOL).isPassed(),
+                "RSTRA is on the configured restricted list");
+        assertTrue(order.getRejectionReason().contains("is on the restricted list RESTRICTED_SYMBOLS"),
+                "rejectionReason: " + order.getRejectionReason());
+
+        /* A refused order answers evaluateAndFill with the position it was handed, so an absent
+           position stays absent: only a fill may bring one into existence. */
+        assertEquals(SEEDED_POSITIONS, referenceData.positionCount(),
+                "a rejected order creates no position");
+        assertNull(referenceData.findPosition("INST-001", "RSTRA"),
+                "no position exists in a symbol that was never filled");
+
+        List<AuditEvent> events = service.events(order.getOrderId());
+        assertEquals(2, events.size(),
+                "a rejected order records its submission and its rejection and nothing more");
+        assertEdge(events.get(0), StateMachine.ORDER, LifecycleTransitions.NONE,
+                OrderStatus.SUBMITTED.name());
+        assertEdge(events.get(1), StateMachine.ORDER, OrderStatus.SUBMITTED.name(),
+                OrderStatus.REJECTED.name());
+        assertEquals(order.getRejectionReason(), events.get(1).getReason(),
+                "the rejection event carries the failing control reasons verbatim");
+        for (AuditEvent event : events) {
+            assertEquals(StateMachine.ORDER, event.getStateMachine(),
+                    "a rejected order never enters the post-trade state machine");
+        }
+    }
+
+    @Test
+    void testEveryTransitionAppendsTimestampedAuditEvent() {
+        Order order = service.submit(
+                request("API-004", "INST-001", "SYNA", "BUY", 100L, "100.00"), ACTOR);
+        String orderId = order.getOrderId();
+        String executionId = order.getExecution().getExecutionId();
+
+        List<AuditEvent> events = service.events(orderId);
+        assertEquals(5, events.size(),
+                "three order edges and two post-trade edges are recorded for a clean execution");
+
+        assertEdge(events.get(0), StateMachine.ORDER, LifecycleTransitions.NONE,
+                OrderStatus.SUBMITTED.name());
+        assertTrue(events.get(0).getReason().contains("API-004"),
+                "the submission event names the clientOrderId: " + events.get(0).getReason());
+
+        assertEdge(events.get(1), StateMachine.ORDER, OrderStatus.SUBMITTED.name(),
+                OrderStatus.ACCEPTED.name());
+        assertEquals("all pre-trade controls passed", events.get(1).getReason(), "acceptance reason");
+
+        assertEdge(events.get(2), StateMachine.ORDER, OrderStatus.ACCEPTED.name(),
+                OrderStatus.EXECUTED.name());
+        assertTrue(events.get(2).getReason().contains(executionId),
+                "the execution event names the executionId: " + events.get(2).getReason());
+
+        assertEdge(events.get(3), StateMachine.POST_TRADE, LifecycleTransitions.NONE,
+                PostTradeStatus.PENDING_AFFIRMATION.name());
+        assertTrue(events.get(3).getReason().contains(executionId),
+                "the affirmation event names the executionId: " + events.get(3).getReason());
+
+        assertEdge(events.get(4), StateMachine.POST_TRADE,
+                PostTradeStatus.PENDING_AFFIRMATION.name(),
+                PostTradeStatus.SETTLEMENT_READY.name());
+        assertEquals("SSI affirmed (simulated)", events.get(4).getReason(), "affirmation reason");
+
+        long previousSequence = 0L;
+        for (AuditEvent event : events) {
+            //Both of an order's state machines are filed under one entity type: POST_TRADE names a
+            //machine, never an entity anyone can ask for.
+            assertEquals(ENTITY_ORDER, event.getEntityType(), "entityType");
+            assertEquals(orderId, event.getEntityId(), "entityId");
+            assertEquals(FIXED_INSTANT, event.getTimestamp(), "every event is timestamped");
+            assertTrue(event.getSequence() > previousSequence,
+                    "sequence must increase strictly, saw " + event.getSequence());
+            previousSequence = event.getSequence();
+            assertEquals(ACTOR, event.getActor(), "actor");
+            assertTrue(event.isSimulated(), "every event labels itself simulated");
+            assertFalse(event.getDisclaimer().isBlank(), "every event carries a non-blank disclaimer");
+        }
+
+        assertEquals(events.size(), auditTimeline.all().size(),
+                "one submission writes exactly these events and no others");
+    }
+
+    @Test
+    void testDuplicateSubmissionOfOneClientOrderIdIsRefused() {
+        service.submit(request("API-005", "INST-001", "SYNA", "BUY", 100L, "100.00"), ACTOR);
+
+        StateConflictException conflict = assertThrows(StateConflictException.class,
+                () -> service.submit(request("API-005", "INST-001", "SYNA", "BUY", 100L, "100.00"),
+                        ACTOR),
+                "a repeated clientOrderId must be refused as a conflict");
+
+        assertTrue(conflict.getMessage().contains("API-005"),
+                "the conflict must name the clientOrderId: " + conflict.getMessage());
+        /* Idempotency is settled by a putIfAbsent on the client order id before any order object
+           exists, so the duplicate leaves behind neither a second order nor a second fill. */
+        assertEquals(1, orderStore.count(), "only the first submission is stored");
+        assertEquals(10100L, referenceData.findPosition("INST-001", "SYNA").getQuantity(),
+                "only the first submission reached the position");
+    }
+
+    @Test
+    void testUnknownOrderIdIsReportedAsMissing() {
+        assertThrows(EntityNotFoundException.class, () -> service.get("ORD-999999"),
+                "an unknown order id is a missing resource");
+        //events reads through the store first, so an unknown id answers as a missing order rather
+        //than as an order that happens to have an empty history.
+        assertThrows(EntityNotFoundException.class, () -> service.events("ORD-999999"),
+                "an unknown order id has no readable timeline either");
+    }
+
+    @Test
+    void testInvalidQuantityOrLimitPriceIsRefused() {
+        //Zero and negative are invalid, which is a different rule from the control thresholds: a
+        //value sitting exactly on a configured ceiling passes, while a quantity of zero never does.
+        assertValidationMessage("quantity",
+                () -> service.submit(request("API-006", "INST-001", "SYNA", "BUY", 0L, "100.00"),
+                        ACTOR));
+        assertValidationMessage("quantity",
+                () -> service.submit(request("API-006", "INST-001", "SYNA", "BUY", -5L, "100.00"),
+                        ACTOR));
+        assertValidationMessage("limitPrice",
+                () -> service.submit(request("API-006", "INST-001", "SYNA", "BUY", 100L, "0.00"),
+                        ACTOR));
+        assertValidationMessage("limitPrice",
+                () -> service.submit(request("API-006", "INST-001", "SYNA", "BUY", 100L, "-1.00"),
+                        ACTOR));
+
+        /* Validation precedes the client order id reservation and every transition, so a refused
+           request leaves no order and no audit event behind - which is also why all four attempts
+           above could reuse one clientOrderId without any of them conflicting. */
+        assertEquals(0, orderStore.count(), "a refused request stores no order");
+        assertTrue(auditTimeline.all().isEmpty(), "a refused request records no audit event");
+    }
+
+    @Test
+    void testMissingRequiredFieldIsRefused() {
+        assertValidationMessage("clientOrderId", () -> service.submit(null, ACTOR));
+        assertValidationMessage("clientOrderId",
+                () -> service.submit(request(null, "INST-001", "SYNA", "BUY", 100L, "100.00"),
+                        ACTOR));
+        assertValidationMessage("clientOrderId",
+                () -> service.submit(request("   ", "INST-001", "SYNA", "BUY", 100L, "100.00"),
+                        ACTOR));
+        assertValidationMessage("clientId",
+                () -> service.submit(request("API-007", null, "SYNA", "BUY", 100L, "100.00"), ACTOR));
+        assertValidationMessage("symbol",
+                () -> service.submit(request("API-007", "INST-001", "  ", "BUY", 100L, "100.00"),
+                        ACTOR));
+        //The side is checked by value rather than by presence alone, so an absent side and an
+        //unrecognised one are refused by the same rule and carry the same message.
+        assertValidationMessage("side",
+                () -> service.submit(request("API-007", "INST-001", "SYNA", null, 100L, "100.00"),
+                        ACTOR));
+        assertValidationMessage("side",
+                () -> service.submit(request("API-007", "INST-001", "SYNA", "HOLD", 100L, "100.00"),
+                        ACTOR));
+        //A boxed quantity is what keeps an absent value distinguishable from zero, so the two owe
+        //the caller different messages.
+        assertValidationMessage("quantity",
+                () -> service.submit(request("API-007", "INST-001", "SYNA", "BUY", null, "100.00"),
+                        ACTOR));
+        assertValidationMessage("limitPrice",
+                () -> service.submit(request("API-007", "INST-001", "SYNA", "BUY", 100L, null),
+                        ACTOR));
+
+        assertEquals(0, orderStore.count(), "no incomplete request reaches the store");
+    }
+
+    @Test
+    void testUnknownClientIdIsRefusedAsABadField() {
+        /* An unknown client is a bad field in a submitted body, not a resource the caller addressed
+           by path, so it answers 400 through ValidationException; EntityNotFoundException stays
+           reserved for an identifier asked for by path and would answer 404. */
+        ValidationException failure = assertThrows(ValidationException.class,
+                () -> service.submit(request("API-008", "INST-999", "SYNA", "BUY", 100L, "100.00"),
+                        ACTOR),
+                "an order for an unknown client must be refused");
+
+        assertTrue(failure.getMessage().contains("INST-999"),
+                "the message must name the unknown clientId: " + failure.getMessage());
+        assertEquals(0, orderStore.count(), "an order for an unknown client is never stored");
+    }
+
+    @Test
+    void testCumulativePositionNotionalRejectsTheSecondOrder() {
+        Order first = service.submit(
+                request("API-009A", "INST-002", "SYND", "BUY", 3000L, "100.00"), ACTOR);
+        Order second = service.submit(
+                request("API-009B", "INST-002", "SYND", "BUY", 3000L, "100.00"), ACTOR);
+
+        assertEquals(OrderStatus.EXECUTED, first.getStatus(),
+                "48000 x 100.00 = 4,800,000 is inside the 5,000,000 resulting-position ceiling");
+        Position afterFirst = referenceData.findPosition("INST-002", "SYND");
+        assertEquals(48000L, afterFirst.getQuantity(), "the first fill grows the seeded 45000");
+        assertAmount("4800000.00", afterFirst.getPositionNotional(),
+                "the stored notional equals the value the control evaluated");
+
+        /* This is the case that proves evaluation sees the prior fill rather than a stale copy:
+           PreTradeControlService.evaluate runs only inside the operator handed to
+           ReferenceDataStore.evaluateAndFill, under one ConcurrentHashMap.compute for this client
+           and symbol, so the second order is valued against 48000 and not against the seeded
+           45000. */
+        assertEquals(OrderStatus.REJECTED, second.getStatus(),
+                "51000 x 100.00 = 5,100,000 crosses that ceiling");
+        assertFalse(control(second, CONTROL_MAX_POSITION_NOTIONAL).isPassed(),
+                "the resulting position control is the one that fails");
+        assertTrue(second.getRejectionReason().contains("exceeds MAX_POSITION_NOTIONAL 5000000.00"),
+                "rejectionReason: " + second.getRejectionReason());
+        assertEquals(48000L, referenceData.findPosition("INST-002", "SYND").getQuantity(),
+                "the rejected order leaves the position as the first one left it");
+
+        List<Order> listed = service.list();
+        assertEquals(2, listed.size(), "both orders are listed, executed and rejected alike");
+        assertEquals(first.getOrderId(), listed.get(0).getOrderId(), "list is ordered by order id");
+        assertEquals(second.getOrderId(), listed.get(1).getOrderId(), "list is ordered by order id");
+    }
+
+    @Test
+    void testSymbolAndSideAreCanonicalizedBeforeEveryLookup() {
+        Order order = service.submit(
+                request("API-010", "INST-001", "  syna  ", "buy", 100L, "100.00"), ACTOR);
+
+        assertEquals("SYNA", order.getSymbol(), "the stored symbol is trimmed and upper-cased");
+        assertEquals("BUY", order.getSide(), "the stored side is canonicalized the same way");
+        assertEquals(OrderStatus.EXECUTED, order.getStatus(),
+                "a canonical symbol resolves its own unrestricted, in-limit position");
+        assertEquals(SEEDED_POSITIONS, referenceData.positionCount(),
+                "canonicalization reaches the existing position instead of creating a second one");
+        assertEquals(10100L, referenceData.findPosition("INST-001", "SYNA").getQuantity(),
+                "the fill lands on the pre-existing INST-001 SYNA holding");
+    }
+
+    @Test
+    void testSellReducesThePositionAndAFirstOrderCreatesOne() {
+        Order sold = service.submit(
+                request("API-012", "INST-001", "SYNA", "SELL", 400L, "100.00"), ACTOR);
+
+        assertEquals(OrderStatus.EXECUTED, sold.getStatus(), "a sell inside every limit executes");
+        assertEquals("SELL", sold.getSide(), "stored side");
+        Position reduced = referenceData.findPosition("INST-001", "SYNA");
+        assertEquals(9600L, reduced.getQuantity(), "a sell subtracts its quantity from the holding");
+        assertAmount("960000.00", reduced.getPositionNotional(),
+                "the reduced quantity is marked at the fill price");
+
+        //A client's first order in a symbol is valued at a quantity of zero rather than refused for
+        //having no position, and it is the fill that brings the position into existence.
+        Order opened = service.submit(
+                request("API-013", "INST-002", "SYNE", "BUY", 200L, "25.00"), ACTOR);
+
+        assertEquals(OrderStatus.EXECUTED, opened.getStatus(), "a first order in a symbol executes");
+        Position created = referenceData.findPosition("INST-002", "SYNE");
+        assertNotNull(created, "the fill creates the position that did not exist before it");
+        assertEquals(200L, created.getQuantity(), "the new position holds the filled quantity");
+        assertEquals(SEEDED_POSITIONS + 1, referenceData.positionCount(),
+                "exactly one position is added");
+    }
+
+    @Test
+    void testSeedDataLoaderProducesTheFixedSyntheticSet() {
+        //A graph of its own, so the seeded identifiers are the first the stores hand out and the
+        //loader's own reference data is the only reference data in play.
+        OrderStore seededOrders = new OrderStore();
+        SettlementExceptionStore seededExceptions = new SettlementExceptionStore();
+        ReferenceDataStore seededReference = new ReferenceDataStore();
+        AuditTimeline seededTimeline = new AuditTimeline();
+        OrderLifecycleService seededLifecycle =
+                lifecycleService(seededOrders, seededExceptions, seededReference, seededTimeline);
+
+        SeedDataLoader loader = new SeedDataLoader(seededReference, seededLifecycle);
+        loader.load();
+
+        assertTrue(loader.isLoaded(), "the loader reports completion for the readiness probe");
+        assertEquals(3, seededReference.clientCount(), "three synthetic institutional clients");
+        assertEquals(SEEDED_POSITIONS, seededReference.positionCount(), "five synthetic positions");
+
+        Order northwind = seededOrders.findByClientOrderId("SEED-001");
+        assertNotNull(northwind, "SEED-001 must be stored");
+        assertEquals("ORD-000001", northwind.getOrderId(), "the seed submits SEED-001 first");
+        assertEquals(OrderStatus.EXECUTED, northwind.getStatus(), "SEED-001 passes every control");
+        assertEquals(PostTradeStatus.SETTLEMENT_READY, northwind.getPostTradeStatus(),
+                "INST-001's settlement instructions agree");
+        assertEquals(RecordSource.SEED, northwind.getSource(),
+                "the three-argument overload marks a seeded order SEED");
+
+        Order restricted = seededOrders.findByClientOrderId("SEED-002");
+        assertNotNull(restricted, "SEED-002 must be stored");
+        assertEquals("ORD-000002", restricted.getOrderId(), "the seed submits SEED-002 second");
+        assertEquals(OrderStatus.REJECTED, restricted.getStatus(),
+                "SEED-002 is an order in the restricted symbol RSTRA");
+        assertNull(restricted.getPostTradeStatus(), "a rejected seed order has no post-trade state");
+        assertEquals(RecordSource.SEED, restricted.getSource(), "seeded source");
+
+        Order mismatching = seededOrders.findByClientOrderId("SEED-003");
+        assertNotNull(mismatching, "SEED-003 must be stored");
+        assertEquals("ORD-000003", mismatching.getOrderId(), "the seed submits SEED-003 third");
+        assertEquals(OrderStatus.EXECUTED, mismatching.getStatus(), "SEED-003 passes every control");
+        assertEquals(PostTradeStatus.EXCEPTION, mismatching.getPostTradeStatus(),
+                "INST-003's counterparty safekeeping account differs from the firm's");
+        assertEquals(RecordSource.SEED, mismatching.getSource(), "seeded source");
+
+        SettlementException opened = seededExceptions.find("EXC-000001");
+        assertNotNull(opened, "the mismatching execution opens the one seeded exception");
+        assertEquals(ExceptionStatus.OPEN, opened.getStatus(), "the seeded exception is left open");
+        assertEquals(RecordSource.SEED, opened.getSource(), "the exception inherits its order's source");
+        assertEquals(mismatching.getOrderId(), opened.getOrderId(), "it references SEED-003's order");
+
+        assertEquals(10100L, seededReference.findPosition("INST-001", "SYNA").getQuantity(),
+                "SEED-001 fills 100 shares onto the seeded 10000");
+        assertEquals(2500L, seededReference.findPosition("INST-003", "SYNA").getQuantity(),
+                "SEED-003 fills 500 shares onto the seeded 2000");
+        assertEquals(5000L, seededReference.findPosition("INST-001", "SYNB").getQuantity(),
+                "no seed order touches INST-001 SYNB");
+        assertEquals(20000L, seededReference.findPosition("INST-002", "SYNC").getQuantity(),
+                "no seed order touches INST-002 SYNC");
+        assertEquals(45000L, seededReference.findPosition("INST-002", "SYND").getQuantity(),
+                "the rejected SEED-002 leaves INST-002 untouched");
+
+        assertEquals(13, seededTimeline.all().size(),
+                "five events for SEED-001, two for the rejected SEED-002, five for SEED-003 "
+                        + "and one opening EXC-000001");
+    }
+
+    @Test
+    void testConcurrentDuplicateSubmissionsLeaveExactlyOneOrder() throws InterruptedException {
+        Queue<Throwable> failures = new ConcurrentLinkedQueue<>();
+        CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch finished = new CountDownLatch(DUPLICATE_SUBMITTERS);
+        ExecutorService submitters = Executors.newFixedThreadPool(DUPLICATE_SUBMITTERS);
+
+        try {
+            for (int submitter = 0; submitter < DUPLICATE_SUBMITTERS; submitter++) {
+                submitters.execute(() -> {
+                    try {
+                        release.await();
+                        service.submit(
+                                request("API-011", "INST-001", "SYNA", "BUY", 100L, "100.00"),
+                                ACTOR);
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        failures.add(interrupted);
+                    } catch (RuntimeException refused) {
+                        failures.add(refused);
+                    } finally {
+                        finished.countDown();
+                    }
+                });
+            }
+
+            release.countDown();
+            assertTrue(finished.await(LATCH_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+                    "every submitter must finish inside the timeout");
+        } finally {
+            submitters.shutdown();
+        }
+
+        assertTrue(submitters.awaitTermination(LATCH_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+                "the executor must terminate rather than leave a thread running");
+
+        /* The count is exact rather than approximate because the client order id is claimed with a
+           single putIfAbsent before any order object exists: exactly one submitter is told to
+           proceed whatever the scheduling order, and the other seven are refused before they can
+           create an order, append an event or move the position. */
+        assertEquals(DUPLICATE_SUBMITTERS - 1, failures.size(),
+                "seven of eight submitters must be refused, saw " + failures);
+        for (Throwable failure : failures) {
+            assertTrue(failure instanceof StateConflictException,
+                    "a losing submitter must be refused with a conflict, not " + failure);
+        }
+
+        assertEquals(1, orderStore.count(), "exactly one order survives");
+        Order survivor = service.list().get(0);
+        assertEquals(OrderStatus.EXECUTED, survivor.getStatus(), "the surviving order executed");
+        assertEquals(10100L, referenceData.findPosition("INST-001", "SYNA").getQuantity(),
+                "the position is filled exactly once");
+    }
+
+    private static OrderLifecycleService lifecycleService(OrderStore orders,
+            SettlementExceptionStore exceptions, ReferenceDataStore reference, AuditTimeline timeline) {
+        ControlLimits limits = new ControlLimits(MAX_ORDER_NOTIONAL, MAX_POSITION_NOTIONAL,
+                FAT_FINGER_THRESHOLD, RESTRICTED_SYMBOLS, EXCEPTION_SLA_HOURS);
+        PostTradeService postTrade = new PostTradeService(orders, exceptions, reference, timeline,
+                FIXED_CLOCK, limits);
+
+        return new OrderLifecycleService(orders, reference, new PreTradeControlService(limits),
+                postTrade, timeline, FIXED_CLOCK);
+    }
+
+    /* The same synthetic reference data SeedDataLoader writes at startup, including INST-003's
+       deliberately unequal counterparty safekeeping account - the module's only SSI mismatch, and
+       therefore the only client whose executions open a settlement exception. */
+    private static void seedReferenceData(ReferenceDataStore store) {
+        SettlementInstruction northwind =
+                new SettlementInstruction("SYNTGB2LXXX", "SAFE-NW-0001", "CASH-NW-0001", "XLON");
+        store.putClient(
+                new ClientAccount("INST-001", "Northwind Asset Management", northwind, northwind));
+
+        SettlementInstruction contoso =
+                new SettlementInstruction("SYNTUS33XXX", "SAFE-CP-0002", "CASH-CP-0002", "XNYS");
+        store.putClient(new ClientAccount("INST-002", "Contoso Pension Trust", contoso, contoso));
+
+        store.putClient(new ClientAccount("INST-003", "Fabrikam Capital Partners",
+                new SettlementInstruction("SYNTDEFFXXX", "SAFE-FB-0003", "CASH-FB-0003", "XETR"),
+                new SettlementInstruction("SYNTDEFFXXX", "SAFE-FB-9903", "CASH-FB-0003", "XETR")));
+
+        store.putPosition(new Position("INST-001", "SYNA", 10000L, new BigDecimal("100.00")));
+        store.putPosition(new Position("INST-001", "SYNB", 5000L, new BigDecimal("50.00")));
+        store.putPosition(new Position("INST-002", "SYNC", 20000L, new BigDecimal("40.00")));
+        //4,500,000 of the 5,000,000 resulting-position ceiling, which is what makes a buy of more
+        //than 5000 shares at 100.00 cross it and anything up to 5000 stay under it.
+        store.putPosition(new Position("INST-002", "SYND", 45000L, new BigDecimal("100.00")));
+        store.putPosition(new Position("INST-003", "SYNA", 2000L, new BigDecimal("100.00")));
+    }
+
+    private static OrderRequest request(String clientOrderId, String clientId, String symbol,
+            String side, Long quantity, String limitPrice) {
+        return new OrderRequest(clientOrderId, clientId, symbol, side, quantity,
+                (limitPrice == null) ? null : new BigDecimal(limitPrice));
+    }
+
+    //Looked up by control name rather than by list index so the assertions survive a reordering of
+    //the fixed evaluation order.
+    private static ControlResult control(Order order, String control) {
+        for (ControlResult result : order.getControlResults()) {
+            if (control.equals(result.getControl())) {
+                return result;
+            }
+        }
+
+        return fail("no " + control + " result was recorded on " + order.getOrderId());
+    }
+
+    private static void assertEdge(AuditEvent event, StateMachine stateMachine, String fromState,
+            String toState) {
+        String edge = fromState + " -> " + toState;
+        assertEquals(stateMachine, event.getStateMachine(), edge + " state machine");
+        assertEquals(fromState, event.getFromState(), edge + " fromState");
+        assertEquals(toState, event.getToState(), edge + " toState");
+    }
+
+    private static void assertValidationMessage(String field, Executable submission) {
+        ValidationException failure = assertThrows(ValidationException.class, submission,
+                "an invalid or absent " + field + " must be refused");
+        assertTrue(failure.getMessage().contains(field),
+                "the message must name " + field + ": " + failure.getMessage());
+    }
+
+    //compareTo rather than equals because BigDecimal.equals is scale-sensitive, and the assertion
+    //is about the amount rather than about the scale the producer happened to write it with.
+    private static void assertAmount(String expected, BigDecimal actual, String message) {
+        assertEquals(0, new BigDecimal(expected).compareTo(actual),
+                message + ": expected " + expected + " but was " + actual);
+    }
+}
