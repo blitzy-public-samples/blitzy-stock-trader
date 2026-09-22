@@ -120,20 +120,4 @@ public enum CashAccountErrorCode {
     public String code() {
         return name();
     }
-
-    public HttpStatus getStatus() {
-        return status;
-    }
-
-    public Integer getRetryAfterSeconds() {
-        return retryAfterSeconds;
-    }
-
-    public String getDefaultMessage() {
-        return defaultMessage;
-    }
-
-    public String getCode() {
-        return name();
-    }
 }

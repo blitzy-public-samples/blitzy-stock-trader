@@ -20,9 +20,35 @@ This module is a **plain tracked directory in the umbrella checkout — not a gi
 edited: the umbrella repository carries these files directly so the new service can be built and reviewed in the same
 checkout as the seam it has to satisfy and the chart it has to conform to.
 
-The module tracks no `.gitignore`: the frozen file inventory (AAP 0.6.1) contains none, and the umbrella repository
-has none of its own, so a build leaves `target/` showing as untracked unless the checkout excludes it locally
-(`.git/info/exclude`).
+### `target/` is expected to show as untracked, and that is the settled answer
+
+The module tracks **no `.gitignore`**: the frozen file inventory (AAP 0.2.1, 0.6.1) contains none and the umbrella
+repository has none of its own. The consequence is concrete rather than theoretical — in a committed checkout, after
+the build this README mandates (`./mvnw -B clean verify`), `git status --porcelain` reports exactly one line:
+
+```text
+?? backend/cash-account-modernized/target/
+```
+
+That line is **build output, never a tracked change**: no file this deliverable ships is modified by it, so the
+minimal-change criterion (AAP 0.7.7, "only files under `backend/cash-account-modernized/` are created") still holds.
+Either of these reports nothing at all in the same checkout — an exclusion pathspec, or removing the output before
+inspecting:
+
+```bash
+git status --porcelain -- ':!backend/cash-account-modernized/target'
+rm -rf backend/cash-account-modernized/target && git status --porcelain
+```
+
+A checkout that would rather never see the line excludes the path locally, with no tracked file added:
+
+```bash
+echo 'backend/cash-account-modernized/target/' >> .git/info/exclude
+```
+
+Shipping a one-line `.gitignore` in the module is the other way to settle this, and it is deliberately not taken here
+because it would add a file the frozen inventory does not carry; it is recorded for the owners under
+[Deviations from the frozen AAP inventory](#deviations-from-the-frozen-aap-inventory).
 
 ## What is in here
 
@@ -259,10 +285,38 @@ These have internal defaults; nothing in the chart supplies them, and nothing ne
 | `cashaccount.fx.accepted-currencies` | The 31 ISO codes `AUD BGN BRL CAD CHF CNY CZK DKK EUR GBP HKD HUF IDR ILS INR ISK JPY KRW MXN MYR NOK NZD PHP PLN RON SEK SGD THB TRY USD ZAR` | The **estate allowlist**, adopted verbatim from the `allowed_currencies` CHECK the estate's PostgreSQL init template already enforces — **not** the set the exchange-rate API serves, which is a 30-code subset of it: as of 2026-09-22 the configured provider's `/v1/currencies` omits `BGN` and `GET /latest?from=USD&to=BGN` answers `404`. Acceptance is therefore not a promise of convertibility — a `BGN` account is created and read normally, and only a cross-currency `credit`/`debit` for it fails, with `503 EXCHANGE_RATE_UNAVAILABLE`, the balance unchanged and no ledger row. `BGN` is kept rather than dropped because this list also decides what a legacy export may be **loaded** with (an out-of-set currency is recorded as `CURRENCY` / `INVALID_IN_LEGACY` and the account is not migrated), so dropping it would silently strand a `BGN`-denominated legacy account. A deployment whose accounts must all be convertible narrows the list — `CASHACCOUNT_FX_ACCEPTED_CURRENCIES=USD,EUR,…`, no chart change — and `application.yml` is the single authority every consumer binds |
 | `cashaccount.reservation.default-ttl` | `PT24H` | A hold nobody settles or releases must not strand funds indefinitely |
 | `cashaccount.reservation.expiry-sweep-interval` | `PT60S` | Bounds how long an overdue hold keeps money out of the available balance |
+| `cashaccount.migration.batch-chunk-size` | `50` | Rows a bulk `load` or `reconcile` writes before it flushes and clears the persistence context. Unbounded, one load would hold every entity it has written until the transaction ends, which is an out-of-memory failure halfway through a migration window. It decides nothing about correctness — the whole load is one transaction either way (AAP 0.6.3), so the same rows land whatever it is — and `50` is deliberately the same number as `spring.jpa.properties.hibernate.jdbc.batch_size`, so a flush maps onto **whole** JDBC batches instead of straddling them. Raise both together or neither. It is **not** a `tool.*` key (below), and an operator sizing a migration window overrides it on the command line: `--cashaccount.migration.batch-chunk-size=<rows>` |
 
 All of them are overridable through Spring's relaxed binding — `CASHACCOUNT_FX_TIMEOUT`,
 `CASHACCOUNT_SECURITY_ALL_AUTHENTICATED_HOLD_STOCKTRADER`, and so on — as plain container environment, **without any
 chart change**. That is the point of leaving them unbound rather than inventing chart keys for them.
+
+### Request intake bounds
+
+Nothing in this stack limited a request body: Tomcat's post-size cap covers form encodings only, so a JSON body was
+bounded by nothing and Jackson materialized whatever arrived **before** any field validation ran — heap and CPU in a
+2Gi pod for the cost of sending bytes. The largest payload this service defines is a few hundred bytes with every
+field at its maximum (owner 32 characters, order reference 64), so these caps are ample headroom and still trivial to
+refuse. They are framework keys with no chart binding, overridable as plain container environment
+(`SERVER_MAX_REQUEST_BODY_SIZE`, and so on) without any chart change.
+
+| Property | Value | What it bounds |
+| --- | --- | --- |
+| `server.max-request-body-size` | `8KB` | The request body the application parses. `config/RequestBodySizeLimitFilter` binds this key, refuses a declared `Content-Length` above it **before reading a byte**, and counts a chunked body as it is read — answering `413 REQUEST_TOO_LARGE` in the standard [`ApiError`](#error-model) shape either way |
+| `server.max-http-request-header-size` | `8KB` | The request line and headers — Tomcat's own default, stated explicitly because it is the bound on the one caller-controlled input the filter above cannot see: the text of the `?amount=` query parameter |
+| `server.tomcat.max-http-form-post-size` | `8KB` | Form bodies, which never reach the filter's counter because the container parses them off the native stream to build the parameter map. This service consumes `application/json` only, so the value is a cap rather than a facility |
+| `server.tomcat.max-swallow-size` | `64KB` | How much of a body the application refused to read Tomcat will still drain to keep the connection usable — large enough that a rejected request receives its `413` instead of a reset connection, small enough that draining is never the attack. It is also the bound on a body nothing reads at all, such as one sent to a `GET` mapping or an actuator path |
+
+**What they cannot bound, stated so it is never mistaken for covered.** Every value above governs what this process
+*reads*; none governs what the network *delivers*, because the connector has accepted the bytes before any of them
+applies. A parsed body is capped at 8KB and a refused one is drained at no more than 64KB, so no request costs this
+pod more than that — but a caller can still spend its own bandwidth pushing bytes at the connector. Closing that
+outer layer belongs to the ingress, service mesh or API gateway in front of the Service and is a **deployment**
+change this module may not make (AAP 0.3.4 makes a chart template change a [stop-and-flag](#stop-and-flag)
+condition, and AAP 0.2.4 puts values, CRDs and GitOps resources out of scope); it is recorded for the platform owner
+under [Deviations from the frozen AAP inventory](#deviations-from-the-frozen-aap-inventory).
+`REQUEST_TOO_LARGE` is the one error code this deliverable added beyond the AAP's own table, and is recorded in the
+same place.
 
 ### Tool-profile properties
 
@@ -281,6 +335,13 @@ web server. See [Migration and reconciliation tooling](#migration-and-reconcilia
 
 `tool.legacy-charset` and `tool.legacy-timezone` are properties rather than constants precisely because the region's
 CCSID and time zone are not in this repository — see [Open items](#open-items).
+
+Those seven are the whole namespace: `MigrationToolRunner` **rejects any `tool.*` option outside them**, so a
+mistyped flag fails the invocation instead of being silently ignored. The one knob a migration run also needs —
+how many rows a load or reconcile flushes by — therefore lives outside it, at
+`cashaccount.migration.batch-chunk-size` ([above](#properties-with-no-environment-binding)), beside the JDBC batch
+size it has to match; `--cashaccount.migration.batch-chunk-size=<rows>` passes straight through the runner's typo
+guard.
 
 ### Injected but deliberately not consumed
 
@@ -473,13 +534,15 @@ return channel, which dropped the sign in a `X(10)` field and reported only the 
 | `DATASTORE_UNAVAILABLE` | 503 + `Retry-After: 5` | Database unreachable (legacy `-911` / `-913` / `-904`) |
 | `UNSUPPORTED_PATH` | 404 | An unmapped path — fail closed, where the legacy `EVALUATE` fell through as success |
 | `UNSUPPORTED_METHOD` | 405 | A known path with an unmapped verb |
+| `REQUEST_TOO_LARGE` | 413 | A request body above `server.max-request-body-size` (8KB), refused on its declared `Content-Length` or counted mid-read — see [Request intake bounds](#request-intake-bounds). The one code here with **no** legacy counterpart and no entry in the AAP's own error table: a COMMAREA is a fixed-length structure, so an oversized request was unrepresentable rather than rejected, and a 413 cannot be reported without a code of its own. Recorded under [Deviations from the frozen AAP inventory](#deviations-from-the-frozen-aap-inventory) |
 | `INVALID_QUERY` | 400 | `limit` below 1 or above 1000, or an unparsable `since` |
 | `CONCURRENT_MODIFICATION` | 409 + `Retry-After: 1` | A lock conflict. One second, not five: the conflict clears as soon as the competing transaction commits |
 | `UNAUTHORIZED` | 401 | Missing or invalid token, rendered by the filter chain's entry point |
 | `FORBIDDEN` | 403 | Authenticated but lacking the required role, rendered by the access-denied handler |
 | `INTERNAL` | 500 | Any unexpected exception |
 
-That is the complete set: 22 codes, one status each, nothing else reachable.
+That is the complete set: **23 codes**, one status each, nothing else reachable — the 22 the AAP's error table
+declares, with the statuses it declares, plus `REQUEST_TOO_LARGE`.
 
 ## Security
 
@@ -916,8 +979,11 @@ migration tool or a hand-written `ALTER` step appended to this file, applied in 
 
 ## Open items
 
-Each of these is raised rather than guessed, and `docs/legacy-characterization.md` carries the detail and the citation
-for those that came from the legacy source.
+Two registers, kept apart because they need different answers. The first is what this deliverable could not settle
+from the repository: each item is raised rather than guessed, and `docs/legacy-characterization.md` carries the detail
+and the citation for those that came from the legacy source. The second —
+[Deviations from the frozen AAP inventory](#deviations-from-the-frozen-aap-inventory) — is what this deliverable
+settled *differently from the plan it was built against*; each of those needs an authorization rather than an answer.
 
 | Open item | What settles it |
 | --- | --- |
@@ -933,6 +999,106 @@ for those that came from the legacy source.
 | `vault.enabled` must remain `false`, because the enabled branch injects Liberty-specific container arguments | A Vault-compatible argument shape for a non-Liberty workload, decided by the chart's owners |
 | The rounding the (absent) z/OS Connect mapping applied to a caller amount with more than two decimals | The z/OS Connect API/SAR definition. This service scales `DOWN` to 2, consistent with COBOL's default truncation, and every parity fixture uses two-decimal amounts so no expected value depends on the choice |
 | The `NUMERIC(9,2)` ceiling of `9,999,999.99`, inherited to preserve legacy precision exactly | The requesting organization confirms the ceiling or authorizes widening (one DDL change plus the `Money` bounds; parity within range is unaffected) |
+
+### Deviations from the frozen AAP inventory
+
+The plan this module was built against freezes four inventories: the dependency versions (AAP 0.9.1), the error-code
+vocabulary (AAP 0.6.2), the verbatim wrapper copy (AAP 0.2.3, 0.8.1) and the test-volume ceiling (AAP 0.7.6). Security
+and regression work exceeded each of them, and the first four rows below are those four numbers. **Every change they
+name is in the tree and none of it is to be reverted** — each is either a fix for a named vulnerability or the
+coverage that guards a fixed defect — but each needs the requesting organization's authorization, and this register
+is where that outstanding decision is visible rather than buried at a code site. The last two rows are the other two
+shapes the same question takes: work the AAP puts outside this module and only the platform owner can do, and a
+deviation deliberately **not** taken, recorded so the owners can take it if they prefer.
+
+| Open item | What settles it |
+| --- | --- |
+| **Three dependency versions override AAP 0.9.1's frozen inventory** — `org.postgresql:postgresql` `42.7.13` (the AAP pins `42.7.7`, matching `backend/portfolio`), `tomcat.version` `10.1.60` (Spring Boot 3.3.13's BOM manages `10.1.42`) and `micrometer.version` `1.15.12` (the BOM manages `1.13.15`). Each is a CVE remediation the mandated 3.3 line ships no newer parent to inherit, declared per coordinate in `pom.xml` and detailed [below](#the-three-dependency-overrides-and-why-no-bom-version-remediates-them) | The requesting organization authorizes the three coordinates, recording that Micrometer `1.15.12` sits two minor lines above Boot 3.3.13's tested matrix and is proven only on the surfaces `ActuatorProbesIT` exercises (`/metrics` and `/actuator/prometheus` answering 200 with `http_server_requests_seconds_count`, the series runbook Step 3's rollback criterion reads). **Reverting to the AAP-pinned versions is not an option on the table** — those versions are the vulnerable ones. Decision row **D1** of the [authorization record](#authorization-record) |
+| **A 23rd error code beyond AAP 0.6.2's closed 22-code vocabulary** — `REQUEST_TOO_LARGE` → `413`, raised by `config/RequestBodySizeLimitFilter` and carried out of a mid-read stream by `error/RequestBodyTooLargeException`. Purely additive: every AAP-declared code is present with the status the AAP declares. It exists because a `413` cannot be reported without a code of its own, and both alternatives break the invariant the enum is for — a `413` carrying a `400`'s code makes the code-to-status binding untrue on the wire, and `400 INVALID_AMOUNT` tells a caller its amount was wrong when its body was never parsed | The requesting organization authorizes the 23rd code. The only alternative is a decision to accept an unbounded request body, because removing the code removes the `413` path, which **is** the remediation ([Request intake bounds](#request-intake-bounds)). Decision row **D2** of the [authorization record](#authorization-record) |
+| **The Maven wrapper properties are not the verbatim copy AAP 0.2.3 and 0.8.1 call for** — `.mvn/wrapper/maven-wrapper.properties` adds exactly two lines to `backend/portfolio-assistant`'s file (lines 20–21: a provenance comment and `distributionSha256Sum=0d7125e8…eeadb`). Lines 1–19 are byte-identical, `mvnw` and `mvnw.cmd` are byte-identical, `wrapperVersion`, `distributionType` and `distributionUrl` are unchanged, and the build resolves the same Apache Maven 3.9.11; `pom.xml`'s verified-build-inputs comment records how the value was derived | The requesting organization authorizes the two lines. **The checksum stays**: without it the wrapper downloads and executes an unverified distribution, which is the defect CWE-494 names. If verbatim copying must hold to the byte, the owners supply an equivalent control outside the file — a repository- or runner-level integrity policy that pins the same distribution. Decision row **D3** of the [authorization record](#authorization-record) |
+| **The suite executes 126 tests against AAP 0.7.6's "approximately 72"** — Surefire 47 plus Failsafe 79, 0 skipped. Every addition traces to a prior checkpoint's mandated regression coverage, and the ceiling's qualitative prohibitions are honoured: zero `@ParameterizedTest`, no exploratory or redundant variants, Mockito excluded from the build. Per-family accounting [below](#test-volume-126-executed-against-a-ceiling-of-72) | The requesting organization authorizes the overshoot as regression coverage. **No test is to be deleted to reach the number**: each one guards a defect a prior checkpoint fixed, so deleting it restores the defect's cover, not the plan. The executed count is folded into the declared scenarios below — 72 declared plus 54 named regressions — and the decision is row **D4** of the [authorization record](#authorization-record) |
+| **A request-body cap at the edge is outstanding, and only the platform owner can set it** — the in-process controls bound what this pod reads (8KB parsed, 64KB drained), never what the network delivers to the connector. Setting it in the ingress, service mesh or API gateway is a deployment change this module may not make: AAP 0.3.4 makes a chart template change a [stop-and-flag](#stop-and-flag) condition and AAP 0.2.4 puts values, CRDs and GitOps resources out of scope | The platform owner sets a request-body limit at or below this module's 8KB for the `/cash-account` path space — for example nginx-ingress `client_max_body_size`, or an Envoy buffer limit — and captures as evidence an over-limit `POST` refused at the edge before it reaches a pod |
+| **Whether the module should ship a one-line `.gitignore`** — it does not, because AAP 0.2.1's inventory carries no such file, so after the mandated build `git status --porcelain` reports `?? backend/cash-account-modernized/target/` as described under [Module placement](#target-is-expected-to-show-as-untracked-and-that-is-the-settled-answer) | The owners decide. Adding `target/` in a tracked `.gitignore` needs the same authorization as the rows above, because it is a file beyond the frozen inventory; declining it costs nothing but that one untracked line, which a checkout suppresses locally through `.git/info/exclude` |
+
+#### The three dependency overrides, and why no BOM version remediates them
+
+| Coordinate | AAP 0.9.1 / BOM | Shipped | Advisory and why the shipped version is the floor |
+| --- | --- | --- | --- |
+| `org.postgresql:postgresql` | `42.7.7` | `42.7.13` | CVE-2026-42198: in 42.2.0 up to but excluding 42.7.11 the **server** dictates the SCRAM-SHA-256 PBKDF2 iteration count, so an impersonated or compromised database can force unbounded client-side CPU work at login, which `loginTimeout` does not bound. 42.7.11 adds the `scramMaxIterations` cap and is the fixed floor; 42.7.13 is the current 42.7.x and additionally fails closed on a SCRAM channel-binding downgrade |
+| `org.apache.tomcat.embed:*` (via `tomcat.version`) | `10.1.42` | `10.1.60` | CVE-2025-61795: 10.1.0-M1 through 10.1.46 delay cleanup of multipart upload temporary files on an error path, so repeated failed uploads exhaust disk; fixed in 10.1.47, and 10.1.60 is the latest 10.1.x. The property is the parent's own, so the whole embed set moves together rather than one artifact being lifted out of its release. `spring.servlet.multipart.enabled=false` removes the affected code path **beside** this bump, not instead of it |
+| `io.micrometer:*` (via `micrometer.version`) | `1.13.15` | `1.15.12` | CVE-2026-40984: crafted HTTP requests against Micrometer's HTTP-server instrumentations cause a denial of service in 1.13.0–1.13.18 (the BOM-managed 1.13.15 is inside that range), 1.14.0–1.14.15, 1.15.0–1.15.11, 1.16.0–1.16.5 and ≤ 1.9.17. The only fixed versions are **1.15.12** and 1.16.6, so no 1.13.x or 1.14.x remediates anything and staying on the BOM line is not available; 1.15.12 is the lowest fixed version. The advisory's other remedy — disabling HTTP server instrumentation — is deliberately not taken, because it would delete `http_server_requests_seconds_count`, the metric runbook Step 3's rollback criterion is written on |
+
+Operational consequence of the last row, and the one thing to re-check on any future Boot patch bump: Micrometer
+1.15.12 is outside Spring Boot 3.3.13's tested dependency matrix. This module's evidence for it is narrow and
+specific — `ActuatorProbesIT` asserts 200 on `/metrics` and on `/actuator/prometheus` and the presence of the
+`http_server_requests_seconds_count` series. Re-assert **both** scrape routes after any change to the Boot or
+Micrometer version, since that is exactly what the compatibility statement nobody has issued would otherwise cover.
+
+#### Test volume: 126 executed against a ceiling of 72
+
+Counts are from `./mvnw -B clean verify` (Surefire `*Test`, Failsafe `*IT`), 0 skipped.
+
+The executed number is the AAP's own scenario count plus the regressions the fixes left behind, and the third column
+is that difference: **72 declared + 54 fix-mandated regressions = 126**. Every family's addition is named in the
+paragraph below, so the overshoot is accounted for scenario by scenario rather than asserted as a total.
+
+| Family | AAP 0.7.6 declared | Added by fixes | Executed | Classes |
+| --- | --- | --- | --- | --- |
+| State-transition unit | 8 | 1 | 9 | `ReservationStateMachineTest` |
+| Money / arithmetic unit | 11 | 2 | 13 | `MoneyTest` 7, `LegacyBalanceCalculatorTest` 3, `CharacterizationDocPresentTest` 3 |
+| Currency conversion | 6 | 6 | 12 | `CurrencyConversionTest` 9, `ExchangeRateSourceWiringTest` 3 |
+| Owner normalization and datasource | 5 | 3 | 8 | `OwnerNormalizerTest` 4, `DataSourceGuardConfigTest` 4 |
+| Export decoding | 3 | 0 | 3 | `VsamHistoryRecordDecoderTest` |
+| Contract through the caller's client | 10 | 5 | 15 | `RetailContractIT` 14, `CashAccountClientDriftTest` 1 |
+| Institutional and audit immediacy | 13 | 11 | 24 | `ReservationLifecycleIT` 22, `AuditImmediacyIT` 2 |
+| Audit immutability | 2 | 0 | 2 | `LedgerImmutabilityIT` |
+| Security | 5 | 8 | 13 | `RoleEnforcementIT` |
+| Fail-closed | 2 | 3 | 5 | `FailClosedIT` |
+| Deployment shape | 1 | 1 | 2 | `ActuatorProbesIT` |
+| Reconciliation and dual-run | 6 | 14 | 20 | `LoaderIT` 10, `ReconciliationIT` 6, `ShadowComparatorIT` 3, `RollbackReplayFileTest` 1 |
+| **Total** | **72** | **54** | **126** | 21 classes |
+
+Where the extra 54 came from: the families that grew most are the ones a security or correctness fix reached.
+Currency conversion gained the outbound-request assertions — no `Authorization` header forwarded, an https-only
+endpoint with no credentials, a bounded response — and the wiring proof that the staged legacy rate source can never
+reach the request path. Security grew into a two-mode matrix (the deployed parity grant, and the strict `groups`-only
+mode as a second context) with `HEAD`-equals-`GET` authorization, the security-header assertions on success and on
+both filter-chain rejections, and the https-only JWKS case. Institutional grew the idempotency-hash cases — expiry
+omitted, `10.0` versus `10.00`, a key retained from a deleted account's life — and the three two-thread races.
+Reconciliation and dual-run grew a live-rate-source mode beside the default `legacy-table` one, plus the
+held-funds and ledger-source classifications. Fail-closed grew an `OPTIONS` case and the two framings of the body
+cap (declared `Content-Length`, and counted mid-read). None of them is a parameterized matrix or an exploratory test,
+and each is the regression a specific fix left behind.
+
+#### Authorization record
+
+The four rows above that need an authorization are recorded here, in the same shape and with the same discipline as
+the characterization document's acceptance block (`docs/legacy-characterization.md` section 10): a status, a named
+authority, a date and a reference, written as single lines in a table so a reader — or a simple `grep` — can tell at
+a glance which decisions are outstanding.
+
+**Who may change a status.** Only the requesting organization may move a row from `PENDING` to `AUTHORIZED`, and must
+record the authorizer's name and role, the date, and a reference to where the decision is minuted (a change record, a
+risk acceptance, a ticket). Nobody building or reviewing this module may fill these fields on the organization's
+behalf, for the same reason the retention requirement may not be defaulted: an authorization nobody granted is worse
+than a deviation plainly marked outstanding. `AUTHORIZED` closes the row; `REJECTED` means the deviation must be
+removed, which for D1–D3 reinstates the vulnerability the change fixed and for D4 deletes regression coverage, so a
+rejection needs the replacement control named in that row's "what settles it" cell. The runbook's Step 0
+prerequisites are the natural point to collect these, since that step already gathers the platform owner's sign-offs
+before any cutover action.
+
+| # | Deviation, and the inventory it departs from | Status | Authorized by (name, role) | Date | Reference |
+| --- | --- | --- | --- | --- | --- |
+| D1 | pgJDBC `42.7.13`, Tomcat `10.1.60` and Micrometer `1.15.12` (AAP 0.9.1), including the Micrometer-outside-the-tested-matrix caveat | PENDING | — | — | — |
+| D2 | `REQUEST_TOO_LARGE` → `413` as a 23rd error code (AAP 0.6.2) | PENDING | — | — | — |
+| D3 | The two lines added to the wrapper properties: the provenance comment and `distributionSha256Sum` (AAP 0.2.3, 0.8.1) | PENDING | — | — | — |
+| D4 | 126 executed tests — 72 declared scenarios plus 54 fix-mandated regressions (AAP 0.7.6) | PENDING | — | — | — |
+| D5 | A tracked one-line `.gitignore` beyond AAP 0.2.1's inventory | NOT TAKEN — see the register's last row | — | — | — |
+
+Legend: `PENDING` — the change is in the tree and the decision is outstanding. `AUTHORIZED` — approved, with the
+authority, date and reference recorded on that row. `REJECTED` — the deviation must be removed together with the
+replacement control its register row names. `NOT TAKEN` — the deviation was declined during implementation and
+nothing in the tree depends on it.
 
 ## Prohibitions
 

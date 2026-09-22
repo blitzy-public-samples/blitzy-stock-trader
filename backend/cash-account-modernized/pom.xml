@@ -41,7 +41,15 @@
              the mandated 3.3 line ships no newer parent to inherit the fix from. They are the only overrides
              in this file, one property per coordinate set, each with its own advisory: everywhere else the BOM
              remains this module's single version authority, and these three are that rule's stated exceptions
-             rather than a second authority beside it. -->
+             rather than a second authority beside it.
+             All three also depart from the frozen dependency inventory (AAP 0.9.1, which pins pgJDBC 42.7.7 and
+             leaves Tomcat and Micrometer to the BOM), so each is carried as a row of README.md's "Deviations
+             from the frozen AAP inventory" register, where the advisory, the reason no BOM version remediates
+             it and the decision row that authorizes it (D1, PENDING until the requesting organization signs it)
+             are stated together - including that Micrometer 1.15.12 sits two minor lines above Boot 3.3.13's
+             tested matrix and is proven only on the surfaces ActuatorProbesIT exercises. A version moved here
+             moves in that register in the same edit, and reverting one to its inventory value reinstates the
+             vulnerability. -->
         <!-- CVE-2026-42198: in pgJDBC 42.2.0 up to but excluding 42.7.11 the SERVER dictates the
              SCRAM-SHA-256 PBKDF2 iteration count, so an impersonated or compromised database can force
              unbounded client-side CPU work at login, which loginTimeout does not bound. 42.7.11 adds the
@@ -274,12 +282,14 @@
             (03e2d65d4483a3396980629f260e25cac0d8b6f7f2791e4dc20bc83f9514db8d0f05b0479e699a5f34679250c49c8e52e961262ded468a20de0be254d8207076)
             and their SHA-1 against Central's .sha1 (2b7fdf8f6983c7b295eab505b46825ee2d11959b). The value is
             lowercase hex because mvnw.cmd compares (Get-FileHash ...).Hash.ToLower() against the literal.
-            The checksum line is the ONLY departure from the verbatim portfolio-assistant wrapper copy that
-            AAP 0.2.3 and 0.8.1 call for: lines 1-19 of that file remain byte-identical to the reference, the
-            wrapper version, distribution type and distribution URL are unchanged, and the build resolves the
-            same Maven 3.9.11. Removing it would leave the distribution unverified, which is the defect
-            CWE-494 names, so the divergence is deliberate and is reported for authorization rather than
-            hidden here.
+            The checksum line and the provenance comment above it are the ONLY departure from the verbatim
+            portfolio-assistant wrapper copy that AAP 0.2.3 and 0.8.1 call for: lines 1-19 of that file remain
+            byte-identical to the reference, the wrapper version, distribution type and distribution URL are
+            unchanged, and the build resolves the same Maven 3.9.11. Removing it would leave the distribution
+            unverified, which is the defect CWE-494 names, so the divergence is deliberate and is carried as a
+            row of README.md's "Deviations from the frozen AAP inventory" register, whose authorization record
+            carries this departure as decision row D3 - so the outstanding decision has one place to be signed
+            rather than being reported once and then invisible.
          2. The container base image. Dockerfile pins ubi9/openjdk-21-runtime:1.21 to its multi-arch
             manifest-list digest; that file states its own provenance and re-derivation commands.
          Update policy for both: a new distribution URL or base release is a reviewed change in which the
