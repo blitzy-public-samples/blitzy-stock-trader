@@ -1,0 +1,327 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!--
+       Copyright 2025 Kyndryl, All Rights Reserved
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-->
+
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!-- 3.3.13 is the final 3.3.x release published to Maven Central and therefore carries every fix of
+         the mandated 3.3 line. The OSS end-of-life of 3.3.x is a raised open item, not a licence to bump
+         to 3.4/3.5. The empty <relativePath/> is required: every sibling in this checkout is a git
+         submodule and nothing aggregates this module, so the parent must be resolved from the
+         repository rather than by walking up the umbrella working tree. -->
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.3.13</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>com.ibm.hybrid.cloud.sample.stocktrader</groupId>
+    <artifactId>cash-account-modernized</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+    <packaging>jar</packaging>
+
+    <name>StockTrader - cash-account-modernized</name>
+    <description>
+        Cloud-native cash ledger service replacing the CICS/COBOL cash-account program: the retail
+        contract the broker already calls, an additive institutional reservation surface, an append-only
+        ledger over PostgreSQL, and the fixture-verified migration/reconciliation tooling.
+    </description>
+
+    <properties>
+        <!-- 21 is the highest source level the estate documents (backend/account/pom.xml:L33,
+             backend/trade-history/pom.xml:L47). java.version drives the parent's compiler settings;
+             maven.compiler.release is set as well so the build is explicit about release semantics. -->
+        <java.version>21</java.version>
+        <maven.compiler.release>21</maven.compiler.release>
+
+        <!-- Versions the Spring Boot BOM does not manage. Declared once each so an audit reads one
+             value per coordinate; every other version in this file comes from the BOM deliberately. -->
+        <postgresql.version>42.7.7</postgresql.version>
+        <microprofile.rest.client.version>4.0</microprofile.rest.client.version>
+        <jakarta.ws.rs.version>3.1.0</jakarta.ws.rs.version>
+        <jakarta.cdi.version>4.1.0</jakarta.cdi.version>
+        <otel.instrumentation.annotations.version>2.4.0</otel.instrumentation.annotations.version>
+        <resteasy.microprofile.version>3.0.1.Final</resteasy.microprofile.version>
+        <!-- Deliberately 6.2.11.Final rather than trade-history's 6.2.5.Final
+             (backend/trade-history/pom.xml:L63): this is the RESTEasy version that
+             resteasy-microprofile-parent 3.0.1.Final itself declares, so the client stack is internally
+             consistent instead of mixing a newer MP layer onto an older core. -->
+        <resteasy.version>6.2.11.Final</resteasy.version>
+        <johnzon.version>2.0.2</johnzon.version>
+        <!-- RESTEasy's MP REST Client declares an MP Config implementation as optional; Liberty supplies
+             one, a Spring classpath does not, and without it RestClientBuilder.build() fails with
+             "RESTEASY003325 ... No ConfigProviderResolver implementation found!". These two versions are
+             the ones resteasy-microprofile-parent 3.0.1.Final manages. -->
+        <microprofile.config.version>3.1</microprofile.config.version>
+        <smallrye.config.version>3.9.1</smallrye.config.version>
+    </properties>
+
+    <!-- No Flyway and no Liquibase: the estate ships no migration framework (backend/portfolio
+         hand-applies createTables.ddl), so the schema is applied by Spring Boot SQL initialization over
+         src/main/resources/schema/cash-account-schema.sql with ddl-auto=validate guarding drift.
+         No Redis, Kafka or CQRS client either: the chart injects REDIS_URL, KAFKA_* and CQRS_ENABLED for
+         a Java version that was never built, and this service consumes none of them. -->
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-jpa</artifactId>
+        </dependency>
+        <!-- Needed so monetary request fields bind and validate as BigDecimal; no money path may touch
+             float or double. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+        <!-- The chart probes /actuator/health/readiness, /actuator/health/liveness and /actuator/startup
+             at the root of port 8080, so the actuator health groups and the startup endpoint are
+             deployment requirements, not optional instrumentation. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+        <!-- The broker propagates the caller's existing RS256 token as the Authorization header; this
+             service validates that same token as a resource server instead of introducing a new
+             identity mechanism. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
+        </dependency>
+        <!-- The chart's scrape annotation carries a port but no path, so a GET /metrics shim has to call
+             PrometheusMeterRegistry.scrape() directly; this registry backs both it and
+             /actuator/prometheus. -->
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
+        <!-- 42.7.7 equals the BOM-managed version and matches backend/portfolio/pom.xml:L113-L118
+             exactly; it is pinned here only so that parity is auditable in one place. The scope
+             deliberately differs from portfolio's "provided": Liberty supplies the driver from
+             /config/prereqs, whereas a Spring Boot executable jar must carry it. -->
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <version>${postgresql.version}</version>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!-- Tests use real collaborators only - a Testcontainers PostgreSQL and Spring's
+             MockRestServiceServer - because no Java module in this estate uses a mocking framework.
+             The org.mockito artifacts the starter would contribute are excluded so none can be reached
+             by accident. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.mockito</groupId>
+                    <artifactId>mockito-core</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>org.mockito</groupId>
+                    <artifactId>mockito-junit-jupiter</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <!-- Role-enforcement assertions run against the real filter chain; this supplies the request
+             post-processors for that, and adds no mocking framework. -->
+        <dependency>
+            <groupId>org.springframework.security</groupId>
+            <artifactId>spring-security-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- Testcontainers is taken at the BOM-managed 1.19.8 rather than the siblings' 1.20.4
+             (backend/account) or 1.21.3 (backend/trade-history/pom.xml:L200-L217) so that a single BOM
+             is the sole version authority for this module. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-testcontainers</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- MicroProfile REST Client stack, present only so the two verbatim test-tree copies of
+             backend/broker's CashAccountClient.java and CashAccount.java compile unmodified and can be
+             driven by RestClientBuilder. The copies exist precisely to avoid a Maven dependency on
+             broker's Liberty WAR module, which is a git submodule and must never be built from here. -->
+        <dependency>
+            <groupId>org.eclipse.microprofile.rest.client</groupId>
+            <artifactId>microprofile-rest-client-api</artifactId>
+            <version>${microprofile.rest.client.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>jakarta.ws.rs</groupId>
+            <artifactId>jakarta.ws.rs-api</artifactId>
+            <version>${jakarta.ws.rs.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <!-- @ApplicationScoped on the copied interface; matches
+             backend/trade-history/pom.xml:L240-L245, narrowed to test scope because this module has no
+             CDI container. -->
+        <dependency>
+            <groupId>jakarta.enterprise</groupId>
+            <artifactId>jakarta.enterprise.cdi-api</artifactId>
+            <version>${jakarta.cdi.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <!-- SpanKind on the copied interface; BOM-managed (1.38.0). -->
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-api</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- @WithSpan on the copied interface. 2.4.0 declares opentelemetry-api 1.38.0, which is the
+             BOM-managed version above, so the two stay aligned; broker obtains both transitively through
+             microprofile-telemetry-api, so this direct coordinate is new to the estate. -->
+        <dependency>
+            <groupId>io.opentelemetry.instrumentation</groupId>
+            <artifactId>opentelemetry-instrumentation-annotations</artifactId>
+            <version>${otel.instrumentation.annotations.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.jboss.resteasy.microprofile</groupId>
+            <artifactId>microprofile-rest-client</artifactId>
+            <version>${resteasy.microprofile.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.jboss.resteasy</groupId>
+            <artifactId>resteasy-client</artifactId>
+            <version>${resteasy.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.jboss.resteasy</groupId>
+            <artifactId>resteasy-json-binding-provider</artifactId>
+            <version>${resteasy.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.johnzon</groupId>
+            <artifactId>johnzon-jsonb</artifactId>
+            <version>${johnzon.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.eclipse.microprofile.config</groupId>
+            <artifactId>microprofile-config-api</artifactId>
+            <version>${microprofile.config.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.smallrye.config</groupId>
+            <artifactId>smallrye-config</artifactId>
+            <version>${smallrye.config.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!-- Version stated explicitly so it can never drift from the parent above. The repackage
+                 goal produces the single executable jar the Dockerfile copies to /deployments/app.jar
+                 and that the migration tooling runs with "java -jar" under the "tool" profile. -->
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <version>3.3.13</version>
+                <executions>
+                    <execution>
+                        <id>repackage</id>
+                        <goals>
+                            <goal>repackage</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+            <!-- Parent-managed version accepted on purpose: backend/portfolio/pom.xml:L150-L153 pins
+                 3.14.0, but overriding a BOM-managed plugin here would give this module a second version
+                 authority for no benefit. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <release>${maven.compiler.release}</release>
+                </configuration>
+            </plugin>
+            <!-- Unit tests are *Test and integration tests are *IT; the split is stated explicitly on
+                 both plugins so an *IT can never be executed by Surefire before its PostgreSQL container
+                 exists. cashaccount.module.basedir is required because CashAccountClientDriftTest
+                 resolves broker's sources relative to the module directory and
+                 CharacterizationDocPresentTest reads docs/legacy-characterization.md from it; the
+                 working directory of a forked test JVM is not a reliable substitute. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <includes>
+                        <include>**/*Test.java</include>
+                        <include>**/*Tests.java</include>
+                    </includes>
+                    <systemPropertyVariables>
+                        <cashaccount.module.basedir>${project.basedir}</cashaccount.module.basedir>
+                    </systemPropertyVariables>
+                </configuration>
+            </plugin>
+            <!-- Failsafe's goals are stated explicitly because it contributes nothing to "package": the
+                 module's gate is "./mvnw -B clean verify", the only phase that runs the integration
+                 tests and then asserts their results. The execution id is the inherited "default" on
+                 purpose - a new id would ADD a second execution alongside the one the Spring Boot
+                 parent already binds, and the integration suite would be scheduled twice. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-failsafe-plugin</artifactId>
+                <configuration>
+                    <includes>
+                        <include>**/*IT.java</include>
+                    </includes>
+                    <systemPropertyVariables>
+                        <cashaccount.module.basedir>${project.basedir}</cashaccount.module.basedir>
+                    </systemPropertyVariables>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>default</id>
+                        <goals>
+                            <goal>integration-test</goal>
+                            <goal>verify</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>
