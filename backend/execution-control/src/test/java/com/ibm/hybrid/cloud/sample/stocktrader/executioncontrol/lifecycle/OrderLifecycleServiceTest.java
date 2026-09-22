@@ -447,8 +447,10 @@ public class OrderLifecycleServiceTest {
     void testResultingPositionBeyondTheLongShareRangeIsRefused() {
         /* Reachable only where an operator has configured ceilings high enough to permit a position
            no long can hold. Arithmetic past the long range wraps: the stored quantity would flip
-           sign and shrink, so the holding would read as a different position than it is. The request
-           is refused inside the store's compute step, so the holding is left exactly as it was. */
+           sign and shrink, so the holding would read as a different position than it is. The
+           request is refused in validation, against the holding as it stands, so it leaves behind
+           neither a stored order nor a spent idempotency key - which is what lets the corrected
+           retry below carry the very same clientOrderId. */
         ControlLimits permissive = new ControlLimits(new BigDecimal("1E+30"),
                 new BigDecimal("1E+30"), new BigDecimal("1E+30"), RESTRICTED_SYMBOLS,
                 EXCEPTION_SLA_HOURS);
@@ -470,8 +472,34 @@ public class OrderLifecycleServiceTest {
 
         assertEquals(Long.MAX_VALUE, referenceData.findPosition("INST-001", "SYNC").getQuantity(),
                 "the refused fill leaves the holding exactly as it was");
-        assertEquals(OrderStatus.SUBMITTED, orderStore.list().get(0).getStatus(),
-                "the order stops at SUBMITTED: no fill, no acceptance and no execution happened");
+        assertEquals(0, orderStore.count(),
+                "a share count no long can hold is refused before any order is stored");
+        assertTrue(auditTimeline.all().isEmpty(),
+                "a refusal that stored no order has no state change to record");
+
+        /* Why the refusal has to precede the reservation: the caller corrects the request and
+           retries under the same key, instead of meeting a 409 on a key held by an order that no
+           transition could ever move off SUBMITTED. A sell of this holding is representable, so
+           the retry is judged by the configured controls like any other order. */
+        Order corrected = unbounded.submit(
+                request("API-016", "INST-001", "SYNC", "SELL", 5L, "0.01"), ACTOR);
+
+        assertEquals(OrderStatus.EXECUTED, corrected.getStatus(),
+                "the corrected retry of a refused clientOrderId must be admitted and filled");
+        assertEquals(Long.MAX_VALUE - 5L,
+                referenceData.findPosition("INST-001", "SYNC").getQuantity(),
+                "the corrected sell is the only movement the holding takes");
+
+        /* The other half of that ordering: identity is settled before admission, so once a key
+           belongs to a stored order a repeat of it is a conflict whatever the range check would
+           have said about it - this buy of 10 would carry the holding past Long.MAX_VALUE, and the
+           caller still has to be told the key is taken rather than that the quantity is wrong. */
+        StateConflictException repeated = assertThrows(StateConflictException.class,
+                () -> unbounded.submit(request("API-016", "INST-001", "SYNC", "BUY", 10L, "0.01"),
+                        ACTOR),
+                "a repeat clientOrderId must be a conflict, not a validation failure");
+        assertTrue(repeated.getMessage().contains("API-016"),
+                "the conflict must name the clientOrderId: " + repeated.getMessage());
 
         /* Math.abs(Long.MIN_VALUE) is itself negative, so deriving a notional through it yields a
            negative figure that sits below every positive ceiling however large the exposure. Exact
@@ -1032,13 +1060,108 @@ public class OrderLifecycleServiceTest {
                         .filter(order -> order.getStatus() == OrderStatus.EXECUTED).count(),
                 "exactly one of the eight submissions filled and executed");
         for (Order order : orderStore.list()) {
-            //A submission refused inside the fill step stops at SUBMITTED, exactly where a fill
-            //refused by the resulting-share-range check stops: no fill, no acceptance, no
-            //execution, and the position it could not open was never created.
+            //A submission refused inside the fill step stops at SUBMITTED: no fill, no acceptance,
+            //no execution, and the position it could not open was never created. This is the one
+            //refusal decided after the order is stored, because only the claim inside the compute
+            //can settle which contender gets the last free slot.
             assertTrue(order.getStatus() == OrderStatus.EXECUTED
                             || order.getStatus() == OrderStatus.SUBMITTED,
                     "a refused first fill must rest at SUBMITTED, not at " + order.getStatus());
         }
+    }
+
+    @Test
+    void testConcurrentSubmissionsNeverStoreAnOrderBeyondTheShareRange()
+            throws InterruptedException {
+        /* The race the per-holding lock exists for: eight orders of one client and symbol whose
+           resulting share counts cannot all be represented. Whichever wins the holding carries it
+           to Long.MAX_VALUE and every other contender is then unrepresentable, so the assertion
+           that matters is that such a refusal never leaves an order resting at SUBMITTED - the
+           representability check and the fill it admits are one indivisible step per holding, so a
+           contender cannot pass the check against a holding another submission then moves. */
+        ControlLimits permissive = new ControlLimits(new BigDecimal("1E+30"),
+                new BigDecimal("1E+30"), new BigDecimal("1E+30"), RESTRICTED_SYMBOLS,
+                EXCEPTION_SLA_HOURS);
+        OrderLifecycleService unbounded = new OrderLifecycleService(orderStore, referenceData,
+                new PreTradeControlService(permissive),
+                new PostTradeService(orderStore, new SettlementExceptionStore(), referenceData,
+                        auditTimeline, FIXED_CLOCK, permissive),
+                auditTimeline, FIXED_CLOCK);
+
+        referenceData.putPosition(new Position("INST-001", "SYNC", Long.MAX_VALUE - 5L,
+                new BigDecimal("0.01")));
+
+        Queue<Throwable> failures = new ConcurrentLinkedQueue<>();
+        CountDownLatch ready = new CountDownLatch(DUPLICATE_SUBMITTERS);
+        CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch finished = new CountDownLatch(DUPLICATE_SUBMITTERS);
+        ExecutorService submitters = Executors.newFixedThreadPool(DUPLICATE_SUBMITTERS);
+
+        try {
+            for (int submitter = 0; submitter < DUPLICATE_SUBMITTERS; submitter++) {
+                //Eight distinct keys, so idempotency refuses none of them: every refusal below is
+                //the share range speaking, which is what this test is about.
+                String clientOrderId = "API-RACE-" + submitter;
+                submitters.execute(() -> {
+                    try {
+                        ready.countDown();
+                        release.await();
+                        unbounded.submit(request(clientOrderId, "INST-001", "SYNC", "BUY", 5L,
+                                "0.01"), ACTOR);
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        failures.add(interrupted);
+                    } catch (RuntimeException refused) {
+                        failures.add(refused);
+                    } finally {
+                        finished.countDown();
+                    }
+                });
+            }
+
+            assertTrue(ready.await(LATCH_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+                    "every submitter must reach the gate before it opens");
+            release.countDown();
+            assertTrue(finished.await(LATCH_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+                    "every submitter must finish inside the timeout");
+        } finally {
+            submitters.shutdown();
+        }
+
+        assertTrue(submitters.awaitTermination(LATCH_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+                "the executor must terminate rather than leave a thread running");
+
+        assertEquals(DUPLICATE_SUBMITTERS - 1, failures.size(),
+                "seven of eight submissions must be refused, saw " + failures);
+        for (Throwable failure : failures) {
+            assertTrue(failure instanceof ValidationException,
+                    "a share count beyond the long range is a bad request, not " + failure);
+        }
+
+        assertEquals(1, orderStore.count(),
+                "a refusal at the share range stores no order, so only the winner's is held");
+        assertEquals(OrderStatus.EXECUTED, orderStore.list().get(0).getStatus(),
+                "the one stored order is the fill that won the holding, never a stalled SUBMITTED");
+        assertEquals(Long.MAX_VALUE, referenceData.findPosition("INST-001", "SYNC").getQuantity(),
+                "exactly one of the eight fills applied");
+        assertEquals(5, auditTimeline.all().size(),
+                "only the winner's five events were written, so no refusal recorded a transition");
+
+        //A key the range check refused was never reserved, so its owner can correct the request
+        //and resubmit - the seven losers here hold no key between them.
+        String refusedKey = null;
+        for (int submitter = 0; submitter < DUPLICATE_SUBMITTERS && refusedKey == null; submitter++) {
+            String candidate = "API-RACE-" + submitter;
+            if (orderStore.findByClientOrderId(candidate) == null) {
+                refusedKey = candidate;
+            }
+        }
+
+        assertNotNull(refusedKey, "seven of the eight keys must belong to no order");
+        assertEquals(OrderStatus.EXECUTED,
+                unbounded.submit(request(refusedKey, "INST-001", "SYNC", "SELL", 5L, "0.01"), ACTOR)
+                        .getStatus(),
+                "a refused contender's key is free, so its corrected retry is admitted and fills");
     }
 
     @Test
@@ -1075,16 +1198,20 @@ public class OrderLifecycleServiceTest {
 
     /* The same synthetic reference data SeedDataLoader writes at startup, including INST-003's
        deliberately unequal counterparty safekeeping account - the module's only SSI mismatch, and
-       therefore the only client whose executions open a settlement exception. */
-    private static void seedReferenceData(ReferenceDataStore store) {
-        SettlementInstruction northwind =
-                new SettlementInstruction("SYNTGB2LXXX", "SAFE-NW-0001", "CASH-NW-0001", "XLON");
-        store.putClient(
-                new ClientAccount("INST-001", "Northwind Asset Management", northwind, northwind));
+       therefore the only client whose executions open a settlement exception.
 
-        SettlementInstruction contoso =
-                new SettlementInstruction("SYNTUS33XXX", "SAFE-CP-0002", "CASH-CP-0002", "XNYS");
-        store.putClient(new ClientAccount("INST-002", "Contoso Pension Trust", contoso, contoso));
+       Each agreeing client gets two separately constructed instructions carrying equal field
+       values, six instances in all, as SeedDataLoader does. Handing one instance to both sides
+       would let an affirmation that compared instruction references rather than their fields pass
+       these fixtures, and reference equality is not what the settlement contract means. */
+    private static void seedReferenceData(ReferenceDataStore store) {
+        store.putClient(new ClientAccount("INST-001", "Northwind Asset Management",
+                new SettlementInstruction("SYNTGB2LXXX", "SAFE-NW-0001", "CASH-NW-0001", "XLON"),
+                new SettlementInstruction("SYNTGB2LXXX", "SAFE-NW-0001", "CASH-NW-0001", "XLON")));
+
+        store.putClient(new ClientAccount("INST-002", "Contoso Pension Trust",
+                new SettlementInstruction("SYNTUS33XXX", "SAFE-CP-0002", "CASH-CP-0002", "XNYS"),
+                new SettlementInstruction("SYNTUS33XXX", "SAFE-CP-0002", "CASH-CP-0002", "XNYS")));
 
         store.putClient(new ClientAccount("INST-003", "Fabrikam Capital Partners",
                 new SettlementInstruction("SYNTDEFFXXX", "SAFE-FB-0003", "CASH-FB-0003", "XETR"),

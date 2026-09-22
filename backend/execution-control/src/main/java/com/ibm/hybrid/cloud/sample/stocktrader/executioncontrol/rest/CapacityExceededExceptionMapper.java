@@ -29,8 +29,8 @@ import jakarta.ws.rs.ext.ExceptionMapper;
 import jakarta.ws.rs.ext.Provider;
 
 
-@Provider
 /** Turns an exhausted in-memory admission capacity into an HTTP 503 with an ErrorResponse body. */
+@Provider
 public class CapacityExceededExceptionMapper implements ExceptionMapper<CapacityExceededException> {
 	@Context private UriInfo uriInfo;
 

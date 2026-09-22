@@ -368,6 +368,29 @@ class OrderSubmissionIT {
         }
     }
 
+    @Test
+    void testMalformedRequestBodyIsRejected() {
+        /* Raw body text, never orderBody(): the JSON-P builder cannot express truncated JSON, a
+           payload that is not JSON at all, an empty entity, a string where a number belongs, a
+           number JSON-P itself refuses to hold, or an array where the object belongs - and those are
+           precisely the bodies that fail inside the deserializer, before the service's own
+           validation is ever reached. They must answer 400 like any other unusable request, and the
+           refusal must describe none of how the deserializer failed. */
+        assertMalformedBodyRejected("{\"clientOrderId\":");
+        assertMalformedBodyRejected("not json at all");
+        assertMalformedBodyRejected("");
+        //A fresh key in the two well-formed-JSON shapes below, for the reason the invalid-field
+        //tests use one: a reused key that got as far as being reserved would answer 409 and mask
+        //the 400 under test.
+        assertMalformedBodyRejected("{\"clientOrderId\":\"" + uniqueClientOrderId() + "\",\"clientId\":\""
+                + CLIENT_ID + "\",\"symbol\":\"" + SYMBOL + "\",\"side\":\"" + BUY
+                + "\",\"quantity\":\"abc\",\"limitPrice\":" + LIMIT_PRICE + "}");
+        assertMalformedBodyRejected("{\"clientOrderId\":\"" + uniqueClientOrderId() + "\",\"clientId\":\""
+                + CLIENT_ID + "\",\"symbol\":\"" + SYMBOL + "\",\"side\":\"" + BUY
+                + "\",\"quantity\":100,\"limitPrice\":1e99999999999999999}");
+        assertMalformedBodyRejected("[1,2,3]");
+    }
+
     //One POST, one set of assertions: the four invalid bodies differ only in the field they spoil,
     //and a shared assertion keeps that the only difference between them.
     private static void assertBadRequest(String jsonBody, String expectedField) {
@@ -381,6 +404,37 @@ class OrderSubmissionIT {
                 "ErrorResponse status did not repeat the HTTP status: " + result.body);
         Assertions.assertTrue(error.getString("message", "").contains(expectedField),
                 "The 400 did not name the offending field " + expectedField + ": " + result.body);
+    }
+
+    /* Separate from assertBadRequest rather than a parameter of it: that helper asserts the refusal
+       NAMES the offending field, while an unreadable body has no field to name - the deserializer
+       failed before any field existed - so the message here is one fixed string, and the assertions
+       below are the opposite ones. Every body is reported back in the failure text, since the six
+       shapes fail for six different reasons inside the deserializer. */
+    private static void assertMalformedBodyRejected(String rawBody) {
+        String posted = "malformed body [" + rawBody + "]";
+        RestResult result = post(ORDERS_URL, rawBody);
+
+        Assertions.assertEquals(400, result.status, posted + " must answer 400: " + result.body);
+
+        JsonObject error = readObject(result);
+        Assertions.assertEquals(400, error.getInt("status"),
+                "ErrorResponse status did not repeat the HTTP status for " + posted + ": " + result.body);
+        Assertions.assertEquals("request body is not valid JSON", error.getString("message", ""),
+                posted + " did not answer the fixed malformed-body message: " + result.body);
+        assertNonBlank(error, "path", posted);
+
+        /* The reason the mapping exists: the deserializer's own text names the property it could not
+           fill, the Java type it could not fill it with and - for a body of the wrong JSON shape -
+           this application's own request class, and a 500 carrying any of that hands a caller the
+           service's internals (CWE-209). Asserted on the whole response body, not just the message,
+           so a leak through any other field of the error would fail here too. */
+        String[] internalTextMarkers = {"Internal error", "deserialize", "java.lang", "java.math",
+                "com.ibm.hybrid", "Yasson"};
+        for (String marker : internalTextMarkers) {
+            Assertions.assertFalse(result.body.contains(marker),
+                    posted + " leaked internal text (" + marker + "): " + result.body);
+        }
     }
 
     /* A fresh key per submission: the four IT classes run against one long-lived server and Failsafe

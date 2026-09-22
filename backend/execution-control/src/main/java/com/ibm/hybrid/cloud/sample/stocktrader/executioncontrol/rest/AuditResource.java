@@ -41,10 +41,10 @@ import jakarta.ws.rs.core.MediaType;
 //POST, PUT and DELETE are covered there for StockTrader on every path, so an attempt at one clears
 //security and is then answered 405 by this GET-only resource, while HEAD, OPTIONS, PATCH and TRACE
 //are covered nowhere and get 403 from deny-uncovered-http-methods.
+/** Read view over the whole append-only audit timeline, optionally narrowed to one entity. */
 @Path("/audit")
 @Produces(MediaType.APPLICATION_JSON)
 @ApplicationScoped
-/** Read view over the whole append-only audit timeline, optionally narrowed to one entity. */
 public class AuditResource {
 	@Inject private AuditTimeline auditTimeline;
 

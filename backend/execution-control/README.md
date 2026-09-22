@@ -164,19 +164,26 @@ bodies are JSON.
 | # | Endpoint | Method | Roles | Success | Returns |
 | --- | --- | --- | --- | --- | --- |
 | 1 | `/orders` | POST | `StockTrader` | 201 | the submitted order in its terminal state, with all four control results |
-| 2 | `/orders` | GET | `StockViewer`, `StockTrader` | 200 | every order, seeded and live |
+| 2 | `/orders` | GET | `StockViewer`, `StockTrader` | 200 | one page of orders, seeded and live |
 | 3 | `/orders/{orderId}` | GET | `StockViewer`, `StockTrader` | 200 | one order |
 | 4 | `/orders/{orderId}/events` | GET | `StockViewer`, `StockTrader` | 200 | that order's `ORDER` and `POST_TRADE` audit events, in `sequence` order |
-| 5 | `/exceptions` | GET | `StockViewer`, `StockTrader` | 200 | settlement exceptions, optionally filtered by `status` and `owner` |
+| 5 | `/exceptions` | GET | `StockViewer`, `StockTrader` | 200 | one page of settlement exceptions, optionally filtered by `status` and `owner` |
 | 6 | `/exceptions/{exceptionId}` | GET | `StockViewer`, `StockTrader` | 200 | one settlement exception |
-| 7 | `/exceptions/{exceptionId}/events` | GET | `StockViewer`, `StockTrader` | 200 | that exception's `EXCEPTION` audit events |
+| 7 | `/exceptions/{exceptionId}/events` | GET | `StockViewer`, `StockTrader` | 200 | one page of that exception's `EXCEPTION` audit events |
 | 8 | `/exceptions/{exceptionId}/assign` | PUT | `StockTrader` | 200 | the exception, now `ASSIGNED` to the owner in the body |
 | 9 | `/exceptions/{exceptionId}/resolve` | PUT | `StockTrader` | 200 | the exception, now `RESOLVED` with the resolution note |
 | 10 | `/exceptions/{exceptionId}/settlement-ready` | PUT | `StockTrader` | 200 | the exception, now `SETTLEMENT_READY`; the parent order follows |
-| 11 | `/audit` | GET | `StockViewer`, `StockTrader` | 200 | the whole audit timeline, optionally filtered by `entityType` and `entityId` |
+| 11 | `/audit` | GET | `StockViewer`, `StockTrader` | 200 | one page of the audit timeline, optionally filtered by `entityType` and `entityId` |
 | 12 | `/controls` | GET | `StockViewer`, `StockTrader` | 200 | the five effective control values as configuration supplied them, `source = CONFIG` |
 | 13 | `/clients` | GET | `StockViewer`, `StockTrader` | 200 | the three synthetic clients with both settlement instructions each |
-| 14 | `/positions` | GET | `StockViewer`, `StockTrader` | 200 | the synthetic positions, as executions have left them |
+| 14 | `/positions` | GET | `StockViewer`, `StockTrader` | 200 | one page of the synthetic positions, as executions have left them |
+
+The five rows that read *one page of* — 2, 5, 7, 11 and 14 — take `offset` and `limit` and serialize
+at most 500 records each, so none of them returns a complete collection by contract:
+[Paging the collection endpoints](#paging-the-collection-endpoints) is where the clamping rule, the
+traversal pattern and what a page deliberately does not tell you are set out. Rows 4
+(`/orders/{orderId}/events`) and 13 (`/clients`) are bounded by the domain instead and return
+everything they hold.
 
 Those fourteen handlers are the whole application surface. **Any other method on any path — `HEAD`,
 `OPTIONS`, `PATCH`, `TRACE` — is refused with `403`**, because `web.xml` covers `GET` on `/*` and
@@ -191,12 +198,18 @@ Query filters:
   `SETTLEMENT_READY`; `owner` matches the assigned owner. Both are optional.
 - `GET /audit?entityType=&entityId=` — `entityType` is `ORDER` or `EXCEPTION`. Both are optional;
   supplied together they return one entity's timeline.
+- `offset` and `limit` on each of the five paged collections — `GET /orders`, `GET /exceptions`,
+  `GET /exceptions/{exceptionId}/events`, `GET /audit` and `GET /positions`. Both are optional and
+  are clamped rather than refused, and a page holds at most 500 records; on `/exceptions` and
+  `/audit` the page is cut from the filtered set, so a `status`, `owner`, `entityType` or
+  `entityId` query pages its own matches. See
+  [Paging the collection endpoints](#paging-the-collection-endpoints).
 
 Request bodies: `POST /orders` takes `{clientOrderId, clientId, symbol, side, quantity, limitPrice}`
-— `side` is `BUY` or `SELL`, `quantity` and `limitPrice` must be positive, and `clientOrderId` is
-the idempotency key. `PUT …/assign` takes `{owner}`; `PUT …/resolve` takes
-`{owner, resolutionNote}` with `owner` optional once the exception is assigned;
-`PUT …/settlement-ready` takes no body.
+— `side` is `BUY` or `SELL`, `quantity` and `limitPrice` must be positive and inside the per-field
+bounds under [Field limits](#field-limits), and `clientOrderId` is the idempotency key.
+`PUT …/assign` takes `{owner}`; `PUT …/resolve` takes `{owner, resolutionNote}` with `owner`
+optional once the exception is assigned; `PUT …/settlement-ready` takes no body.
 
 `POST /orders` returns **`201` whether the terminal state is `EXECUTED` or `REJECTED`**, because the
 order resource exists and is retrievable either way. Read `status`, `rejectionReason` and
@@ -209,11 +222,18 @@ Status codes on failure:
 | No credentials presented | `401` |
 | Authenticated `StockViewer` on a mutating verb (POST/PUT) | `403` |
 | Validation failure — missing field, non-positive `quantity`/`limitPrice`, unknown `clientId`, blank `owner` or `resolutionNote` | `400` |
+| Request body that cannot be read as JSON — truncated or non-JSON text, an empty body, a field of the wrong JSON type, or an array where an object belongs | `400` |
 | Unknown order or exception id | `404` |
 | Duplicate `clientOrderId`, or an unsupported lifecycle transition | `409` |
+| An in-memory ceiling is exhausted, so a request that would otherwise have been accepted cannot be recorded | `503` |
 
 Every error body is `{status, error, message, path}`, with `message` naming the offending field,
-identifier or state.
+identifier or state — except for a body that could not be read, whose `message` is the fixed text
+`request body is not valid JSON`: the parser's own description names internal types and fields and
+is never relayed. The `503` is the one code the plan this module was built to does not list; it
+exists because the stores are bounded, it is decided last — after `400`, `404` and `409` — and it is
+described under [Admission capacity](#admission-capacity) and recorded under
+[Deviations from the frozen implementation plan](#deviations-from-the-frozen-implementation-plan).
 
 Both personas map to the `StockTrader` role — the trader who submits orders and the operations
 analyst who works exceptions alike — because the estate defines only `StockTrader` and
@@ -552,6 +572,11 @@ spec:
           # Post-trade exception ageing.
           - name: EXCEPTION_SLA_HOURS
             value: "24"
+        # A failed application start registers no check of this service at all. Startup and
+        # readiness then answer 503 with an empty `checks` array on this runtime, but liveness
+        # answers 200 UP with that same empty array - so liveness alone is not evidence the
+        # service works. See "A failed start and the empty check list" in the operational notes
+        # before treating these three as a hard gate.
         startupProbe:
           httpGet:
             path: /health/started
@@ -740,7 +765,9 @@ curl -k -u read:only https://localhost:9443/execution-control/orders
 ```
 
 The last call shows the read-only role at work; the same credentials on any `POST` or `PUT` answer
-`403`.
+`403`. On a freshly started service each of those collections fits in one response; on a service
+that has been worked, `/orders`, `/positions` and `/audit` return their first 500 records only, and
+[Paging the collection endpoints](#paging-the-collection-endpoints) is how you read the rest.
 
 ## Seeded synthetic data
 
@@ -820,6 +847,76 @@ containing `StockTrader` or `StockViewer`. Re-adding the `ALL_AUTHENTICATED_USER
 **not** offered as a remedy: it would grant every authenticated caller `StockTrader` and defeat the
 restriction of the mutating verbs that this service requires.
 
+### A failed start and the empty check list
+
+The three health checks are CDI beans, so they exist only if the application started. If it did not
+— a throw inside the seed observer that runs at `@Initialized(ApplicationScoped.class)`, or any
+deployment failure that stops the WAR being installed — **no check of this service is registered**,
+and what each probe answers is then the runtime's decision rather than this service's. Measured on
+the delivered runtime (Open Liberty 26.0.0.9, `mpHealth-4.0`) with the application deliberately not
+installed:
+
+| Probe | No application started | Service healthy |
+| --- | --- | --- |
+| `/health/started` | `503` `{"status":"DOWN","checks":[]}` | `200`, one `ExecutionControl` check, `"message":"Started"` |
+| `/health/ready` | `503` `{"status":"DOWN","checks":[]}` | `200`, one `ExecutionControl` check, `"message":"Ready"` with `jwtAudience` and `jwtIssuer` |
+| `/health/live` | **`200` `{"status":"UP","checks":[]}`** | `200`, one `ExecutionControl` check, `"message":"Live"` with the store counts |
+
+Readiness and startup fail closed there, but **not** because of the probes in this module: they are
+`DOWN` because Liberty contributes the application's own start state to those two endpoints. That is
+a runtime default this service neither owns nor can assert in its own tests. Liveness gets no such
+contribution, and MicroProfile Health's outcome with no registered check is an overall `UP` — so a
+pod whose application never installed still answers liveness `200 UP`. Read liveness alone as
+evidence the service works and you will route traffic to a pod where every call under
+`/execution-control` answers `404`.
+
+**Read the `checks` array, not only the status.** A healthy answer names this service, and that name
+is the thing worth asserting on:
+
+```json
+{"status":"UP","checks":[{"name":"ExecutionControl","status":"UP","data":{"message":"Ready","jwtAudience":"stock-trader","jwtIssuer":"http://stock-trader.ibm.com"}}]}
+```
+
+An empty `checks` array on any of the three is therefore the signature of a start that never
+completed — whatever status sits beside it — and it is distinct from a service that started and is
+still seeding, which registers its check and reports `DOWN` with
+`"message": "Seed data not yet loaded"`. The server log holds the cause the probe cannot report: a
+successful deployment logs `CWWKZ0001I: Application ExecutionControl started`, and in its place sits
+the `CWWKZ` message that names the failure — `CWWKZ0014W` when the WAR is not at the location
+`server.xml` names, `CWWKZ0021E` when it is there but cannot be started.
+
+A hard gate should not rest on that runtime default. Gating on an application path is what proves
+the application is installed, and the `httpGet` form cannot express it: under `AUTH_TYPE=basic` (and
+under `none`) every path below `/execution-control` answers `401` to the credential-free kubelet,
+and the kubelet counts only `2xx` and `3xx` as success. An `exec` probe can, because it reads the
+status code itself — `401` and `403` prove the application is deployed and enforcing, while `404`
+proves it is absent:
+
+```yaml
+        readinessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            - 'code=$(curl -sS --max-time 5 -o /dev/null -w "%{http_code}" http://localhost:9080/execution-control/controls) || exit 1; case "$code" in 200|401|403) exit 0 ;; *) exit 1 ;; esac'
+          periodSeconds: 15
+          timeoutSeconds: 5
+          failureThreshold: 3
+```
+
+Both halves of that command are load-bearing, and a shorter form fails open. `|| exit 1` is what
+makes a refused or timed-out connection a failure: `curl` writes the status text `000` and exits
+non-zero, and a predicate that only compared the text would pass a listener that never answered.
+The `case` whitelist is what keeps the gate hard: anything that is not the expected `200`, `401` or
+`403` — a `404` from an undeployed application, a `5xx` from a broken one, an empty `000` — fails
+rather than being read as "not a 404, so healthy". `timeoutSeconds` is raised because the kubelet
+allows an `exec` probe one second by default, less than `--max-time` needs.
+
+`curl` is present in the base image (`/usr/bin/curl`), so the probe needs nothing added to it. The
+manifest above ships the `httpGet` form because it is the contract the operator chart applies to
+every other StockTrader service; substitute the `exec` form when a deployment must never route to a
+pod whose application failed to install.
+
 ### Inherited demonstration security material
 
 The module carries copies of the estate's sample security material so that cross-service JWT
@@ -883,8 +980,11 @@ no order, no position movement, no exception and no timeline entry behind — a 
 indistinguishable from a request that was never sent. The one qualification is the race the
 position claim settles: where several first fills in *distinct* symbols contend for the last free
 slot, a loser that had already passed the gate is refused inside the fill step, so its order stops
-at `SUBMITTED` with its one submission event and no position is created — the same place a fill
-refused by the resulting-share-range check stops.
+at `SUBMITTED` with its one submission event and no position is created. Only a ceiling claim can
+put a refusal there, because a claim is taken inside the very step it guards and a contender the
+gate admitted can still lose it. The resulting-share-range check is not one of them: it and the
+fill it admits run inside one lock on that holding, so it is settled before the `clientOrderId` is
+reserved and before any order is stored, whatever else is submitting against the same holding.
 
 **Every ceiling is an atomic claim, so every one of them is exact.** Orders, exceptions and
 positions are claimed with a compare-and-set counter taken inside the step that would create the
@@ -913,9 +1013,10 @@ record from ever being the thing that refuses a state change.
 
 #### Field limits
 
-The same reasoning bounds what one request may store. These are semantic limits — what an
-identifier and a ticker are — and a value that crosses one answers `400 Bad Request` naming the
-field, before any identifier is reserved.
+The same reasoning bounds what one request may store. The text limits are semantic — what an
+identifier and a ticker are — and the two numeric limits are representation ceilings, the range this
+module can compute an amount in. A value that crosses any of them answers `400 Bad Request` naming
+the field, before any identifier is reserved.
 
 | Field | Limit |
 | --- | --- |
@@ -924,6 +1025,26 @@ field, before any identifier is reserved.
 | `symbol` | 12 characters, written in `A-Z`, `0-9`, `.` or `-` after canonicalization |
 | `owner` | 64 characters |
 | `resolutionNote` | 1024 characters |
+| `quantity` | a whole number of shares, greater than zero and at most `9223372036854775807` — the signed 64-bit range the JSON integer is read into. The client's resulting holding is held to that same range, so a quantity that would carry an existing position past it is refused too |
+| `limitPrice` | at most `1000000000000.00` per share, a whole number of cents, and inside the amount range every stored and rendered amount shares: at most 12 decimal places, 40 significant digits and a magnitude below `1E+38` |
+
+The order those two are checked in matters, because each refusal carries a different message. A
+price is refused as outside the amount range *before* it is converted to cents, since the
+conversion is the expansion the range exists to prevent: `1e200000000` is a dozen characters to
+send and a two-hundred-million-digit number to hold. So a compact exponent answers
+`limitPrice is outside the supported amount range (…)`, a representable price above the ceiling
+answers `limitPrice must not exceed 1000000000000.00`, and a price with a third decimal answers
+`limitPrice must be a whole number of cents` — never rounded, because rounding `0.001` to `0.00`
+would clear every configured notional ceiling and fill at no cost. The one-trillion ceiling is not a
+control: a price sitting on it is admitted and then judged by the configured pre-trade limits like
+any other. It exists so that this price multiplied by any admissible share count still lands inside
+the amount range above, which is what keeps a notional computable.
+
+`quantity` is the one field whose ceiling is not reported as a field violation at its very edge: a
+number beyond the signed 64-bit range is not an integer this field can hold at all, so it is refused
+while the body is being read — `400` with the fixed text `request body is not valid JSON` — rather
+than by the validation that names `quantity`. Everything inside that range — zero, a negative, or a
+value that would overflow the client's holding — is a field violation and names the field.
 
 Required text fields are checked with Java's `isBlank` and stored with `strip`, so a value made
 only of Unicode whitespace — `U+2003` EM SPACE, for instance — is refused as absent rather than
@@ -952,3 +1073,109 @@ zero, negative or above the maximum page size of **500** becomes 500. Ordering i
 endpoint already documented — order id, exception id, client then symbol, audit sequence — and it
 is established over the whole collection before the page is cut, so consecutive pages neither
 overlap nor skip a record.
+
+**What a page does not tell you — an accepted risk.** A page is the same bare JSON array the
+endpoint has always returned. It carries no total count, no next-offset and no `Link` header, so a
+caller holding 500 records cannot tell a collection that ends there from one that was truncated
+without asking for the next page. `GET /audit` is where that is most visible: it returns at most 500
+of a timeline that can hold 150,000 events, so reading the timeline in full is a traversal rather
+than one call.
+
+**Traversal by `offset` is the intended access pattern.** Walk it with an *effective* limit — a
+number from 1 to 500 — and step and compare against that same number, never against a larger one you
+asked for: a `limit` of 1000 is clamped to 500, and a walk that read 500 records and expected 1000
+would treat a full page as a short one and stop with the rest unread. Sending no `limit` at all is
+the same case, since an absent value is clamped to 500 too.
+
+Over a collection nothing is writing to, the walk is then exact: the ordering is established over
+the whole collection before the page is cut, so incrementing `offset` by the effective limit neither
+repeats nor misses a record, and the first page shorter than that limit — an empty page included —
+is the end. That short page is the termination condition; there is nothing else to consult.
+
+Under concurrent writes it is best-effort, because a page is a cut and not a snapshot. Orders,
+exceptions and audit events are ordered by monotonic identifier or sequence, so every new record
+lands *after* the cursor and a walk in progress picks it up on a later page. Positions are ordered
+by client and then symbol, so a first fill in a new symbol can insert a key *before* the cursor:
+that shifts everything after it one offset higher, which both repeats a record the walk already read
+and can leave the newly inserted key unvisited. Nothing is ever deleted, so no record that existed
+when the walk began can vanish from it — but a `/positions` walk over a service taking orders is not
+a consistent picture of any single instant, and a caller that needs one has to re-read from
+`offset=0` while nothing is filling.
+
+```bash
+# Read the whole timeline a page at a time. Stop at the first page shorter than the limit sent.
+OFFSET=0
+while :; do
+  PAGE=$(curl -k -s -u stock:trader \
+    "https://localhost:9443/execution-control/audit?offset=$OFFSET&limit=500")
+  COUNT=$(printf '%s' "$PAGE" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')
+  printf '%s\n' "$PAGE"          # …or hand the page to whatever consumes it
+  [ "$COUNT" -lt 500 ] && break
+  OFFSET=$((OFFSET + 500))
+done
+```
+
+No count-and-next-offset envelope is offered, and that is a decision rather than an omission:
+wrapping the records would change every collection response from an array into an object, breaking
+every existing caller and every example in this document, and it would widen an API surface whose
+paging parameters are themselves still awaiting ratification — see
+[Deviations from the frozen implementation plan](#deviations-from-the-frozen-implementation-plan).
+For a simulated, in-memory service whose whole estate is bounded at 150,000 events, the traversal
+above is sufficient and the missing metadata is accepted. A consumer that genuinely needs an exact
+total, or a stable cursor across concurrent writes, needs that envelope: raise it as an API change
+with the module owner rather than inferring a total by probing offsets.
+
+## Deviations from the frozen implementation plan
+
+The plan this module was built to is frozen, and it pins the Liberty release, two test dependencies,
+the HTTP perimeter, an exhaustive 71-file inventory and an exhaustive endpoint-and-status matrix.
+Eight delivered facts sit outside those pins. Every one of them came out of the module's security
+review, each is deliberate, and **none has been ratified by a plan owner** — so they are recorded
+here as ratification pending, with what reverting each one would cost. This register is the evidence
+for that decision, not the decision itself: ratifying a row is a human act, and until it happens the
+row's status is the one stated here.
+
+| # | What the plan pins | What is delivered instead | Where it lives | Why it diverges |
+| --- | --- | --- | --- | --- |
+| 1 | Liberty **25.0.0.9** as both the container base image and the integration-test assembly, the latter as `com.ibm.websphere.appserver.runtime:wlp-webProfile10` (§0.1.3, §0.3.1, §0.6.1, §0.8.1) | Liberty **26.0.0.9** in both: the digest-pinned base image `icr.io/appcafe/open-liberty:26.0.0.9-full-java21-openj9-ubi-minimal`, and the test assembly `io.openliberty:openliberty-runtime:26.0.0.9` | `Dockerfile` `FROM`; the `liberty-maven-plugin` `<assemblyArtifact>` in `pom.xml`; quoted in [Container](#container) and [Build and test](#build-and-test) | Liberty 17.0.0.3 through 26.0.0.7 sit inside the servlet request/response smuggling advisories **CVE-2026-15064** (CWE-444, inconsistent interpretation of HTTP requests, CVSS 3.1 **8.7 High**) and **CVE-2026-15325**; the fixes first ship in 26.0.0.8. The Web Profile assembly publishes no release past 26.0.0.4 — itself inside that range — so the full runtime assembly is the only way to hold the test server at the release the image runs |
+| 2 | `org.apache.cxf:cxf-rt-rs-client` **4.1.1** (§0.3.1) | **4.1.8**, test scope | `pom.xml` test dependencies | 4.1.1 brings `cxf-core` 4.1.1, affected by **CVE-2026-49875** / GHSA-gw93-jmqp-6572 (XXE, CWE-611) and fixed in 4.1.6 |
+| 3 | `org.eclipse.parsson:parsson` **1.1.7** (§0.3.1) | **1.1.9**, test scope | `pom.xml` test dependencies | **CVE-2026-9563**: 1.1.5 through 1.1.7 impose no JSON input-size limit (CWE-400) |
+| 4 | A single `httpEndpoint`, mirroring the broker's (§0.6.1) | Two endpoints, one per scheme, each with its own `<headers>` policy, plus `httpOptions removeServerHeader="true"` and `webContainer disableXPoweredBy="true"` | `src/main/liberty/config/server.xml`; described under [Standalone Kubernetes deployment](#standalone-kubernetes-deployment) | The mirrored endpoint advertised the server signature, `X-Powered-By` and `$WSEP` and set no `X-Content-Type-Options`, cache policy or HSTS (CWE-200, CWE-693). Liberty scopes a header policy to an endpoint and not to a scheme, so one endpoint serving both ports cannot assert HSTS to TLS clients alone — and RFC 6797 has a cleartext client ignore it |
+| 5 | An exhaustive 71-file inventory, with three typed lifecycle failures and three `ExceptionMapper`s (§0.2.3, §0.6.1) | 74 files: a fourth typed failure, a fourth mapper, and one package-private paging helper | `lifecycle/CapacityExceededException.java`, `rest/CapacityExceededExceptionMapper.java`, `rest/PageBounds.java` | The ceilings under [Admission capacity](#admission-capacity) need a refusal no existing mapper expresses, and one clamped page-bounds helper keeps the 500-record policy in a single place. Both answer CWE-770 / CWE-400 — unbounded growth in a process that evicts nothing |
+| 6 | The status matrix 201 and 200 on success, 400, 401, 403, 404 and 409 on failure (§0.7.1, §0.8.4) | The same, plus **`503 Service Unavailable`** for an exhausted ceiling | `rest/CapacityExceededExceptionMapper.java`; documented under [Admission capacity](#admission-capacity) | The same root cause as row 5. `503` rather than `429` because the exhausted ceiling belongs to the service and not to the caller, and it is decided after identity and legality, so no caller loses the `400`, `404` or `409` it earned |
+| 7 | Fourteen handlers whose only query parameters are `status`, `owner`, `entityType` and `entityId` (§0.7.1) | The same fourteen handlers, five of them additionally accepting optional `offset` and `limit` | `rest/{OrderResource,SettlementExceptionResource,AuditResource,ReferenceDataResource}.java`; documented under [Paging the collection endpoints](#paging-the-collection-endpoints) | A full read serialized the whole estate. The parameters are optional and clamped rather than validated, so a caller that sends neither sees exactly the body it saw before for any collection under 500 records |
+| 8 | The same 71-file inventory and its three `ExceptionMapper`s (§0.2.3, §0.6.1) | 76 files: two further mappers, `JsonbExceptionMapper` and `ProcessingExceptionMapper`, so a request body JSON-B cannot read answers `400` with the fixed text `request body is not valid JSON` instead of the runtime's default `500` carrying the deserializer's own message | `rest/JsonbExceptionMapper.java`, `rest/ProcessingExceptionMapper.java` | The plan's `400` for a bad request (§0.7.1) had no mapper behind it for a body that never reached validation, and the default answer named internal types and fields — CWE-209. `400` is already in the plan's status matrix, so this adds files, not a status |
+
+### What ratification does and does not decide
+
+Functionally these eight change nothing the plan specifies. The same three Liberty features are
+enabled, the ports, context root, WAR name and probe paths are unchanged, the fourteen handlers and
+their success codes are unchanged, and the module's own gate — unit tests, integration tests against
+a started Liberty server, and both line-coverage gates — is green on the delivered tree. Rows 1 to 4
+are a runtime and a perimeter the plan could not have named, because the advisories post-date it;
+rows 5 to 7 are the smallest surface that bounds a service holding all of its state in memory,
+and row 8 closes the one client-triggerable `500` the plan's status matrix never listed.
+
+**No row may be reverted to bring the code back to the plan.** Reverting row 1 returns the service
+to a Liberty release inside the smuggling-advisory range; rows 2 and 3 to a test client and parser
+with known CVEs; row 4 to advertising its product and version and asserting no content-type or cache
+policy over authenticated JSON; rows 5 to 7 to stores that grow until the heap is gone and
+collection reads that serialize everything they hold; row 8 to a malformed body answered `500`
+with the deserializer's text.
+
+What an owner has to settle is narrower than the list looks, because some rows are one decision:
+row 1 is a single runtime choice spanning the image and the test assembly, which must stay in step
+on every upgrade, and rows 5 and 6 are a single refusal design — the status is what the mapper
+exists to return. Declining a row is only sound if its replacement carries the same protection: for
+row 1 that means Liberty 26.0.0.8 or later whatever assembly it arrives in, for rows 5 to 7 an
+eviction policy or a datastore, never the removal of the ceilings, and for row 8 any mapper that
+answers the same fixed `400`.
+
+**Ratifying a row** means recording a decision against its number — accepted as a deviation from
+the plan, or accepted as an addition to the plan's file and API inventories for rows 5 to 8 — with
+the owner's name and the date, in whatever register governs the plan; the plan itself is frozen and
+is not edited to accommodate any of this. The rows are numbered so a decision can cite one without
+restating it, and a ratified row's status belongs here beside its number so this document and that
+decision cannot drift apart. Two facts an owner should have in hand when deciding: nothing in rows
+1 to 8 changes an interface a caller or another service depends on, and every one of them is
+exercised by the module's own gate, which is green on the delivered tree.

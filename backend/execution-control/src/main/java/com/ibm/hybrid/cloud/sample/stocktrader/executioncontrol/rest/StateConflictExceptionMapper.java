@@ -29,8 +29,8 @@ import jakarta.ws.rs.ext.ExceptionMapper;
 import jakarta.ws.rs.ext.Provider;
 
 
-@Provider
 /** Turns a conflicting request's StateConflictException into an HTTP 409 with an ErrorResponse body. */
+@Provider
 public class StateConflictExceptionMapper implements ExceptionMapper<StateConflictException> {
 	@Context private UriInfo uriInfo;
 

@@ -132,11 +132,11 @@ public class OrderLifecycleService {
 
         SubmittedOrder submitted = validate(request);
         requireUnsubmitted(submitted.clientOrderId);
-        requireCapacity(submitted);
-        String orderId = reserveOrderId(submitted.clientOrderId);
-        Order stored = insertSubmitted(submitted, orderId, actor, now, source);
 
-        List<ControlResult> results = evaluateAndFill(submitted, stored).getControlResults();
+        AdmittedOrder admitted = admit(submitted, actor, now, source);
+        List<ControlResult> results = admitted.controlResults;
+        String orderId = admitted.orderId;
+
         String rejectionReason = rejectionReason(results);
         if (!rejectionReason.isEmpty()) {
             return reject(orderId, results, rejectionReason, actor, now);
@@ -145,6 +145,27 @@ public class OrderLifecycleService {
         accept(orderId, results, actor, now);
 
         return postTrade.onExecuted(execute(orderId, submitted, actor, now), actor);
+    }
+
+    /* Every step whose outcome depends on the holding runs inside one lock on that holding, so the
+       range check below is authoritative rather than a reading a concurrent fill can invalidate:
+       no other submission of the same client and symbol can fill between the check and the fill it
+       admits, which is what keeps an order that cannot fill from ever being stored - refused here,
+       the submission leaves no order, no event and no reserved clientOrderId behind. The ACCEPTED
+       and EXECUTED transitions and the post-trade hand-off stay outside, so this lock never
+       encloses OrderStore.inOrderLock and the two acquisition orders cannot cross. */
+    private AdmittedOrder admit(SubmittedOrder submitted, String actor, Instant now,
+            RecordSource source) {
+        return referenceData.inPositionLock(submitted.clientId, submitted.symbol, () -> {
+            requireRepresentableResultingQuantity(submitted);
+            requireCapacity(submitted);
+
+            String orderId = reserveOrderId(submitted.clientOrderId);
+            Order stored = insertSubmitted(submitted, orderId, actor, now, source);
+
+            return new AdmittedOrder(orderId,
+                    evaluateAndFill(submitted, stored).getControlResults());
+        });
     }
 
     private SubmittedOrder validate(OrderRequest request) {
@@ -242,12 +263,12 @@ public class OrderLifecycleService {
         return cents;
     }
 
-    /* Asked before the capacity gates so a saturated service still answers the question the
-       caller actually asked: a repeat clientOrderId is a conflict whatever the ceilings hold, and
-       refusing it with 503 would invite a retry of a key that can never be accepted. This peek is
-       read-only and decides only which refusal is given - reserveClientOrderId's putIfAbsent
-       remains the authority, so two concurrent submissions of one key that both pass here still
-       leave exactly one order. */
+    /* Asked before every admission gate so a service that cannot admit this order still answers
+       the question the caller actually asked: a repeat clientOrderId is a conflict whatever the
+       ceilings hold and whatever the holding would allow, and refusing it with 503 or 400 would
+       invite the retry of a key that can never be accepted. This peek is read-only and decides
+       only which refusal is given - reserveClientOrderId's putIfAbsent remains the authority, so
+       two concurrent submissions of one key that both pass here still leave exactly one order. */
     private void requireUnsubmitted(String clientOrderId) {
         if (orderStore.findByClientOrderId(clientOrderId) != null) {
             throw duplicateClientOrderId(clientOrderId);
@@ -259,6 +280,25 @@ public class OrderLifecycleService {
     private static StateConflictException duplicateClientOrderId(String clientOrderId) {
         return new StateConflictException(
                 "clientOrderId " + clientOrderId + " has already been submitted");
+    }
+
+    /* Asked of the holding inside admit's lock, before the clientOrderId is reserved and before
+       any order is stored, because a share count no long can hold is a refusal the caller can
+       correct and resubmit: left to the fill alone it would answer 400 with the order already
+       stored as SUBMITTED, resting where no later transition can move it and holding its key
+       against the corrected retry, while every order has to reach REJECTED or EXECUTED. This
+       check reads state rather than the request alone, which is why it sits in admit and not in
+       validate - identity has to be settled before admission, so a repeat clientOrderId stays a
+       conflict whatever this check would have said about it. */
+    private void requireRepresentableResultingQuantity(SubmittedOrder submitted) {
+        submitted.resultingQuantity(existingQuantity(
+                referenceData.findPosition(submitted.clientId, submitted.symbol)));
+    }
+
+    //One reading of an absent holding for both the check above and the fill below - a client's
+    //first order in a symbol values at zero shares - so the two can never disagree on it.
+    private static long existingQuantity(Position position) {
+        return (position == null) ? 0L : position.getQuantity();
     }
 
     /* Every capacity this submission could consume is settled here, before the client order id is
@@ -329,15 +369,16 @@ public class OrderLifecycleService {
         /* Evaluating the controls and applying the fill are one atomic step per client and symbol:
            a second order in the same symbol has to be valued against the position the first one
            left behind rather than a stale copy, and a rejected order has to leave that position
-           exactly as it was. Nothing outside this operator reads or writes the position. */
+           exactly as it was. Nothing outside this operator writes the position or evaluates a
+           control against it; admit's representability check reads it under the same per-holding
+           lock this call runs inside, so the two can never see different holdings. */
         return referenceData.evaluateAndFill(submitted.clientId, submitted.symbol, position -> {
             List<ControlResult> outcomes = controls.evaluate(stored, position);
             if (!outcomes.stream().allMatch(ControlResult::isPassed)) {
                 return ReferenceDataStore.FillDecision.unchanged(outcomes);
             }
 
-            long resulting = submitted.resultingQuantity(
-                    (position == null) ? 0L : position.getQuantity());
+            long resulting = submitted.resultingQuantity(existingQuantity(position));
 
             return ReferenceDataStore.FillDecision.filled(new Position(submitted.clientId,
                     submitted.symbol, resulting, submitted.limitPrice), outcomes);
@@ -461,6 +502,17 @@ public class OrderLifecycleService {
         return order;
     }
 
+    /** One admitted order: the id it was stored under and the control results its fill produced */
+    private static final class AdmittedOrder {
+        private final String orderId;
+        private final List<ControlResult> controlResults;
+
+        private AdmittedOrder(String orderId, List<ControlResult> controlResults) {
+            this.orderId = orderId;
+            this.controlResults = controlResults;
+        }
+    }
+
     /** The validated, canonical form of one submit body */
     private static final class SubmittedOrder {
         //Every later step reads these fields instead of the request, so the stored order, the
@@ -486,8 +538,12 @@ public class OrderLifecycleService {
         /* Checked arithmetic, because the sum of a stored holding and an order quantity is the one
            value here that a caller can push past what a long holds. Wrapping it would store a
            position whose sign and magnitude are both wrong, so a share count that cannot be
-           represented is refused as a bad request instead - inside the store's compute step, which
-           leaves the position exactly as it was. */
+           represented is refused as a bad request instead. Admit asks this of the holding before it
+           stores anything, so the refusal costs the caller no order and no idempotency key; the
+           fill asks it again inside the store's compute, where it guards the value actually being
+           stored against any caller that reached the store without admit's lock, and throwing from
+           there leaves the position exactly as it was. One method, so both refuse on identical
+           terms and a caller cannot be told two different things about one order. */
         private long resultingQuantity(long existingQuantity) {
             try {
                 return BUY.equals(side)

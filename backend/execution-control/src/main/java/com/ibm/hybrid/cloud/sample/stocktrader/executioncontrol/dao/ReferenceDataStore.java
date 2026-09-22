@@ -36,7 +36,9 @@ import java.util.Objects;
 //Concurrency
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 //CDI 4.0
 import jakarta.enterprise.context.ApplicationScoped;
@@ -57,8 +59,15 @@ public class ReferenceDataStore {
     private static final Comparator<Position> BY_CLIENT_THEN_SYMBOL =
             Comparator.comparing(Position::getClientId).thenComparing(Position::getSymbol);
 
+    //A fixed stripe count, not one lock per holding: the table then cannot grow with the number of
+    //positions, and two holdings that happen to share a stripe contend only for the few
+    //microseconds one admission and fill hold it. Matches OrderStore's stripe count.
+    private static final int POSITION_LOCK_STRIPES = 64;
+
     private final ConcurrentHashMap<String, ClientAccount> clients = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Position> positions = new ConcurrentHashMap<>();
+
+    private final ReentrantLock[] positionLocks = createPositionLocks();
 
     /* Claims, not stored positions: a claim is taken inside the atomic step that would create the
        key and released if no position came of it, so this counter - never positions.size() - is
@@ -132,6 +141,35 @@ public class ReferenceDataStore {
         });
 
         return decided[0];
+    }
+
+    /* evaluateAndFill is atomic for one holding, which is all the fill itself needs. A submission
+       needs more than that: it has to decide, before it stores anything, whether the share count
+       this order would leave behind can be represented at all, and that decision is only sound if
+       no other fill of the same holding can land between the decision and the fill it admits.
+       This is the primitive that makes the pair indivisible per holding - a caller runs its whole
+       sequence in here - and, like OrderStore.inOrderLock, it is taken before any compute and
+       never from inside one, so the single lock order (this lock, then a map's own) admits no
+       cycle. Striped on the canonical key, so two holdings contend only when they share a stripe. */
+    public <T> T inPositionLock(String clientId, String symbol, Supplier<T> work) {
+        //floorMod rather than %: a negative hash gives a negative remainder and so an index
+        //outside the array, while floorMod always lands inside the stripe range.
+        ReentrantLock lock = positionLocks[Math.floorMod(
+                Objects.hashCode(positionKey(clientId, symbol)), POSITION_LOCK_STRIPES)];
+        lock.lock();
+        try {
+            return work.get();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private static ReentrantLock[] createPositionLocks() {
+        ReentrantLock[] locks = new ReentrantLock[POSITION_LOCK_STRIPES];
+        for (int stripe = 0; stripe < locks.length; stripe++) {
+            locks[stripe] = new ReentrantLock();
+        }
+        return locks;
     }
 
     //A compare-and-set loop rather than incrementAndGet followed by a test, as in

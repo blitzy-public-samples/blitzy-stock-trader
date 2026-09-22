@@ -998,13 +998,16 @@ public class PostTradeServiceTest {
     }
 
     private void seedClients() {
-        //One instruction instance on both sides is the clean-SSI case; INST-003 differs in
-        //safekeepingAccount alone, which is the only mismatch the seeded contract produces.
-        SettlementInstruction northwind = new SettlementInstruction(NORTHWIND_CUSTODIAN_BIC,
-                NORTHWIND_SAFEKEEPING_ACCOUNT, NORTHWIND_CASH_ACCOUNT,
-                NORTHWIND_PLACE_OF_SETTLEMENT);
-        referenceData.putClient(
-                new ClientAccount(NORTHWIND_ID, NORTHWIND_NAME, northwind, northwind));
+        /* The clean-SSI client carries two separately constructed instructions of equal field
+           values, as SeedDataLoader gives it: one shared instance would let an affirmation
+           comparing instruction references rather than their fields pass this fixture, and
+           reference equality is not what agreeing settlement instructions mean. INST-003 differs
+           in safekeepingAccount alone, which is the only mismatch the seeded contract produces. */
+        referenceData.putClient(new ClientAccount(NORTHWIND_ID, NORTHWIND_NAME,
+                new SettlementInstruction(NORTHWIND_CUSTODIAN_BIC, NORTHWIND_SAFEKEEPING_ACCOUNT,
+                        NORTHWIND_CASH_ACCOUNT, NORTHWIND_PLACE_OF_SETTLEMENT),
+                new SettlementInstruction(NORTHWIND_CUSTODIAN_BIC, NORTHWIND_SAFEKEEPING_ACCOUNT,
+                        NORTHWIND_CASH_ACCOUNT, NORTHWIND_PLACE_OF_SETTLEMENT)));
 
         referenceData.putClient(new ClientAccount(FABRIKAM_ID, FABRIKAM_NAME,
                 new SettlementInstruction(FABRIKAM_CUSTODIAN_BIC,

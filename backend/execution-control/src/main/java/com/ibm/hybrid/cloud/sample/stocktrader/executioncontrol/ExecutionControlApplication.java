@@ -29,9 +29,9 @@ import jakarta.ws.rs.core.Application;
 
 //MP-JWT is declared here rather than in web.xml's login-config, the choice the estate's own
 //descriptors record; web.xml is left to carry only the per-method role constraints.
+/** JAX-RS application root of the simulated institutional execution and post-trade control service. */
 @ApplicationPath("/")
 @LoginConfig(authMethod = "MP-JWT", realmName = "jwt-jaspi")
 @ApplicationScoped
-/** JAX-RS application root of the simulated institutional execution and post-trade control service. */
 public class ExecutionControlApplication extends Application {
 }

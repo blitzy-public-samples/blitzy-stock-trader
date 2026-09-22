@@ -49,10 +49,10 @@ import jakarta.ws.rs.core.SecurityContext;
 //authorized on entry. Authorization and dispatch are two stages: PUT and DELETE are covered for
 //StockTrader on every path, so they clear security and are then answered 405 here, while HEAD,
 //OPTIONS, PATCH and TRACE are covered nowhere and get 403 from deny-uncovered-http-methods.
+/** Submit surface for simulated institutional orders, plus the read views over one order and its audit timeline. */
 @Path("/orders")
 @Produces(MediaType.APPLICATION_JSON)
 @ApplicationScoped
-/** Submit surface for simulated institutional orders, plus the read views over one order and its audit timeline. */
 public class OrderResource {
 	@Inject private OrderLifecycleService orderLifecycleService;
 

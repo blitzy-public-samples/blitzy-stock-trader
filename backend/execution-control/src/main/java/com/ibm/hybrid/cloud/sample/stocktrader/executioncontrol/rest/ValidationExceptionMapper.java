@@ -29,8 +29,8 @@ import jakarta.ws.rs.ext.ExceptionMapper;
 import jakarta.ws.rs.ext.Provider;
 
 
-@Provider
 /** Turns a rejected request's ValidationException into an HTTP 400 with an ErrorResponse body. */
+@Provider
 public class ValidationExceptionMapper implements ExceptionMapper<ValidationException> {
 	@Context private UriInfo uriInfo;
 

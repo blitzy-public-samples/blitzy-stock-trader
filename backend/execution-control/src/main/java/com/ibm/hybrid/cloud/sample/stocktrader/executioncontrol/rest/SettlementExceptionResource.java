@@ -48,10 +48,10 @@ import jakarta.ws.rs.core.SecurityContext;
 //No role annotation here: web.xml is the estate's enforcement point, granting GET to both
 //StockViewer and StockTrader and every mutating verb to StockTrader alone, so the analyst
 //working an exception is already authorized by the time any method below is entered.
+/** Working surface for the simulated settlement-exception workflow: list, read, assign, resolve and mark settlement-ready. */
 @Path("/exceptions")
 @Produces(MediaType.APPLICATION_JSON)
 @ApplicationScoped
-/** Working surface for the simulated settlement-exception workflow: list, read, assign, resolve and mark settlement-ready. */
 public class SettlementExceptionResource {
 	@Inject private PostTradeService postTradeService;
 

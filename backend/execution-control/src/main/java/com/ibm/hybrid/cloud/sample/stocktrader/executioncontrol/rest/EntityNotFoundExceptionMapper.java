@@ -29,8 +29,8 @@ import jakarta.ws.rs.ext.ExceptionMapper;
 import jakarta.ws.rs.ext.Provider;
 
 
-@Provider
 /** Turns an identifier that names no stored entity into an HTTP 404 with an ErrorResponse body. */
+@Provider
 public class EntityNotFoundExceptionMapper implements ExceptionMapper<EntityNotFoundException> {
 	@Context private UriInfo uriInfo;
 
