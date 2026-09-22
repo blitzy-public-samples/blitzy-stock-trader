@@ -1,0 +1,84 @@
+/*
+       Copyright 2020-2021 IBM Corp, All Rights Reserved
+       Copyright 2022-2025 Kyndryl, All Rights Reserved
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+ */
+
+package com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.rest;
+
+import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.AuditEvent;
+import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.Order;
+import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json.OrderRequest;
+import com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.lifecycle.OrderLifecycleService;
+
+//Collections
+import java.util.List;
+
+//CDI 4.0
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+
+//Jakarta REST 3.1
+import jakarta.ws.rs.Consumes;
+import jakarta.ws.rs.GET;
+import jakarta.ws.rs.POST;
+import jakarta.ws.rs.Path;
+import jakarta.ws.rs.PathParam;
+import jakarta.ws.rs.Produces;
+import jakarta.ws.rs.core.Context;
+import jakarta.ws.rs.core.MediaType;
+import jakarta.ws.rs.core.Response;
+import jakarta.ws.rs.core.SecurityContext;
+
+
+//No role annotation here: web.xml is the estate's enforcement point, granting GET to both
+//StockViewer and StockTrader and POST to StockTrader alone, so the submitting trader is already
+//authorized by the time any method below is entered and every other verb is refused there by
+//deny-uncovered-http-methods.
+@Path("/orders")
+@Produces(MediaType.APPLICATION_JSON)
+@ApplicationScoped
+/** Submit surface for simulated institutional orders, plus the read views over one order and its audit timeline. */
+public class OrderResource {
+	@Inject private OrderLifecycleService orderLifecycleService;
+
+	@POST
+	@Consumes(MediaType.APPLICATION_JSON)
+	public Response submitOrder(OrderRequest orderRequest, @Context SecurityContext securityContext) {
+		Order order = orderLifecycleService.submit(orderRequest, securityContext.getUserPrincipal().getName());
+
+		//201 answers a REJECTED order exactly as it answers an EXECUTED one: the pre-trade verdict
+		//is recorded on an order that now exists, is retrievable at its own URL and carries its own
+		//audit timeline, so the creation succeeded. Reporting a control rejection as a 4xx would
+		//tell the caller its request was at fault and would disown the auditable record it made.
+		return Response.status(Response.Status.CREATED).entity(order).build();
+	}
+
+	@GET
+	public List<Order> getOrders() {
+		return orderLifecycleService.list();
+	}
+
+	@GET
+	@Path("/{orderId}")
+	public Order getOrder(@PathParam("orderId") String orderId) {
+		return orderLifecycleService.get(orderId);
+	}
+
+	@GET
+	@Path("/{orderId}/events")
+	public List<AuditEvent> getOrderEvents(@PathParam("orderId") String orderId) {
+		return orderLifecycleService.events(orderId);
+	}
+}
