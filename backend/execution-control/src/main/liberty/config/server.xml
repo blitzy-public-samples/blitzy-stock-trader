@@ -1,0 +1,65 @@
+<!--
+       Copyright 2020-2021 IBM Corp All Rights Reserved
+       Copyright 2022-2025 Kyndryl All Rights Reserved
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-->
+
+<server description="Execution Control server">
+    <!-- Two things the sibling services carry are deliberately absent, not overlooked: a
+         metrics element, whose feature is not part of the microProfile-7.1 umbrella and
+         so would be dead configuration, and an application binding granting every
+         authenticated caller the StockTrader role, which would make StockViewer
+         unenforceable and defeat web.xml's restriction of POST/PUT/DELETE. Roles resolve
+         instead from the token's groups claim, or from the basicRegistry groups of
+         includes/none.xml. Neither may be added back for the sake of parity. -->
+    <featureManager>
+        <feature>microProfile-7.1</feature>
+        <feature>mpTelemetry-2.1</feature>
+        <feature>appSecurity-5.0</feature>
+    </featureManager>
+
+    <variable name="TRACE_SPEC" defaultValue="*=info"/>
+
+    <logging traceSpecification="${TRACE_SPEC}" consoleLogLevel="INFO" />
+
+    <!-- The ports are variables rather than literals so the listener can be moved on a
+         shared host: the build sets liberty.var.default.http.port, which Liberty maps
+         onto the variable of exactly that name and Failsafe reuses as liberty.test.port,
+         so one -Dliberty.var.default.http.port moves the server and every integration
+         test's expectation together. Renaming either variable breaks that coupling. -->
+    <variable name="default.http.port" defaultValue="9080"/>
+    <variable name="default.https.port" defaultValue="9443"/>
+
+    <httpEndpoint httpPort="${default.http.port}" httpsPort="${default.https.port}" host="*" id="defaultHttpEndpoint"/>
+
+    <keyStore id="defaultKeyStore" password="St0ckTr@der" type="pkcs12"
+         location="${server.config.dir}/resources/security/key.p12" />
+
+    <keyStore id="defaultTrustStore" password="St0ckTr@der" type="pkcs12"
+         location="${server.config.dir}/resources/security/trust.p12" />
+
+    <ssl id="defaultSSLConfig" keyStoreRef="defaultKeyStore" trustStoreRef="defaultTrustStore" trustDefaultCerts="true" />
+
+    <variable name="AUTH_TYPE" defaultValue="basic"/>
+    <variable name="JWT_AUDIENCE" defaultValue="stock-trader"/>
+    <variable name="JWT_ISSUER" defaultValue="http://stock-trader.ibm.com"/>
+
+    <include optional="false" location="${server.config.dir}/includes/${AUTH_TYPE}.xml"/>
+
+    <ltpa expiration="1h"/>
+
+    <webApplication id="ExecutionControl" name="ExecutionControl" location="ExecutionControl.war" contextRoot="/execution-control">
+        <classloader apiTypeVisibility="+third-party"/>
+    </webApplication>
+</server>
