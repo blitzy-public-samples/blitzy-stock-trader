@@ -1,19 +1,3 @@
-/*
-       Copyright 2025 Kyndryl, All Rights Reserved
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
- */
-
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.persistence;
 
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.domain.LedgerEntry;
@@ -28,74 +12,45 @@ import java.util.Collection;
 import java.util.List;
 
 /** Data access to the append-only {@code ledger_entry} audit rows: one append path and three reads. */
-// WHY THE BARE Repository MARKER AND NOT JpaRepository. Spring Data's CRUD-derived base interfaces -
-// JpaRepository, CrudRepository, ListCrudRepository, PagingAndSortingRepository - each publish a mutating
-// API on every interface that extends them, and a Java interface cannot withdraw an inherited method: once
-// any of them is the base type, an UPDATE or a DELETE against ledger_entry is a compiling call away and the
-// only thing standing between a caller and a lost audit row is the database trigger. Repository is the empty
-// marker, whose documented purpose is exactly this - declare the operations the domain permits and no others
-// - so this type's whole surface is the four methods below, and the append-only shape is structural rather
-// than conventional. Declared methods are still served by SimpleJpaRepository, so save() behaves precisely
-// as it would on JpaRepository. The database-level half of the same invariant is the trigger
-// ledger_entry_immutable (BEFORE UPDATE OR DELETE, RAISE EXCEPTION) in
-// schema/cash-account-schema.sql:L194-L196; two guards of deliberately different kind, because one is
-// reviewable at compile time in this module and the other holds for every path that is not this code.
-//
-// WHY THE INVARIANT EARNS THAT REDUNDANCY. The trail this replaces was the write-only HISTORY KSDS, whose
-// EXEC CICS IGNORE CONDITION DUPREC ahead of its only WRITE
-// [backend/cash-account-cobol/COBOL/CASH00.cbl:L123-L131] discarded a second event for the same owner within
-// one second, silently and with no error to the caller - and nothing ever read the file back to notice. The
-// replacement is lossless and queryable, so a row that could be altered or discarded would not be a lesser
-// audit trail than the legacy one; it would be a worse one, because consumers now trust it.
 public interface LedgerEntryRepository extends Repository<LedgerEntry, Long> {
 
-    // INSERT-only by construction rather than by discipline, on three independent counts: entry_id is
-    // BIGINT GENERATED ALWAYS AS IDENTITY (schema/cash-account-schema.sql:L76) mapped
-    // GenerationType.IDENTITY, so an instance from LedgerEntry.of(...) carries a null identifier and is
-    // always transient - SimpleJpaRepository.save() therefore takes its persist() branch and never merge();
-    // every mapped column is updatable = false; and the entity publishes no mutator, leaving Hibernate's
-    // dirty check nothing it could ever flush as an UPDATE. The generic signature mirrors CrudRepository's
-    // own so the declaration binds to the implementation's method instead of being parsed as a derived
-    // query. The call joins the caller's transaction - audit/LedgerService appends inside it - which is what
-    // makes the row visible to the ledger query the instant that transaction commits; no flush, no separate
-    // transaction and no asynchronous hand-off belongs here or the guarantee becomes eventual.
+    // No update or delete method is exposed, and none may be added. The bare Repository marker is what makes
+    // that structural: the CRUD bases publish a mutating API on every interface that extends them, and a Java
+    // interface cannot withdraw an inherited method, so under any of them a DELETE against ledger_entry would
+    // be one compiling call away. The database half of the guard is the ledger_entry_immutable trigger
+    // (BEFORE UPDATE OR DELETE) in cash-account-schema.sql, which holds for every path that is not this code.
+    //
+    // The generic signature mirrors CrudRepository's own so the declaration binds to SimpleJpaRepository's
+    // method rather than being parsed as a derived query, and the append joins the caller's transaction,
+    // which is what makes the row visible the instant that transaction commits - a separate transaction or an
+    // asynchronous hand-off here would make the guarantee eventual.
     <S extends LedgerEntry> S save(S entry);
 
-    // Callers pass an UNSORTED Pageable - PageRequest.of(0, limit), the limit the controller has already
-    // bounded. A Sort carried on the Pageable is appended after this name-derived ordering rather than
-    // replacing it, so it cannot reorder the result, entry_id having already made the ordering total; what
-    // it does is add ORDER BY terms that idx_ledger_entry_owner_recorded_at
-    // (schema/cash-account-schema.sql:L159-L160) cannot serve, turning an index-ordered read into a sort of
-    // every matched row.
+    // Callers pass an UNSORTED Pageable: a Sort carried on it is appended after this name-derived ordering
+    // rather than replacing it, so it cannot reorder the result but does add terms
+    // idx_ledger_entry_owner_recorded_at cannot serve, turning an index-ordered read into a full sort.
     //
     // GreaterThanEqual, not GreaterThan: "since" is an inclusive lower bound, so a timestamp copied from a
     // row an earlier page returned yields that row again instead of silently skipping the event it was read
     // from. The entry_id tie-break is what a partial settlement needs - its SETTLEMENT and RELEASE rows are
-    // written in one transaction and can share recorded_at to the stored microsecond, and only the
-    // monotonic surrogate then gives them a stable newest-first order across repeated reads.
+    // written in one transaction and can share recorded_at to the stored microsecond, and only the monotonic
+    // surrogate then gives them a stable newest-first order across repeated reads.
     List<LedgerEntry> findByOwnerAndRecordedAtGreaterThanEqualOrderByRecordedAtDescEntryIdDesc(
             String owner, OffsetDateTime since, Pageable pageable);
 
     List<LedgerEntry> findByOwnerOrderByRecordedAtDescEntryIdDesc(String owner, Pageable pageable);
 
-    // The reconciler's question about a whole set of owners at once: which of them carry at least one ledger row
-    // and not one from any other source - the shape that says "this account was produced by a load and nothing
-    // has written to it since". Answering it by reading each owner's history is one query per owner, and every
-    // account the export does not name is a candidate, so a partial export against a large target turns a
-    // classification into O(N) reads of unbounded rows; the anti-join decides the whole set in one statement and
-    // returns owner names rather than entities, so nothing proportional to an owner's history is ever
-    // materialized. The caller passes the owners in bounded chunks, which is what keeps this statement's IN list
-    // - and its bind-parameter count - independent of how many accounts the target holds.
+    // Answers "produced by a load and untouched since" for a whole set of owners in one statement. Reading
+    // each owner's history instead is a query per owner, and every account the export does not name is a
+    // candidate, so a partial export against a large target would turn the classification into O(N) reads of
+    // unbounded rows; the anti-join returns owner names rather than entities, so nothing proportional to an
+    // owner's history is materialized. The caller passes the owners in bounded chunks, which keeps the IN
+    // list's bind-parameter count independent of how many accounts the target holds.
     //
-    // NOT EXISTS rather than an aggregate over sources: it can stop at the first disqualifying row of an owner,
-    // idx_ledger_entry_owner_recorded_at (schema/cash-account-schema.sql:L159-L160) serves both the outer scan
-    // and the correlated probe, and the predicate reads as the rule it implements. DISTINCT because an owner has
-    // one row per event and the answer is one row per owner.
-    //
-    // The query is declared rather than derived: no property path expresses "and no row of another source", and
-    // a declared @Query pre-empts derivation under the default CREATE_IF_NOT_FOUND lookup strategy, so the
-    // method name is free to state the rule. A read-only projection of a column, so it adds no mutating surface
-    // to this deliberately append-only interface.
+    // NOT EXISTS rather than an aggregate over sources, because it stops at an owner's first disqualifying
+    // row and idx_ledger_entry_owner_recorded_at serves both the outer scan and the correlated probe. The
+    // query is declared because no property path expresses "and no row of another source"; it projects one
+    // column read-only, so it adds no mutating surface to this deliberately append-only interface.
     @Query("select distinct entry.owner from LedgerEntry entry where entry.owner in :owners "
             + "and not exists (select other.entryId from LedgerEntry other "
             + "where other.owner = entry.owner and other.source <> :source)")

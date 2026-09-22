@@ -1,24 +1,10 @@
-/*
-       Copyright 2025 Kyndryl, All Rights Reserved
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
- */
-
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.config;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyFactory;
 import java.security.NoSuchAlgorithmException;
@@ -39,12 +25,16 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
-import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Condition;
+import org.springframework.context.annotation.ConditionContext;
+import org.springframework.context.annotation.Conditional;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.convert.converter.Converter;
+import org.springframework.core.env.Environment;
 import org.springframework.core.io.Resource;
 import org.springframework.core.io.ResourceLoader;
+import org.springframework.core.type.AnnotatedTypeMetadata;
 import org.springframework.security.core.GrantedAuthority;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.oauth2.core.DelegatingOAuth2TokenValidator;
@@ -62,20 +52,6 @@ import org.springframework.security.oauth2.jwt.MappedJwtClaimSetConverter;
 import org.springframework.security.oauth2.jwt.NimbusJwtDecoder;
 import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationConverter;
 
-// This service introduces no identity mechanism of its own; it verifies the token the estate already issues. Broker
-// forwards the caller's Authorization header to us verbatim - its client declares
-// org.eclipse.microprofile.rest.client.propagateHeaders=Authorization,Proxy-Authorization
-// [backend/broker/src/main/resources/META-INF/microprofile-config.properties:L1] - so the credential arriving here is
-// the same RS256 JWT that the trader minted and that broker itself validates: signed with the shared jwtSigner alias
-// and checked against the same issuer and audience [backend/broker/src/main/liberty/config/includes/basic.xml:L39-L40;
-// backend/broker/src/main/liberty/config/server.xml:L40-L42]. Re-authenticating the caller, or accepting a different
-// credential shape, would make cutover a change to every caller instead of a change to deployment values.
-//
-// The four modes are not an invention either: the siblings select their security configuration by including
-// includes/${AUTH_TYPE}.xml [backend/broker/src/main/liberty/config/server.xml:L44], and the include files that exist
-// are basic, ldap, oidc and none - which is exactly why those four values are supported and a fifth fails start-up.
-// basic and ldap share one branch here because they differ only in the user registry Liberty consults when ISSUING a
-// token; the token this service verifies is identical in both, so the key material is identical too.
 /** Verifies the estate's existing RS256 JWT and turns its {@code groups} claim into Spring Security authorities. */
 @Configuration
 public class JwtDecoderConfig {
@@ -108,23 +84,24 @@ public class JwtDecoderConfig {
 
     private static final String PUBLIC_KEY_PEM_FOOTER = "-----END PUBLIC KEY-----";
 
-    // Conditional rather than a bean that returns null, because auth-type=none means this service authenticates
-    // nothing at all and config/SecurityConfig therefore resolves the decoder through an optional dependency and
-    // configures no resource server in that mode. A null-returning @Bean would leave Spring with a bean definition it
-    // cannot satisfy; an absent definition is what SecurityConfig's optional lookup expects, so the two files must
-    // keep agreeing on this mechanism. @ConditionalOnProperty offers no not-equals, hence the expression; the
-    // :basic default mirrors application.yml and broker's own variable default so an unset AUTH_TYPE still
-    // authenticates. The converter bean below stays unconditional because SecurityConfig needs it in every mode.
+    // Conditional rather than a bean returning null: config/SecurityConfig resolves the decoder through an optional
+    // dependency and configures no resource server in none mode, so an absent definition is what its lookup
+    // expects. The Condition below decides that as text, which nothing about SecurityConfig's ObjectProvider lookup
+    // has to know; the converter bean further down stays unconditional because every authenticating mode needs it.
     @Bean
-    @ConditionalOnExpression("!'none'.equalsIgnoreCase('${" + AUTH_TYPE_PROPERTY + ":basic}'.trim())")
+    @Conditional(AuthenticatingModeCondition.class)
     public JwtDecoder jwtDecoder(CashAccountProperties properties, ResourceLoader resourceLoader) {
         CashAccountProperties.Security security = properties.getSecurity();
         CashAccountProperties.Jwt jwt = security.getJwt();
         String authType = security.getAuthType();
-        String mode = (authType == null) ? "" : authType.toLowerCase(Locale.ROOT);
+        // The same normalisation the condition applies, from the same helper: one definition of "the mode" is what
+        // keeps the bean's presence and the branch it takes from ever disagreeing about a value.
+        String mode = normalizedMode(authType);
 
         // Key material is read here, once, while the context starts: a per-request read would put file or network
         // I/O on the path of every authenticated call and would let a mid-flight edit change who can be trusted.
+        // basic and ldap share one branch because they differ only in the registry Liberty consults when ISSUING a
+        // token [backend/broker/src/main/liberty/config/includes/basic.xml:L39-L40], leaving the key material equal.
         NimbusJwtDecoder decoder = switch (mode) {
             case MODE_BASIC, MODE_LDAP -> NimbusJwtDecoder
                     .withPublicKey(signerPublicKey(resourceLoader, jwt.getPublicKeyLocation()))
@@ -144,6 +121,41 @@ public class JwtDecoderConfig {
         decoder.setJwtValidator(tokenValidator(jwt.getIssuer(), jwt.getAudience()));
         decoder.setClaimSetConverter(callerIdentityClaimSetConverter());
         return decoder;
+    }
+
+    /**
+     * Whether an authenticating mode is configured, and therefore whether the decoder bean above exists.
+     *
+     * <p>Public and taking the {@link Environment} because the read itself is the security property being
+     * asserted: {@code AUTH_TYPE} arrives from a ConfigMap
+     * [infra/stocktrader-operator/helm-charts/stocktrader/templates/cash-account.yaml:L73-L77], and
+     * {@code Environment.getProperty} resolves {@code ${...}} placeholders and nothing else, so the value is
+     * compared as text and is never parsed or evaluated as an expression. The predecessor of this method was
+     * {@code @ConditionalOnExpression}, whose argument is an expression TEMPLATE: the property was interpolated
+     * into it and the result was then evaluated, so a value closing the quote the template opened ran arbitrary
+     * SpEL while conditions were still being read - ahead of every validation in this file and in
+     * config/SecurityConfig. Neither inert Boot condition expresses "any mode except none" on its own
+     * ({@code @ConditionalOnProperty} has no not-equals), which is why the predicate is written out here.
+     *
+     * <p>Deliberately does not reject an unsupported mode. A condition that threw would move the fail-closed
+     * message into condition evaluation and away from the two gates that already own it - this file's
+     * {@code default} branch and {@link SecurityConfig#authenticating(String)} - both of which stop start-up for
+     * anything outside the four supported modes (AAP 0.6.5).
+     *
+     * @param environment the context's environment, read for {@code cashaccount.security.auth-type}
+     * @return {@code false} only when the configured mode is {@code none}, ignoring case and surrounding space
+     */
+    public static boolean decoderRequired(Environment environment) {
+        // MODE_BASIC as the fallback mirrors application.yml's own ${AUTH_TYPE:basic} and broker's variable default
+        // [backend/broker/src/main/liberty/config/server.xml:L40], so an unset AUTH_TYPE still authenticates.
+        String configured = environment.getProperty(AUTH_TYPE_PROPERTY, MODE_BASIC);
+        return !SecurityConfig.MODE_NONE.equals(normalizedMode(configured));
+    }
+
+    // Trimmed and lower-cased exactly as the removed expression's .trim() and equalsIgnoreCase did, so the swap of
+    // mechanism cannot change which values omit the bean; Locale.ROOT keeps that independent of the pod's locale.
+    private static String normalizedMode(String authType) {
+        return (authType == null) ? "" : authType.trim().toLowerCase(Locale.ROOT);
     }
 
     // Maps the groups claim to ROLE_-prefixed authorities, which is what makes hasRole("StockTrader") and
@@ -177,12 +189,10 @@ public class JwtDecoderConfig {
             addRole(authorities, groups);
         }
 
-        // Parity, not laxity. The siblings bind the StockTrader role to the ALL_AUTHENTICATED_USERS special subject
-        // <security-role id="StockTrader"><special-subject type="ALL_AUTHENTICATED_USERS" id="IBMid"/></security-role>
-        // [backend/broker/src/main/liberty/config/server.xml:L56-L60], so any authenticated caller can write through
-        // broker today. Granting the same here by default means cutover changes no caller's effective permissions and
-        // the GET-versus-write split stays latent rather than absent; setting the property false is the supported
-        // strict mode in which only the token's groups decide.
+        // Parity, not laxity: the siblings bind StockTrader to the ALL_AUTHENTICATED_USERS special subject
+        // [backend/broker/src/main/liberty/config/server.xml:L56-L60], so any authenticated caller can write
+        // through broker today and granting the same by default means cutover changes no caller's effective
+        // permissions. False is the supported strict mode in which only the token's groups decide.
         if (allAuthenticatedHoldStockTrader) {
             authorities.add(new SimpleGrantedAuthority(STOCK_TRADER_AUTHORITY));
         }
@@ -210,11 +220,10 @@ public class JwtDecoderConfig {
                 new RequiredAudienceValidator(audience));
     }
 
-    // MicroProfile JWT identifies the caller by upn and falls back to sub when upn is absent, but
-    // JwtAuthenticationConverter derives the principal name from exactly one claim and its convert method is final,
-    // so the fallback cannot live in the converter. Defaulting upn from sub as the claim set is converted - the
-    // decoder's own documented extension point, wrapping the same MappedJwtClaimSetConverter defaults it would use
-    // anyway - gives "upn when present, else sub" for every authentication without reimplementing the converter.
+    // MicroProfile JWT identifies the caller by upn and falls back to sub, but JwtAuthenticationConverter derives
+    // the principal from exactly one claim and its convert method is final, so the fallback cannot live there.
+    // Defaulting upn from sub while the claim set is converted is the decoder's own extension point, and wrapping
+    // MappedJwtClaimSetConverter keeps the defaults it would apply anyway.
     private static Converter<Map<String, Object>, Map<String, Object>> callerIdentityClaimSetConverter() {
         Converter<Map<String, Object>, Map<String, Object>> defaults =
                 MappedJwtClaimSetConverter.withDefaults(Collections.emptyMap());
@@ -238,14 +247,74 @@ public class JwtDecoderConfig {
                     + "variable optional, so its absence is a real configuration state and start-up must fail "
                     + "rather than run without a way to verify signatures.");
         }
-        return jwksUrl;
+
+        // In oidc mode this endpoint is the whole trust anchor: whatever it serves decides which signatures this
+        // service accepts, so whoever can answer for it can mint a StockTrader token of their own. Over cleartext
+        // http that is anyone on the path between the pod and the identity provider, and nothing downstream would
+        // notice - the tokens verify. Requiring https here, while the context starts, is therefore the only place
+        // the guarantee can be made; Nimbus will not make it, and a pod that has already begun serving traffic
+        // cannot be told to stop trusting keys it fetched. A missing host, a user-info section or a fragment are
+        // refused with it: the first would leave the address ambiguous, the second puts a credential in a URL this
+        // service can neither protect nor rotate, and the third is never part of a key-set address - each marks a
+        // value that was not meant for this property rather than one to interpret generously.
+        String candidate = jwksUrl.trim();
+        URI uri;
+        try {
+            uri = new URI(candidate);
+        } catch (URISyntaxException exception) {
+            throw jwksRejection(syntaxFailure(exception));
+        }
+
+        // Absoluteness first: a relative or opaque value has no scheme or no hierarchical authority to inspect,
+        // so every later check would read null and report the wrong reason.
+        if (!uri.isAbsolute() || uri.isOpaque()) {
+            throw jwksRejection("it is not an absolute hierarchical URI of the form https://host/path");
+        }
+        if (!"https".equalsIgnoreCase(uri.getScheme())) {
+            throw jwksRejection("its scheme is '" + uri.getScheme() + "', not https");
+        }
+        if (uri.getHost() == null || uri.getHost().isBlank()) {
+            throw jwksRejection("it names no host");
+        }
+        if (uri.getRawUserInfo() != null) {
+            throw jwksRejection("it carries a user-info section");
+        }
+        if (uri.getRawFragment() != null) {
+            throw jwksRejection("it carries a fragment");
+        }
+        return candidate;
     }
 
-    // Only the public half of the signing key is ever read, and only from this property. The shared trust store the
-    // siblings mount carries the jwtSigner entry complete with its private key and is copied into every sibling
-    // image - a defect this module does not repeat, so nothing here reads a key store, its credentials, or any
-    // signing key material. Keeping the location a property is also what lets tests point it at an ephemeral,
-    // per-JVM key that is never checked in.
+    // The parser's own exception is deliberately neither attached as a cause nor quoted: URISyntaxException's
+    // message embeds the entire input it choked on, and a start-up stack trace prints every cause, so a
+    // malformed URL carrying a password would put that password in pod logs through the exception chain even
+    // though the message below redacts it. Its reason and index are fixed diagnostics that never contain the
+    // input, and they are all an operator needs to find the character at fault in their own configuration.
+    private static String syntaxFailure(URISyntaxException exception) {
+        String reason = (exception.getReason() == null) ? "malformed" : exception.getReason();
+        return (exception.getIndex() < 0)
+                ? "it is not a valid URI (" + reason + ")"
+                : "it is not a valid URI (" + reason + " at index " + exception.getIndex() + ")";
+    }
+
+    // The rejected value is named by property, never reproduced: it may carry the very user-info this method
+    // refuses, and a start-up failure is written to pod logs. The scheme is the one part quoted, because it is
+    // what an operator has to change and cannot be a credential. No cause is accepted at all, so nothing holding
+    // the candidate URI can be attached to the failure by a later edit.
+    private static IllegalStateException jwksRejection(String reason) {
+        return new IllegalStateException(JWKS_URL_PROPERTY + " (OIDC_JWKS_URL) must be an absolute https URI that "
+                + "names a host and carries neither user-info nor a fragment, because in 'oidc' mode the JWKS "
+                + "endpoint is the sole source of the keys this service verifies tokens with "
+                + "[backend/broker/src/main/liberty/config/includes/oidc.xml:L16-L21]. The configured value is "
+                + "rejected because " + reason + "; it is not echoed here, since a rejected URL can contain "
+                + "credentials. Start-up fails rather than fetch verification keys over a channel an on-path "
+                + "attacker can answer for - substituted keys forge tokens this service would accept, including "
+                + "tokens claiming the StockTrader role.");
+    }
+
+    // Only the public half of the signing key is ever read, and only from this property: the shared trust store the
+    // siblings mount carries the jwtSigner private key too, so nothing here reads a key store or its credentials.
+    // Keeping the location a property is also what lets tests point it at an ephemeral, per-JVM key.
     private static RSAPublicKey signerPublicKey(ResourceLoader resourceLoader, String location) {
         if (location == null || location.isBlank()) {
             throw new IllegalStateException(PUBLIC_KEY_LOCATION_PROPERTY + " must name the signer's public "
@@ -311,6 +380,17 @@ public class JwtDecoderConfig {
         } catch (IllegalArgumentException | NoSuchAlgorithmException | InvalidKeySpecException exception) {
             throw new IllegalStateException(PUBLIC_KEY_LOCATION_PROPERTY + " '" + location
                     + "' is not a readable RSA public key PEM.", exception);
+        }
+    }
+
+    /** Registers the decoder bean for every authenticating mode, omitting it only for {@code auth-type=none}. */
+    static final class AuthenticatingModeCondition implements Condition {
+
+        @Override
+        public boolean matches(ConditionContext context, AnnotatedTypeMetadata metadata) {
+            // Nothing is read from the annotation metadata: the decision is a property comparison, and taking no
+            // input from the annotation is what keeps this condition usable - and testable - as a plain predicate.
+            return decoderRequired(context.getEnvironment());
         }
     }
 

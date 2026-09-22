@@ -1,23 +1,8 @@
-/*
-       Copyright 2025 Kyndryl, All Rights Reserved
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
- */
-
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.fx;
 
 import java.math.BigDecimal;
 import java.net.URI;
+import java.net.URISyntaxException;
 import java.util.Collection;
 import java.util.LinkedHashSet;
 import java.util.Locale;
@@ -30,7 +15,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.context.properties.bind.Bindable;
 import org.springframework.boot.context.properties.bind.Binder;
 import org.springframework.core.env.ConfigurableEnvironment;
@@ -43,53 +27,53 @@ import org.springframework.web.client.RestClientException;
 import org.springframework.web.util.UriComponentsBuilder;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.domain.Money;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.error.CashAccountErrorCode;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.error.CashAccountException;
 
-// Technology choice: the legacy rate lookup was an in-database join, selecting STOCKTRD.FRANKFURT1 on the account's
-// own currency truncated to five characters [backend/cash-account-cobol/COBOL/CASH00.cbl:L213-L219]. That table is a
-// migration-source artifact and not a target-state dependency, and its precision is the reason: RATES was
-// DECIMAL(3, 2) / PIC S9(1)V9(2) COMP-3 [backend/cash-account-cobol/COBOL/DCLFRANK.cpy:L12, L22], two decimals with a
-// ceiling of 9.99, so any currency worth less than a tenth of the base unit was unrepresentable. Live rates carry four
-// to six significant digits; the reconciliation tooling classifies that divergence as a RATE_SOURCE variance rather
-// than absorbing it, and the staged table survives only behind LegacyRateTableSource for replaying legacy arithmetic.
-//
-// Deliberate deviation - fail closed. CASH-ACCT-CREDIT and CASH-ACCT-DEBIT ran their COMPUTE and UPDATE even when the
-// rate SELECT found no row [CASH00.cbl:L214-L231 for credit, L248-L264 for debit]: the missing row's SQLCODE 100 was
-// overwritten by the UPDATE's SQLCODE 0, so a balance computed from the uninitialized RATES host variable
-// [DCLFRANK.cpy:L22 declares it with no VALUE clause] was committed under a success code. Here every undeterminable
-// rate raises ExchangeRateUnavailableException instead, which the service layer renders as
-// 503 EXCHANGE_RATE_UNAVAILABLE with Retry-After: 5, leaving the balance unchanged and writing no ledger row.
-//
-// No @Profile, deliberately. ToolExchangeRateSource is @Profile("tool") @Primary and delegates to this client when
-// tool.rate-source=live, so this bean has to exist in that profile too; in the deployed profile it is then the only
-// ExchangeRateSource bean, which is what ExchangeRateSourceWiringTest asserts.
 /** Live exchange-rate lookup at the chart-injected CURRENCY_API_URL; the target-state replacement for the legacy rate-table join. */
 @Component
 public class FrankfurterExchangeRateClient implements ExchangeRateSource {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(FrankfurterExchangeRateClient.class);
 
+    private static final String FX_URL_PROPERTY = "cashaccount.fx.url";
+
     private static final String ACCEPTED_CURRENCIES_PROPERTY = "cashaccount.fx.accepted-currencies";
 
     private static final Pattern ISO_4217_CODE = Pattern.compile("^[A-Z]{3}$");
 
     // The accepted set as shipped, held here as well as in configuration so a context that binds no property list
-    // still rejects an unconvertible code instead of forwarding it to the rate service. Same 31 codes the estate
-    // already enforces through its allowed_currencies CHECK
-    // (infra/stocktrader-setup/azure/modules/postgres_init/init_schema.sql.tmpl:L7).
+    // still rejects an unaccepted code instead of forwarding it. It enforces ESTATE acceptance only - the same 31
+    // codes as the allowed_currencies CHECK of
+    // infra/stocktrader-setup/azure/modules/postgres_init/init_schema.sql.tmpl:L7 - and is not a promise of
+    // convertibility: the provider serves a subset of it, BGN among the codes it may omit, and a code it omits
+    // comes back missing from the response, which extractRate raises as ExchangeRateUnavailableException for the
+    // service to render as 503 EXCHANGE_RATE_UNAVAILABLE - never as 400 INVALID_CURRENCY.
     private static final Set<String> DEFAULT_ACCEPTED_CURRENCIES = Set.of(
             "AUD", "BGN", "BRL", "CAD", "CHF", "CNY", "CZK", "DKK", "EUR", "GBP", "HKD", "HUF", "IDR", "ILS", "INR",
             "ISK", "JPY", "KRW", "MXN", "MYR", "NOK", "NZD", "PHP", "PLN", "RON", "SEK", "SGD", "THB", "TRY", "USD",
             "ZAR");
 
-    // Two attempts, no backoff. Both attempts happen before the account row is locked - the caller resolves the rate
-    // on an unlocked read and only then opens the write transaction that takes the row under PESSIMISTIC_WRITE
-    // (retail/RetailCashAccountService.applyRateChange) - so a retry spends the caller's own synchronous request
-    // budget and nobody else's. Two rather than more because the pair of connect and read timeouts already bounds
-    // the worst case (cashaccount.fx.timeout, PT2S, applied to both phases in config/FxClientConfig), and no backoff
-    // because sleeping before an immediate transport retry adds latency without improving its odds.
+    // Two attempts, no backoff. Both happen before the account row is locked - the caller resolves the rate on an
+    // unlocked read and only then opens the write transaction that takes the row under PESSIMISTIC_WRITE
+    // (retail/RetailCashAccountService.applyRateChange) - so a retry spends the caller's own request budget and
+    // nobody else's. Two rather than more because the connect and read timeouts already bound the worst case
+    // (cashaccount.fx.timeout in config/FxClientConfig), and no backoff because sleeping before an immediate
+    // transport retry adds latency without improving its odds.
     private static final int MAX_ATTEMPTS = 2;
+
+    // The only scheme this client will dial. See requireEndpoint for why plaintext is refused outright.
+    private static final String REQUIRED_SCHEME = "https";
+
+    // Cardinality bound on the answer, the second half of the size bound config/FxClientConfig applies to the
+    // bytes. The byte ceiling already makes an enormous map impossible, but the two limits fail differently and
+    // both are worth having: the transport one is about how much this process may be made to allocate, this one is
+    // about the answer still being the contract. A pair query publishes one rate and the whole set is about thirty;
+    // ISO 4217 assigns fewer than two hundred active codes, so 512 is beyond anything a correct answer can carry
+    // and rejects only a response that has stopped being one. Package-private so fx/CurrencyConversionTest drives
+    // the boundary against the limit itself rather than a duplicate of it.
+    static final int MAX_RATE_ENTRIES = 512;
 
     private static final String QUERY_PARAM_FROM = "from";
 
@@ -102,35 +86,25 @@ public class FrankfurterExchangeRateClient implements ExchangeRateSource {
     /**
      * Container constructor.
      *
-     * @param restClient  the bounded, header-free client published by {@code config.FxClientConfig}; its connect and
-     *                    read budget is configuration owned there and is never re-read or re-applied here
-     * @param fxUrl       the endpoint, which is a deployment value and never a literal in this class: the chart
-     *                    injects it as {@code CURRENCY_API_URL} from configMap key
-     *                    {@code cashAccount.exchangeRateUrl}
+     * @param restClient  the bounded, header-free client published by {@code config.FxClientConfig}, which owns
+     *                    its connect and read budget
+     * @param environment source of both configured values, each read through {@link Binder}: the endpoint
+     *                    {@code cashaccount.fx.url} - a deployment value, never a literal here: the chart injects
+     *                    {@code CURRENCY_API_URL} from configMap key {@code cashAccount.exchangeRateUrl}
      *                    (infra/stocktrader-operator/helm-charts/stocktrader/templates/cash-account.yaml:L156-L160,
-     *                    value at .../values.yaml:L147). The {@code @Value} carries no inline fallback so this class
-     *                    never chooses a host of its own; the resolution cascade is owned by configuration instead -
-     *                    {@code cashaccount.fx.url} reads {@code CURRENCY_API_URL} and falls back to the value
-     *                    application.yml ships, which is the chart's own default (application.yml:L154, mirrored by
-     *                    {@code config.CashAccountProperties.Fx}). Omitting the environment variable therefore lands
-     *                    on that default rather than failing. An unusable endpoint still stops start-up, but ahead
-     *                    of this constructor rather than inside it: a value that resolves blank -
-     *                    {@code CURRENCY_API_URL} set to the empty string, which wins over the placeholder default
-     *                    because the variable exists - is rejected by the {@code @NotBlank} on
-     *                    {@code config.CashAccountProperties.Fx.url}, whose validated bean the injected
-     *                    {@code fxRestClient} depends on, and a property that no property source supplies at all
-     *                    fails placeholder resolution. {@code requireEndpoint} is defence in depth for the direct
-     *                    constructions below, which bypass both
-     * @param environment source of the accepted-currency list, read through {@link Binder} because the property is
-     *                    written as a YAML sequence, which cannot be bound by {@code @Value}
+     *                    value at .../values.yaml:L147) and {@code cashaccount.fx.url} in application.yml supplies
+     *                    the fallback, so this class chooses no host of its own. A blank value is rejected by the
+     *                    {@code @NotBlank} on {@code config.CashAccountProperties.Fx.url} before this constructor
+     *                    runs, and by {@code requireEndpoint} below, which also covers the direct constructions
+     *                    that bypass the container - and the accepted-currency list
+     *                    {@code cashaccount.fx.accepted-currencies}, a YAML sequence no placeholder can bind
      */
     @Autowired
-    public FrankfurterExchangeRateClient(@Qualifier("fxRestClient") RestClient restClient,
-            @Value("${cashaccount.fx.url}") String fxUrl, Environment environment) {
-        this(restClient, fxUrl, acceptedCurrenciesFrom(environment));
+    public FrankfurterExchangeRateClient(@Qualifier("fxRestClient") RestClient restClient, Environment environment) {
+        this(restClient, endpointFrom(environment), acceptedCurrenciesFrom(environment));
     }
 
-    /** Uses the accepted-currency set as shipped; for a caller that holds no {@link Environment}. */
+    // Takes the accepted-currency set as shipped, for a caller that holds no Environment.
     public FrankfurterExchangeRateClient(RestClient restClient, String fxUrl) {
         this(restClient, fxUrl, DEFAULT_ACCEPTED_CURRENCIES);
     }
@@ -146,23 +120,19 @@ public class FrankfurterExchangeRateClient implements ExchangeRateSource {
         String from = normalizeCode(base);
         String to = normalizeCode(quote);
 
-        // Defence in depth rather than duplication: the authoritative validation is at the API boundary and the quote
-        // usually arrives from a stored account currency that was validated on write. Checking again here is what
-        // keeps the two failure classes distinct - a rejected input stays 400 INVALID_CURRENCY and only an
-        // undeterminable rate becomes 503 EXCHANGE_RATE_UNAVAILABLE, so a caller error can never invite a retry.
+        // Defence in depth, and what keeps the two failure classes distinct: a rejected input stays
+        // 400 INVALID_CURRENCY and only an undeterminable rate becomes 503, so a caller error cannot invite a retry.
         requireAcceptedCode(from);
         requireAcceptedCode(to);
 
-        // Exact legacy parity, not an optimization: an account already in the base currency was multiplied by a rate
-        // of 1 in the program being replaced, so reproducing that value locally makes its balances reconcile exactly
-        // - and it refuses to make an operation that needs no conversion depend on a third party that could be down.
+        // Exact legacy parity, not an optimization: the program being replaced multiplied an account already in the
+        // base currency by a rate of 1, and no third party can be down for an operation that needs no conversion.
         if (from.equals(to)) {
             return BigDecimal.ONE;
         }
 
-        // Built from the configured value rather than concatenated onto it, so a query string already present in that
-        // value survives instead of being clobbered. There is no conversion endpoint to ask for a converted amount;
-        // the rate comes back and the caller applies it.
+        // Built from the configured value rather than concatenated onto it, so a query string already present in
+        // that value survives instead of being clobbered.
         URI uri = UriComponentsBuilder.fromUriString(fxUrl)
                 .queryParam(QUERY_PARAM_FROM, from)
                 .queryParam(QUERY_PARAM_TO, to)
@@ -179,24 +149,40 @@ public class FrankfurterExchangeRateClient implements ExchangeRateSource {
         ResourceAccessException transportFailure = null;
         for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
             try {
-                return restClient.get()
+                // The bytes are bounded before this binding happens, not after: the client published by
+                // config/FxClientConfig refuses a Content-Length above its ceiling before reading anything and
+                // meters a body that declares no length as it is consumed, so no answer a third party sends can
+                // decide how much this process allocates. That failure arrives here as a RestClientException and
+                // leaves through the catch below as 503 EXCHANGE_RATE_UNAVAILABLE, unretried.
+                return requireBoundedAnswer(restClient.get()
                         .uri(uri)
                         .retrieve()
                         .onStatus(HttpStatusCode::isError, (request, response) -> {
                             throw unavailable(from, to, "endpoint answered HTTP " + response.getStatusCode().value(),
                                     null);
                         })
-                        .body(FrankfurterLatestResponse.class);
+                        .body(FrankfurterLatestResponse.class), from, to);
             } catch (ResourceAccessException transport) {
-                // Only a transport failure is retried, because only a transport failure can differ on a second
-                // attempt. A refused status and an unreadable body are deterministic, so retrying either would add
-                // latency to a request whose outcome is already settled.
+                // Only a transport failure can differ on a second attempt; a refused status and an unreadable body
+                // are deterministic, so retrying either would add latency to a settled outcome.
                 transportFailure = transport;
             } catch (RestClientException unreadable) {
                 throw unavailable(from, to, "endpoint answer could not be read", unreadable);
             }
         }
         throw unavailable(from, to, "endpoint unreachable after " + MAX_ATTEMPTS + " attempts", transportFailure);
+    }
+
+    // Raised as an unavailable rate rather than an invalid input: the caller supplied an accepted pair, so nothing
+    // about the request is wrong - the answer is. Checked here, between binding and extraction, so the rejection
+    // is on the answer as a whole and not on the one entry that happens to be read out of it.
+    private FrankfurterLatestResponse requireBoundedAnswer(FrankfurterLatestResponse answer, String from, String to) {
+        Map<String, BigDecimal> rates = answer == null ? null : answer.rates();
+        if (rates != null && rates.size() > MAX_RATE_ENTRIES) {
+            throw unavailable(from, to,
+                    "endpoint answer carried more than " + MAX_RATE_ENTRIES + " rates", null);
+        }
+        return answer;
     }
 
     private BigDecimal extractRate(FrankfurterLatestResponse response, String from, String to) {
@@ -210,29 +196,38 @@ public class FrankfurterExchangeRateClient implements ExchangeRateSource {
             throw unavailable(from, to, "endpoint answer omitted the requested currency", null);
         }
 
-        // A non-positive rate is refused for the same reason this class never returns a sentinel: it would turn every
-        // credit and debit into a silent no-op, which is exactly the class of quietly wrong answer being eliminated.
+        // A zero rate would turn every credit and debit into a silent no-op and a negative one would invert the
+        // operation: the same class of quietly wrong answer as an absent rate.
         if (rate.signum() <= 0) {
             throw unavailable(from, to, "endpoint answer carried a non-positive rate", null);
         }
 
-        // Returned at its natural precision, untouched. The program being replaced truncated the whole expression
-        // exactly once, after the signed addition [CASH00.cbl:L222 for credit, L256 for debit], and domain.Money
-        // owns that single truncation; trimming the rate here would break parity without failing anything - with a
-        // stored balance of 100.00, a rate of 0.03 and an amount of 0.30 the one final truncation yields 99.99 while
-        // a pre-trimmed product yields 100.00.
+        // A rate of an extreme exponent - "EUR":1e1000000000 is twelve bytes of third-party JSON - parses for
+        // nothing but expands into hundreds of megabytes of digits at the first multiply or setScale inside
+        // domain.Money, so the size of the provider's number is judged here, before it reaches the arithmetic.
+        // domain.Money owns the limits and this class holds no copy of them, as it holds no copy of the scale or
+        // rounding mode. A bound on the number's size, never on a rate's precision or value - the legacy two-decimal
+        // RATES column is the defect this service removes - answered as 503 EXCHANGE_RATE_UNAVAILABLE with the
+        // balance untouched and no ledger row written, rather than as a 500 from an ArithmeticException deeper down.
+        if (!Money.isWithinInputBounds(rate)) {
+            throw unavailable(from, to, "endpoint answer carried a rate of unusable magnitude", null);
+        }
+
+        // Returned at its natural precision, untouched: the program being replaced truncated the whole expression
+        // exactly once, after the signed addition [CASH00.cbl:L222 credit, L256 debit], and domain.Money owns that
+        // single truncation, so trimming the rate here would break parity without failing anything.
         return rate;
     }
 
-    // DEBUG and not WARN, deliberately: the single WARN for a web-path failure is emitted by
-    // error/ApiExceptionHandler when it renders the 503, which is the only place that also holds the owner and the
-    // request context. This line is the single point every failure funnels through, so it records the pair, the short
-    // reason and the cause's TYPE - refused, timed out - for opt-in diagnosis, rather than doubling the WARN volume
-    // of a provider outage that repeats on every request. Never the cause's stack trace, and the reason stays a short
-    // phrase that never names the endpoint or carries a response body. A tool-profile run has no exception handler
-    // and loses nothing either, because there the same failure is evidence rather than a log record: the service's
-    // EXCHANGE_RATE_UNAVAILABLE reaches migration/shadow/ShadowComparator, which writes it as a REJECTED_BY_TARGET
-    // row of migration_reconciliation and counts it in the run summary.
+    // Deliberate deviation - fail closed. CASH-ACCT-CREDIT and CASH-ACCT-DEBIT ran their COMPUTE and UPDATE even
+    // when the rate SELECT found no row [CASH00.cbl:L214-L231 credit, L248-L264 debit]: the missing row's
+    // SQLCODE 100 was overwritten by the UPDATE's SQLCODE 0, so a balance computed from the uninitialized RATES
+    // host variable [DCLFRANK.cpy:L22 declares it with no VALUE clause] was committed under a success code. Every
+    // undeterminable rate raises instead, and the service renders it as 503 with the balance unchanged.
+    //
+    // DEBUG and not WARN: error/ApiExceptionHandler emits the single WARN when it renders the 503, holding the
+    // owner and the request context, so a second line here would double the log volume of a provider outage that
+    // repeats on every request. Never a stack trace, and the reason never names the endpoint or a response body.
     private ExchangeRateUnavailableException unavailable(String from, String to, String reason, Throwable cause) {
         LOGGER.debug("Exchange rate lookup for {}->{} failed: {}{}", from, to, reason, causeSuffix(cause));
         return ExchangeRateUnavailableException.forPair(from, to, reason, cause);
@@ -268,12 +263,82 @@ public class FrankfurterExchangeRateClient implements ExchangeRateSource {
         return safe.isEmpty() ? "(blank)" : safe.toString();
     }
 
+    // HTTPS is required, and the refusal is deliberately a start-up failure rather than a per-request one: this
+    // runs in the constructor, so a pod configured to fetch rates over plaintext never becomes ready instead of
+    // serving wrong balances until someone notices. The rate is not advisory data - it is multiplied into every
+    // cross-currency credit and debit and written to the ledger, so an on-path attacker who can rewrite an HTTP
+    // answer can move money (CWE-319 cleartext transmission, CWE-345 insufficient verification of data
+    // authenticity). HTTPS moves that from a network position to the server's certificate chain, which the JVM
+    // trust store verifies, and config/FxClientConfig's Redirect.NORMAL keeps it there by refusing a redirect back
+    // down to HTTP. The chart's own value is already https (values.yaml:L147), so nothing deployed changes.
+    //
+    // The three checks past the scheme close the ways a URL can be HTTPS and still be wrong: no host means the
+    // request target is undetermined; user-info means a credential is sitting in a configMap value that reaches
+    // logs and metrics tags; a fragment is never sent on the wire and so silently means something other than it
+    // reads. Comparison is case-insensitive because a scheme is (RFC 3986 section 3.1) and the JDK client agrees.
     private static String requireEndpoint(String fxUrl) {
         if (fxUrl == null || fxUrl.isBlank()) {
             throw new IllegalStateException(
                     "cashaccount.fx.url is required; the chart supplies it as CURRENCY_API_URL");
         }
-        return fxUrl.trim();
+
+        String endpoint = fxUrl.trim();
+        URI parsed;
+        try {
+            parsed = new URI(endpoint);
+        } catch (URISyntaxException malformed) {
+            // The rejected value is never echoed, and the parser's own exception is dropped rather than chained for
+            // exactly that reason: URISyntaxException.getMessage() renders the whole rejected input, and Spring
+            // prints every nested cause when a context fails to refresh, so keeping it would publish a mistyped or
+            // hostile CURRENCY_API_URL - credentials, CR/LF-forged log lines and all - into the start-up log. What
+            // survives is metadata that cannot carry the value: the parser's own reason category, itself filtered,
+            // and the numeric index it failed at, which is what an operator actually needs to find the typo.
+            throw new IllegalStateException("cashaccount.fx.url (CURRENCY_API_URL) is not a valid URI: "
+                    + reasonForMessage(malformed.getReason()) + " at index " + malformed.getIndex());
+        }
+
+        if (!REQUIRED_SCHEME.equalsIgnoreCase(parsed.getScheme())) {
+            // The scheme is the one part of the value safe to echo: URI syntax restricts it to a letter followed
+            // by letters, digits and "+-.", so it cannot carry a forged log record.
+            throw new IllegalStateException("cashaccount.fx.url (CURRENCY_API_URL) must use the "
+                    + REQUIRED_SCHEME + " scheme, not " + schemeForMessage(parsed.getScheme()));
+        }
+        if (parsed.getHost() == null || parsed.getHost().isBlank()) {
+            throw new IllegalStateException("cashaccount.fx.url (CURRENCY_API_URL) must name a host");
+        }
+        if (parsed.getUserInfo() != null) {
+            throw new IllegalStateException(
+                    "cashaccount.fx.url (CURRENCY_API_URL) must carry no user-info credentials");
+        }
+        if (parsed.getFragment() != null) {
+            throw new IllegalStateException("cashaccount.fx.url (CURRENCY_API_URL) must carry no fragment");
+        }
+        return endpoint;
+    }
+
+    private static String schemeForMessage(String scheme) {
+        return scheme == null || scheme.isBlank()
+                ? "(none)"
+                : sanitizedForMessage(scheme.toLowerCase(Locale.ROOT), 16);
+    }
+
+    private static String reasonForMessage(String reason) {
+        return reason == null || reason.isBlank() ? "(unspecified)" : sanitizedForMessage(reason, 64);
+    }
+
+    // Printable ASCII only and length-capped. Both callers render a fragment derived from operator-supplied
+    // configuration into a start-up log line, and a configMap is writable by anyone who can patch it, so the
+    // filter is what makes "this diagnostic cannot carry a forged log record" true of the code rather than of the
+    // value that happened to be configured.
+    private static String sanitizedForMessage(String value, int maxLength) {
+        StringBuilder safe = new StringBuilder(maxLength);
+        for (int index = 0; index < value.length() && safe.length() < maxLength; index++) {
+            char candidate = value.charAt(index);
+            if (candidate >= ' ' && candidate < 127) {
+                safe.append(candidate);
+            }
+        }
+        return safe.isEmpty() ? "(filtered)" : safe.toString();
     }
 
     private static Set<String> normalizedCodes(Collection<String> codes) {
@@ -290,11 +355,25 @@ public class FrankfurterExchangeRateClient implements ExchangeRateSource {
         return normalized.isEmpty() ? DEFAULT_ACCEPTED_CURRENCIES : Set.copyOf(normalized);
     }
 
-    // Binder rather than @Value because the property is a YAML sequence, which @Value cannot bind; Binder also accepts
-    // the comma-separated scalar form, so relaxed binding through an environment variable keeps working. Reading it
-    // from the Environment rather than injecting the typed properties object is what keeps this package free of the
-    // config package, which wires everything and is depended on by nothing. A non-configurable Environment cannot
-    // expose property sources at all, so that case takes the shipped set instead of failing start-up.
+    // Binder, never @Value, and the reason is the endpoint: a @Value placeholder is resolved and its resolved text
+    // is then handed to Spring's expression resolver, so a value of the form #{...} executes during bean creation.
+    // This endpoint is the one configuration value that arrives from a configMap key an operator edits
+    // (CURRENCY_API_URL <- cashAccount.exchangeRateUrl), which would make edit access to that map equivalent to
+    // code execution in the pod. Binder resolves ${...} and converts, and evaluates nothing, so the same text stays
+    // inert data and is rejected as a bad endpoint rather than run. A non-configurable Environment exposes no
+    // property sources, so it yields the empty string and requireEndpoint stops start-up.
+    private static String endpointFrom(Environment environment) {
+        if (!(environment instanceof ConfigurableEnvironment)) {
+            return "";
+        }
+        return Binder.get(environment).bind(FX_URL_PROPERTY, Bindable.of(String.class)).orElse("");
+    }
+
+    // Binder rather than @Value because the property is a YAML sequence, which @Value cannot bind; Binder also
+    // accepts the comma-separated scalar form, so relaxed binding through an environment variable keeps working.
+    // Reading the Environment rather than injecting the typed properties object keeps this package free of config,
+    // which wires everything and is depended on by nothing. A non-configurable Environment exposes no property
+    // sources at all, so that case takes the shipped set instead of failing start-up.
     private static Set<String> acceptedCurrenciesFrom(Environment environment) {
         if (!(environment instanceof ConfigurableEnvironment)) {
             return DEFAULT_ACCEPTED_CURRENCIES;
@@ -304,10 +383,9 @@ public class FrankfurterExchangeRateClient implements ExchangeRateSource {
                 .orElse(DEFAULT_ACCEPTED_CURRENCIES);
     }
 
-    // Only rates is declared, and its value type is BigDecimal: that declared type is what makes Jackson build each
-    // rate straight from the response text, so no binary approximation of a rate can exist even for an instant. The
-    // amount, base and date members of the contract are deliberately unread, and unknown members are ignored so a
-    // provider adding one cannot turn a working conversion into a parse failure.
+    /** Declares rates as BigDecimal so Jackson builds each rate from the response text, never through a double. */
+    // A map is the contract's own shape and cannot be narrowed here, so its growth is bounded outside the type:
+    // bytes by the ceiling in config/FxClientConfig before this is bound, entries by MAX_RATE_ENTRIES after.
     @JsonIgnoreProperties(ignoreUnknown = true)
     private record FrankfurterLatestResponse(Map<String, BigDecimal> rates) {
     }

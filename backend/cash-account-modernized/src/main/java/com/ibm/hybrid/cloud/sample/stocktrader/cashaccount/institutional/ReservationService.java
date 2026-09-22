@@ -1,19 +1,3 @@
-/*
-       Copyright 2025 Kyndryl, All Rights Reserved
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
- */
-
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.institutional;
 
 import java.math.BigDecimal;
@@ -36,7 +20,10 @@ import org.hibernate.exception.ConstraintViolationException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
-import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.context.properties.bind.Bindable;
+import org.springframework.boot.context.properties.bind.Binder;
+import org.springframework.core.env.ConfigurableEnvironment;
+import org.springframework.core.env.Environment;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -56,30 +43,6 @@ import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.error.CashAccountExce
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.persistence.CashAccountRepository;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.persistence.CashReservationRepository;
 
-/*
- * WHY THE LOCK ORDER IS FIXED AND STATED HERE. Every transaction that moves money in this module takes the
- * owner's cash_account row with PESSIMISTIC_WRITE first and only then reads the reservation row FOR UPDATE -
- * request paths and the scheduled expiry sweep alike. One order for every path is what makes the graph
- * cycle-free, so no hold, settle, release or sweep can deadlock against another on the same owner. Pessimistic
- * row locking is the estate's sanctioned strategy (backend/portfolio/src/main/resources/META-INF/
- * persistence.xml:L13-L14, eclipselink.pessimistic-lock=Lock with the shared cache off - "need this to scale
- * beyond one pod"), narrowed here to the two locking queries so plain reads stay lock-free.
- *
- * WHY hold, settle, release AND THE SWEEP ARE NOT TRANSACTIONAL, AND WHY A SELF-REFERENCE EXISTS. Each of them
- * has something to do OUTSIDE the transaction that writes: hold must re-read after PostgreSQL has aborted the
- * transaction its losing INSERT violated; a settle must raise its refusal only after the transaction that
- * committed a lapsed hold's expiry has committed, so the EXPIRY ledger row survives the 409; settle and
- * release decide a terminal reservation's non-mutating outcome with no lock at all; and the sweep must give
- * each candidate its own short transaction. A @Transactional method reached as a plain this.method(...) call
- * bypasses the proxy and would run with no transaction at all, so every such call goes through
- * self.getObject(). audit/LedgerService appends with Propagation.MANDATORY, which turns a lost boundary into
- * an immediate IllegalTransactionStateException rather than a silent no-op.
- *
- * WHY THE BALANCE EFFECTS ARE NOT WRITTEN DOWN HERE. domain/ReservationStateMachine decides and applies every
- * transition - hold moves available to reserved, a settle takes the settled portion out and returns the
- * remainder, a release or expiry returns the whole hold - and names the ledger rows it requires. This class
- * only locks, persists and appends: duplicating a rule here would create a second implementation of it.
- */
 /** Orchestrates institutional holds, settlements, releases and expiry over the locked account and ledger. */
 @Service
 public class ReservationService {
@@ -97,13 +60,23 @@ public class ReservationService {
     private static final String HASH_ALGORITHM = "SHA-256";
 
     /**
-     * The hold idempotency guard {@code UNIQUE (incarnation_id, idempotency_key)}
-     * (schema/cash-account-schema.sql:L69), by name, because only a violation of THIS constraint is the race.
+     * The {@code cash_reservation} idempotency guard {@code UNIQUE (incarnation_id, idempotency_key)} by name,
+     * because only a violation of this constraint is the hold race.
      */
     private static final String IDEMPOTENCY_CONSTRAINT = "uq_cash_reservation_incarnation_key";
 
     /** The literal an omitted {@code expiresAt} contributes to the canonical hash. */
     private static final String DEFAULT_EXPIRY_TOKEN = "DEFAULT";
+
+    // The two reservation durations, named once here so the readers, the guard and the @Scheduled expression below
+    // cannot drift apart. Both defaults are the ones application.yml ships (AAP 0.6.1).
+    private static final String DEFAULT_TTL_PROPERTY = "cashaccount.reservation.default-ttl";
+
+    private static final String EXPIRY_SWEEP_INTERVAL_PROPERTY = "cashaccount.reservation.expiry-sweep-interval";
+
+    private static final Duration DEFAULT_TTL = Duration.ofHours(24);
+
+    private static final Duration DEFAULT_EXPIRY_SWEEP_INTERVAL = Duration.ofSeconds(60);
 
     private final CashAccountRepository accounts;
     private final CashReservationRepository reservations;
@@ -111,22 +84,39 @@ public class ReservationService {
     private final ObjectProvider<ReservationService> self;
     private final Duration defaultTtl;
 
+    /**
+     * Container constructor.
+     *
+     * @param accounts     the locked-first account rows
+     * @param reservations the reservation rows, locked after the account
+     * @param ledger       appends every transition's row inside this service's own transaction
+     * @param self         this bean through its proxy, because the transactional units are reached from
+     *                     non-transactional methods of this same class
+     * @param environment  source of both reservation durations, each read through {@link Binder}
+     * @throws IllegalStateException if either duration is unparseable or not positive
+     */
     public ReservationService(CashAccountRepository accounts, CashReservationRepository reservations,
-            LedgerService ledger, ObjectProvider<ReservationService> self,
-            @Value("${cashaccount.reservation.default-ttl:PT24H}") Duration defaultTtl) {
+            LedgerService ledger, ObjectProvider<ReservationService> self, Environment environment) {
         this.accounts = Objects.requireNonNull(accounts, "accounts");
         this.reservations = Objects.requireNonNull(reservations, "reservations");
         this.ledger = Objects.requireNonNull(ledger, "ledger");
         this.self = Objects.requireNonNull(self, "self");
-        this.defaultTtl = Objects.requireNonNull(defaultTtl, "defaultTtl");
+        this.defaultTtl = positiveDuration(DEFAULT_TTL_PROPERTY, durationFrom(environment, DEFAULT_TTL_PROPERTY,
+                DEFAULT_TTL));
+
+        // Read here only to refuse it, which is why the value is not kept: the sweep below is declared with
+        // @Scheduled(fixedRateString = ...) as AAP 0.6.3 requires, and Spring resolves that placeholder and then
+        // hands the RESOLVED TEXT to its expression resolver - the same sink a @Value carries - so an interval
+        // written as #{...} would execute. Binding the identical key here, inertly, closes that path: a Duration
+        // bind fails on anything that is not a parseable positive duration, and a constructor always runs before
+        // ScheduledAnnotationBeanPostProcessor processes the annotation, so by the time the annotation is read the
+        // value has already been proven to be a duration and cannot be an expression.
+        positiveDuration(EXPIRY_SWEEP_INTERVAL_PROPERTY,
+                durationFrom(environment, EXPIRY_SWEEP_INTERVAL_PROPERTY, DEFAULT_EXPIRY_SWEEP_INTERVAL));
     }
 
     /**
      * A hold's result together with whether it replayed an earlier one.
-     *
-     * <p>Nested rather than declared as its own file: it exists only to tell the controller whether to answer
-     * {@code 201} or {@code 200} with {@code Idempotent-Replayed: true}, exactly as {@code domain} nests
-     * {@code ReservationStateMachine.Effect} beside the method that returns it.</p>
      *
      * @param reservation the reservation as it stands after the call
      * @param replayed {@code true} when the stored reservation was returned unchanged for a repeated key
@@ -137,11 +127,6 @@ public class ReservationService {
     /**
      * A settle's or release's committed outcome, and whether the transaction expired a lapsed hold instead of
      * performing the transition that was asked for.
-     *
-     * <p>Nested for the reason {@link HoldOutcome} is. It exists so that one transaction can both commit an
-     * expiry and report it: a release answers with that outcome, while a settle refuses it with
-     * {@code 409 INVALID_TRANSITION} raised after the commit, which is what keeps the {@code EXPIRY} ledger
-     * row every transition owes the audit trail.</p>
      *
      * @param reservation the reservation as the committed transaction left it
      * @param expired {@code true} when this transaction expired a lapsed hold rather than settling or
@@ -189,15 +174,10 @@ public class ReservationService {
         try {
             return proxy.holdOnce(normalizedOwner, key, requestHash, request);
         } catch (DataIntegrityViolationException race) {
-            // UNIQUE (incarnation_id, idempotency_key) is the first-writer-wins guard, so the loser of a real
-            // race lands here. The winner's row is visible only to a transaction opened after this rollback,
-            // which is why the comparison happens in replayFor and not in the aborted transaction above.
-            //
-            // Only THAT constraint, though: every other integrity violation this transaction can raise - a
-            // ledger_entry CHECK, a reservation amount or state CHECK - would be answered by replayFor with a
-            // replay or a retryable 409, both of which claim the write succeeded or can succeed when neither
-            // is true. Rethrown, it reaches the handler's catch-all as 500 INTERNAL, the status AAP 0.6.2
-            // assigns an unexpected failure, and the cause survives in the log instead of being swallowed.
+            // First-writer-wins on UNIQUE (incarnation_id, idempotency_key): the loser lands here, and the
+            // winner's row is visible only to a transaction opened after this rollback, which is why the hash
+            // comparison happens in replayFor. Any other integrity violation is rethrown to the handler's 500
+            // rather than answered by replayFor, which would claim a write that never happened.
             if (!violatesIdempotencyConstraint(race)) {
                 throw race;
             }
@@ -205,15 +185,14 @@ public class ReservationService {
         }
     }
 
-    /*
-     * holdOnce, replayFor, settleOnce, releaseOnce and expireOneCandidate are public for one reason only: a
-     * @Transactional method must be entered through the Spring proxy, and the proxy can only expose what is
-     * public. They are the transactional units of the four callers above - not test conveniences, and not part
-     * of the surface a controller should reach for.
-     */
-
     /**
      * The transactional unit of {@link #hold}: locks the account, replays or creates, appends the ledger row.
+     *
+     * <p>This method, {@link #replayFor}, {@link #settleOnce}, {@link #releaseOnce} and
+     * {@link #expireOneCandidate} are public only because a transactional method has to be entered through
+     * the Spring proxy - reached as a plain {@code this.method(...)} call it would run with no transaction at
+     * all, which is why every caller goes through {@code self.getObject()}. Their callers stay
+     * non-transactional because each has work to do outside the transaction that writes.</p>
      *
      * @param owner the normalized account owner
      * @param idempotencyKey the validated, trimmed key
@@ -239,18 +218,11 @@ public class ReservationService {
             return replayOrReuse(stored.get(), requestHash);
         }
 
-        // Every row this owner-scoped query can return belongs to a DIFFERENT incarnation, because a row of the
-        // current one would already have been answered above. Such a key is reuse and never a replay, whatever
-        // its payload hash: the retained hold reserved funds in an account life that no longer exists, so
-        // replaying it would report a reservation against balance it never touched - and creating a second hold
-        // under it would move the balance twice (AAP 0.6.3 cash_reservation, AAP 0.11.1). The UNIQUE
-        // (incarnation_id, idempotency_key) guard cannot see this: the new incarnation_id makes the pair unique
-        // again, which is why the rejection has to be decided here.
-        //
-        // Race-free where it sits and nowhere else: this transaction already holds the owner's cash_account row
-        // under PESSIMISTIC_WRITE (above), and a retail DELETE takes that same row lock
-        // (retail/RetailCashAccountService.delete), so no incarnation change can slip between this check and the
-        // INSERT below. Run from hold's lock-free pre-read it would be a guess.
+        // Any row this owner-scoped query returns belongs to an earlier incarnation, the current one having
+        // been answered above, so the key is reuse and never a replay whatever its hash: the retained hold
+        // reserved funds in an account life that no longer exists. UNIQUE (incarnation_id, idempotency_key)
+        // cannot see it, and the check is race-free only here, under the cash_account row lock a retail DELETE
+        // must also take before it can change the incarnation.
         List<CashReservation> retained = reservations.findByOwnerAndIdempotencyKey(normalizedOwner,
                 idempotencyKey);
         if (!retained.isEmpty()) {
@@ -264,9 +236,8 @@ public class ReservationService {
         // and the sweep terminates it - because the hold error set carries no code for a bad expiry.
         OffsetDateTime expiresAt = request.expiresAt() != null ? request.expiresAt() : now().plus(defaultTtl);
 
-        // The order reference is handed over exactly as it arrived, which is also exactly what
-        // canonicalRequestHash hashed: the entity stores it unaltered, so the value this response returns
-        // hashes back to the same digest and a verbatim retry is recognized as the replay it is.
+        // The order reference is stored exactly as it arrived, which is what canonicalRequestHash hashed, so a
+        // verbatim retry hashes back to the same digest and is recognized as the replay it is.
         CashReservation reservation = CashReservation.newHold(account, request.orderReference(), amount,
                 currency, expiresAt, idempotencyKey, requestHash);
         ReservationStateMachine.Effect effect = ReservationStateMachine.hold(account, reservation);
@@ -279,13 +250,10 @@ public class ReservationService {
         return new HoldOutcome(ReservationResponse.from(persisted), false);
     }
 
-    // Two ways of asking the same question, because neither alone is dependable. Hibernate's PostgreSQL
-    // violated-constraint-name extractor puts the name on a ConstraintViolationException in the cause chain -
-    // the structured answer, used when it is there. The message scan is the fallback: Spring's translated
-    // message embeds "constraint [<name>]", and a constraint name inside a PostgreSQL error message is not
-    // localized even when the surrounding text is, so matching the name is safe where matching prose is not.
-    // The chain is walked rather than the top exception inspected, since Spring wraps the JDBC and Hibernate
-    // exceptions that actually carry the name. Case-insensitive because PostgreSQL folds unquoted identifiers.
+    // Asked two ways because neither alone is dependable: Hibernate's extractor puts the name on a
+    // ConstraintViolationException when it can, and the fallback matches the name inside the message, which
+    // PostgreSQL does not localize even where it localizes the surrounding prose. The whole cause chain is
+    // walked, since Spring wraps the exceptions that carry the name, and folded case because PostgreSQL does.
     private static boolean violatesIdempotencyConstraint(Throwable thrown) {
         for (Throwable cause = thrown; cause != null; cause = cause.getCause()) {
             if (cause instanceof ConstraintViolationException violation
@@ -306,15 +274,13 @@ public class ReservationService {
         return false;
     }
 
-    // The newest retained row is named in the rejection because it is the one an operator asked about: the key
-    // was last used there. reservationId breaks a created_at tie so the ApiError payload is the same on every
-    // call and on every pod, which a list whose row order the database never promised would not be.
+    // The newest retained row is the one the rejection names, and reservationId breaks a created_at tie so the
+    // ApiError payload is identical on every call and every pod, which row order alone would not guarantee.
     private static CashReservation mostRecentlyCreated(List<CashReservation> retained) {
         return retained.stream()
                 .max(Comparator.comparing(CashReservation::createdAt)
                         .thenComparing(CashReservation::reservationId))
-                // Unreachable: the only caller has already established the list is non-empty. Stated as a defect
-                // rather than returned as a null the caller would dereference.
+                // Unreachable: the only caller has already established the list is non-empty.
                 .orElseThrow(() -> new IllegalArgumentException("retained must not be empty"));
     }
 
@@ -332,9 +298,8 @@ public class ReservationService {
     public HoldOutcome replayFor(UUID incarnationId, String idempotencyKey, String requestHash) {
         return reservations.findByIncarnationIdAndIdempotencyKey(incarnationId, idempotencyKey)
                 .map(stored -> replayOrReuse(stored, requestHash))
-                // No row under this key means the violated constraint was not the idempotency guard, or the
-                // owner was re-created between the read and the write. A retryable 409 states that honestly;
-                // a 500 would blame the caller's request for a race it can simply repeat.
+                // No row under this key means the owner was re-created between the read and the write, which a
+                // retryable 409 states honestly where a 500 would blame the caller for a repeatable race.
                 .orElseThrow(() -> CashAccountException.of(CashAccountErrorCode.CONCURRENT_MODIFICATION));
     }
 
@@ -350,37 +315,26 @@ public class ReservationService {
      *         including a hold that had lapsed, which this call expires and commits before refusing
      */
     public ReservationResponse settle(UUID reservationId, SettleRequest request) {
-        // One unlocked read serves the whole call: it establishes that the reservation exists, which state it
-        // is in, and which owner's account row a mutation would have to lock first.
+        // One unlocked read establishes that the reservation exists, its state, and whose account row a
+        // mutation would have to lock first.
         CashReservation stored = requireReservation(reservationId);
-        // Parsed before anything is locked or written, because a request refused as INVALID_AMOUNT must leave
-        // no state change behind it at all.
+        // Parsed before anything is locked or written, so a request refused as INVALID_AMOUNT leaves no state
+        // change behind it.
         Money settleAmount = requireSettleAmount(request == null ? null : request.amount(), reservationId);
 
-        /*
-         * WHY A TERMINAL RESERVATION IS ANSWERED WITHOUT THE ACCOUNT ROW. cash_reservation carries no foreign
-         * key and its rows are retained after a retail DELETE (AAP 0.11.1), so a settled, released or expired
-         * reservation legitimately outlives the account it names - and its outcome moves no money, being
-         * either the idempotent 200 the contract promises a retrying caller or a 409. Locking the account
-         * first would turn every such call on a deleted owner into a 409 about the account instead, so the
-         * lock is taken only for the HELD case that actually moves funds. The decision itself stays in
-         * domain/ReservationStateMachine, which owns the (state, command) table.
-         */
+        // A terminal reservation is answered without the account row: its rows are retained after a retail
+        // DELETE (AAP 0.11.1), so it legitimately outlives the account it names, and its outcome moves no
+        // money. Locking the account first would turn such a call on a deleted owner into a 409 about the
+        // account instead, so the lock is taken only for the HELD case that actually moves funds.
         if (!stored.isHeld()) {
             ReservationStateMachine.settleFromTerminal(stored);
             return ReservationResponse.from(stored);
         }
 
-        /*
-         * WHY ONE TRANSACTION DECIDES, AND WHY THE REFUSAL IS RAISED AFTER IT. An overdue hold is expired by
-         * the request that touched it rather than waiting for the sweep, and a settle from EXPIRED is refused
-         * - but CashAccountException is unchecked, so raising that 409 inside the transaction would roll the
-         * expiry back with it and lose the EXPIRY ledger row every transition owes the audit trail (AAP
-         * 0.7.4). settleOnce therefore commits whichever outcome it reached under the one account-first lock
-         * and reports which it was; the refusal is raised here, after the commit. A second transaction that
-         * expired the hold first, as an earlier shape did, would re-read and re-lock the same two rows for no
-         * added guarantee.
-         */
+        // An overdue hold is expired by the request that touched it, and a settle from EXPIRED is refused - but
+        // CashAccountException is unchecked, so raising that 409 inside the transaction would roll the expiry
+        // back with it and lose the EXPIRY ledger row every transition owes the audit trail (AAP 0.7.4).
+        // settleOnce commits whichever outcome it reached and reports which; the refusal follows the commit.
         TransitionOutcome outcome = self.getObject().settleOnce(reservationId, stored.owner(), settleAmount);
         if (outcome.expired()) {
             throw CashAccountException.forReservation(CashAccountErrorCode.INVALID_TRANSITION, reservationId,
@@ -401,8 +355,8 @@ public class ReservationService {
     public TransitionOutcome settleOnce(UUID reservationId, String owner, Money settleAmount) {
         CashAccount account = lockAccountFor(owner, reservationId);
         // Re-read under the lock, never trusted from the unlocked read above: a settle, release or sweep may
-        // have made the row terminal in between, and the state machine judges it as it stands here - which is
-        // what keeps exactly one terminal transition and one ledger row per hold.
+        // have made the row terminal in between, and judging it as it stands here is what keeps exactly one
+        // terminal transition and one ledger row per hold.
         CashReservation locked = lockReservation(reservationId);
         OffsetDateTime now = now();
 
@@ -437,8 +391,7 @@ public class ReservationService {
         }
 
         // No outcome of a release is a refusal once it reaches the lock: an expiry moves the money exactly
-        // where a release would, so the caller's intent is already satisfied and the committed EXPIRED
-        // outcome is the answer rather than a 409.
+        // where a release would, so the committed EXPIRED outcome is the answer rather than a 409.
         return self.getObject().releaseOnce(reservationId, stored.owner()).reservation();
     }
 
@@ -488,8 +441,7 @@ public class ReservationService {
         CashReservation reservation = claimed.get();
         OffsetDateTime now = now();
         // Re-checked under the account lock, which is what keeps exactly one terminal transition and one
-        // ledger row per hold: a second sweeper, or a settle or release that won the race, has already made
-        // the row terminal by the time this runs, and this call then correctly does nothing.
+        // ledger row per hold: a sweeper or a settle that won the race leaves nothing for this call to do.
         if (!reservation.isHeld() || !reservation.isExpiredAt(now)) {
             return false;
         }
@@ -502,7 +454,10 @@ public class ReservationService {
      *
      * @return the number of reservations this pass expired
      */
-    @Scheduled(fixedRateString = "${cashaccount.reservation.expiry-sweep-interval:PT60S}")
+    // The interval this expression names is bound and proven to be a positive duration by the constructor, which
+    // the container runs first, so the placeholder's resolved text can never be an expression by the time Spring
+    // reads it here.
+    @Scheduled(fixedRateString = "${" + EXPIRY_SWEEP_INTERVAL_PROPERTY + ":PT60S}")
     public int sweepExpiredReservations() {
         List<CashReservationRepository.ExpiryCandidate> candidates = reservations.findExpiryCandidates(
                 ReservationState.HELD, now(), PageRequest.of(0, EXPIRY_SWEEP_BATCH_SIZE));
@@ -516,7 +471,7 @@ public class ReservationService {
                 }
             } catch (RuntimeException failure) {
                 // Per candidate, so one unexpirable row cannot strand the funds of every later candidate in
-                // the batch. The next pass retries it, and this is the only log line the class emits.
+                // the batch; the next pass retries it.
                 LOG.warn("Expiry sweep skipped reservation {} of owner {}: {}", candidate.getReservationId(),
                         candidate.getOwner(), failure.toString());
             }
@@ -556,30 +511,22 @@ public class ReservationService {
     }
 
     private HoldOutcome replayOrReuse(CashReservation stored, String requestHash) {
-        // The key says "this is the same call"; the hash says whether that claim is true. A key presented
-        // with a different payload is therefore reuse (422) rather than a replay, because answering it with
-        // the stored reservation would silently discard a hold the caller genuinely asked for.
+        // The key claims "this is the same call"; the hash decides whether the claim is true. A key presented
+        // with a different payload is reuse (422), not a replay, because answering it with the stored
+        // reservation would silently discard a hold the caller genuinely asked for.
         if (!requestHash.equals(stored.requestHash())) {
             throw CashAccountException.forReservation(CashAccountErrorCode.IDEMPOTENCY_KEY_REUSED,
                     stored.reservationId());
         }
         // originalHold, not from: a replay owes the caller the answer its original call received (AAP 0.6.2,
-        // 0.7.3), so the row's live state - settled, released or expired by now - must not reach a client that
-        // is merely retrying the create. ReservationResponse records why that original body can be rebuilt
-        // exactly from this row; GET .../reservations/{reservationId} is where current state is published.
+        // 0.7.3), so the row's live state must not reach a client that is merely retrying the create.
         return new HoldOutcome(ReservationResponse.originalHold(stored), true);
     }
 
-    /*
-     * The one place a lapsed hold is expired, shared by the settle and release paths and by the sweep so that
-     * a single implementation decides and records it. An empty Optional means nothing was overdue - the
-     * ordinary case - and the caller then performs the transition it was asked for.
-     *
-     * SYSTEM rather than INSTITUTIONAL as the ledger source, even when a caller's settle or release is what
-     * noticed it: the event is the TTL elapsing, not the request, which is the distinction LedgerEntry.Source
-     * exists to record - and it leaves a lazily expired hold indistinguishable in the audit trail from one
-     * the scheduled sweep reached first.
-     */
+    // The one place a lapsed hold is expired, shared by the settle and release paths and by the sweep; an
+    // empty Optional means nothing was overdue and the caller performs the transition it was asked for. The
+    // ledger source is SYSTEM even when a caller's request noticed it, because the event is the TTL elapsing,
+    // which leaves a lazily expired hold indistinguishable from one the scheduled sweep reached first.
     private Optional<ReservationResponse> expireLapsedHold(CashAccount account, CashReservation reservation,
             OffsetDateTime now) {
 
@@ -590,6 +537,9 @@ public class ReservationService {
         return Optional.of(persist(account, reservation, expiry, LedgerEntry.Source.SYSTEM));
     }
 
+    // Every balance effect written here was decided and applied by domain/ReservationStateMachine - a hold
+    // moves available to reserved, a settle takes the settled part out and returns the remainder, a release or
+    // expiry returns the whole hold - so this class persists the rows it named and never restates the rule.
     private ReservationResponse persist(CashAccount account, CashReservation reservation,
             ReservationStateMachine.Effect effect, LedgerEntry.Source source) {
         CashReservation persisted = reservations.save(reservation);
@@ -600,9 +550,8 @@ public class ReservationService {
 
     private void appendLedger(CashAccount account, CashReservation reservation,
             ReservationStateMachine.Effect effect, LedgerEntry.Source source) {
-        // One row per effect, in the order the state machine named them, inside this transaction - so a
-        // partial settlement's SETTLEMENT and RELEASE rows and the balance change commit together and are
-        // queryable the instant they do. An idempotent no-op names no effect and therefore writes nothing.
+        // One row per effect, inside this transaction, so a partial settlement's SETTLEMENT and RELEASE rows
+        // and the balance change commit together and are queryable the instant they do.
         for (ReservationStateMachine.LedgerEffect ledgerEffect : effect.ledgerEffects()) {
             ledger.append(account, reservation, ledgerEffect.eventType(), ledgerEffect.amount(), source);
         }
@@ -617,15 +566,16 @@ public class ReservationService {
                         CashAccountErrorCode.RESERVATION_NOT_FOUND, reservationId));
     }
 
+    // The owner's cash_account row is the first lock on every path that moves money - request and sweep alike
+    // - and only then is the reservation row read FOR UPDATE, which is what keeps the lock graph cycle-free.
+    // Pessimistic row locking is the estate's strategy
+    // [backend/portfolio/src/main/resources/META-INF/persistence.xml:L13-L14], used here on locking queries
+    // only, so plain reads stay lock-free.
     private CashAccount lockAccountFor(String owner, UUID reservationId) {
-        // Only the HELD paths reach this, and a HELD reservation's account cannot ordinarily be missing: a
-        // retail DELETE is refused with RESERVATIONS_OUTSTANDING while any hold is HELD, and a terminal
-        // reservation - whose row deliberately outlives its account, cash_reservation carrying no foreign key
-        // - is answered by settle/release without ever asking for the account. An absent row here therefore
-        // means a hold whose funds have nowhere to return to, most likely a row changed outside this service,
-        // and INVALID_TRANSITION is the truthful answer: the transition cannot be performed. The ledger query
-        // remains that owner's audit path either way.
         return accounts.findByOwnerForUpdate(owner)
+                // Only the HELD paths reach this, and a retail DELETE is refused while any hold is HELD, so an
+                // absent row means a hold whose funds have nowhere to return to - most likely a row changed
+                // outside this service - and INVALID_TRANSITION is the truthful answer.
                 .orElseThrow(() -> CashAccountException.forReservation(
                         CashAccountErrorCode.INVALID_TRANSITION, reservationId,
                         "The account this reservation was placed against no longer exists."));
@@ -652,27 +602,19 @@ public class ReservationService {
         return candidate;
     }
 
-    /*
-     * WHY THE AMOUNT IS NORMALIZED AND COMPARED BEFORE Money IS CONSTRUCTED. Money.of applies the
-     * NUMERIC(9,2) storage ceiling and answers anything above it with AMOUNT_OUT_OF_RANGE (422) - a code the
-     * closed hold error set does not contain (AAP 0.6.2). A hold of 50,000,000.00 against a 1,000.00 account
-     * is simply a request for more than the account can cover, and INSUFFICIENT_FUNDS is the code the
-     * contract names for that; answering with a range error would also tell the caller its amount was
-     * unrepresentable when what it needs to know is that the funds are not there. No available balance can
-     * exceed that ceiling, so the comparison is decisive here, and the authoritative sufficiency check stays
-     * where both the retail debit and the hold can share it - Money.minus, under the account lock, through
-     * domain/ReservationStateMachine.hold.
-     */
+    // Compared before Money is constructed, because Money.of answers anything above the NUMERIC(9,2) ceiling
+    // with AMOUNT_OUT_OF_RANGE, which the closed hold error set does not contain (AAP 0.6.2); no balance can
+    // exceed that ceiling either, so such a hold is more than the account can cover. The authoritative
+    // sufficiency check stays in Money.minus under the account lock, shared with the retail debit.
     private static Money requireHoldAmount(BigDecimal raw, String owner) {
         if (raw == null) {
             throw CashAccountException.forOwner(CashAccountErrorCode.INVALID_AMOUNT, owner);
         }
-        // Scaled the way Money scales, so the value judged is the value that would be stored: a hold of
-        // 0.004 reserves nothing once stored and is refused as the zero it becomes.
+        // Scaled the way Money scales, so the value judged is the value that would be stored: a hold of 0.004
+        // reserves nothing once stored and is refused as the zero it becomes.
         BigDecimal normalized = raw.setScale(Money.SCALE, Money.ROUNDING);
-        // Money permits zero because a retail credit or debit of zero is legal; a hold of zero is not, so the
-        // institutional path refuses it rather than reserving nothing under a live reservation. A negative
-        // amount is the same 400, which is why one comparison covers both.
+        // Money permits zero because a retail credit or debit of zero is legal; a hold of zero is not, and a
+        // negative amount is the same 400, which is why one comparison covers both.
         if (normalized.signum() <= 0) {
             throw CashAccountException.forOwner(CashAccountErrorCode.INVALID_AMOUNT, owner);
         }
@@ -683,19 +625,10 @@ public class ReservationService {
         return Money.of(normalized);
     }
 
-    /*
-     * The settle counterpart of the same rule: above the ceiling Money.of raises AMOUNT_OUT_OF_RANGE, which
-     * the closed settle error set does not contain either (AAP 0.6.2). No held amount can exceed the ceiling,
-     * so an amount above it necessarily exceeds what was held - the contract's INVALID_AMOUNT (> held) case.
-     * The comparison against the reservation's own held amount is deliberately NOT made here: it belongs to
-     * domain/ReservationStateMachine, which judges it against the row it locked. A null amount is the
-     * documented full settlement and is passed through untouched for the state machine to resolve.
-     *
-     * The sign is judged on the RAW value, before scaling, exactly as Money.of judges it: -0.001 truncates
-     * DOWN to 0.00 at scale 2, and a sign read after that normalization would accept a negative caller value
-     * as the legal zero settlement - settling nothing while releasing the whole hold (AAP 0.6.2 binds a
-     * negative amount to 400 INVALID_AMOUNT). Only the ceiling is compared on the stored scale.
-     */
+    // The settle counterpart of the same rule: an amount above the ceiling necessarily exceeds what was held,
+    // the contract's INVALID_AMOUNT, while AMOUNT_OUT_OF_RANGE is outside the closed settle set (AAP 0.6.2).
+    // Against the row's own held amount it is domain/ReservationStateMachine that compares, and a null amount
+    // passes through as the full settlement. The sign is judged raw: -0.001 truncates DOWN to a legal zero.
     private static Money requireSettleAmount(BigDecimal raw, UUID reservationId) {
         if (raw == null) {
             return null;
@@ -725,18 +658,10 @@ public class ReservationService {
 
     private static String canonicalRequestHash(String orderReference, Money amount, String currency,
             OffsetDateTime expiresAt) {
-        // The canonical form makes replay detection insensitive to what does not matter and sensitive to what
-        // does: orderReference is compared exactly with no case folding, 10 / 10.0 / 10.00 fix to one scale
-        // and hash alike, and an omitted expiry contributes a literal so a replay that also omits it matches
-        // despite the server-generated default being time-dependent.
-        //
-        // The expression is the one AAP 0.7.3 fixes, component for component, and nothing is normalized on
-        // the way in beyond what that clause names: the order reference is hashed exactly as the caller sent
-        // it - no case folding and no trimming - and an explicit expiry contributes its full instant. Two
-        // payloads that differ anywhere in this string are two different requests under one key, which the
-        // contract answers with 422 IDEMPOTENCY_KEY_REUSED rather than with the stored hold. What makes a
-        // replay of the values the first response handed back match is therefore not a rule applied here but
-        // domain/CashReservation storing the order reference exactly as it was hashed.
+        // The expression is the one AAP 0.7.3 fixes, component for component: the order reference is hashed
+        // exactly as the caller sent it, no case folding or trimming; 10 / 10.0 / 10.00 fix to one scale and
+        // hash alike; and an omitted expiry contributes a literal so a replay that omits it too matches the
+        // time-dependent server default. Any other difference is two requests under one key - 422, not replay.
         String canonical = orderReference + '|'
                 + amount.amount().setScale(Money.SCALE, Money.ROUNDING).toPlainString() + '|'
                 + currency + '|'
@@ -752,5 +677,29 @@ public class ReservationService {
 
     private OffsetDateTime now() {
         return OffsetDateTime.now(ZoneOffset.UTC);
+    }
+
+    // Binder, never a @Value placeholder: a placeholder's RESOLVED TEXT is then handed to Spring's expression
+    // resolver, so a duration written as #{...} would execute while this service was being created. Binder resolves
+    // ${...} and converts, evaluating nothing, so such a value fails the conversion instead of running. Reading it
+    // from the Environment rather than injecting the typed properties object keeps this package free of config,
+    // which wires everything and is depended on by nothing (AAP 0.8.2). A non-configurable Environment exposes no
+    // property sources, so it yields the documented default exactly as an unset key does.
+    private static Duration durationFrom(Environment environment, String key, Duration fallback) {
+        if (!(environment instanceof ConfigurableEnvironment)) {
+            return fallback;
+        }
+        return Binder.get(environment).bind(key, Bindable.of(Duration.class)).orElse(fallback);
+    }
+
+    // Refused at start-up rather than absorbed: a zero or negative TTL would make every hold expire the instant it
+    // was taken, and a zero or negative sweep interval is not a schedule at all - both are misconfigurations an
+    // operator has to see before the first hold, which is also the posture config/CashAccountProperties takes to
+    // the same two keys.
+    private static Duration positiveDuration(String key, Duration value) {
+        if (value == null || value.isZero() || value.isNegative()) {
+            throw new IllegalStateException(key + " must be a positive ISO-8601 duration, but was " + value);
+        }
+        return value;
     }
 }

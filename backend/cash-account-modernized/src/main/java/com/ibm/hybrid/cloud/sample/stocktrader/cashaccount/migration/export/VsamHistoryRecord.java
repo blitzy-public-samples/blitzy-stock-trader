@@ -1,35 +1,26 @@
-/*
-       Copyright 2025 Kyndryl, All Rights Reserved
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
- */
-
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.migration.export;
 
 import java.math.BigDecimal;
 
-/** One record of the legacy write-only VSAM HISTORY KSDS, in the WS-VSAM-RECORD layout of CASH00.cbl:L38-L45. */
+/**
+ * One record of the legacy write-only VSAM HISTORY KSDS, in the WS-VSAM-RECORD layout of CASH00.cbl:L38-L45.
+ *
+ * @param name        the owner as the caller supplied it, part of the 29-byte KSDS key
+ * @param eventDate   the raw YYYYMMDD stamp, part of that key
+ * @param eventTime   the raw HHMMSS stamp, part of that key
+ * @param requestCode the legacy one-character request code, including codes the dispatch did not recognize
+ * @param balance     the balance the record carried, decoded from unsigned zoned decimal
+ * @param currency    the currency the record carried
+ * @param retcode     the SQLCODE as unsigned digits, sign already dropped by the legacy MOVE
+ */
 public record VsamHistoryRecord(
-        // Keeps the caller's original casing: CASH00.cbl:L111 moves WS-NAME straight into the record with
-        // no case folding, whereas the account table normalizes (UPPER on insert at L155, LOWER on match
-        // at L141). "John"+stamp and "JOHN"+stamp are therefore two separate, equally valid KSDS keys
-        // (WS-VSAM-KEY, CASH00.cbl:L47-L50; KEYS, DEFKSDS.jcl:L14) and both must survive an import
-        // unaltered. The uppercased join key is a later, separate derivation: reconcile/LegacyHistory.ownerKey.
+        // Unfolded caller casing: CASH00.cbl:L111 moves WS-NAME in without the account table's UPPER/LOWER
+        // normalization (L155, L141), so "John"+stamp and "JOHN"+stamp are two equally valid 29-byte KSDS
+        // keys (CASH00.cbl:L47-L50; DEFKSDS.jcl:L14) and both must survive an import unaltered.
         String name,
-        // Kept as the raw YYYYMMDD / HHMMSS text written at CASH00.cbl:L112-L113 from FORMATTIME
-        // (L82-L85): resolving it to a point in time needs the CICS region's zone, which is not in this
-        // repository and arrives as the tool.legacy-timezone property, so that conversion belongs to
-        // load/LegacyLoader rather than to this carrier.
+        // Raw YYYYMMDD / HHMMSS text (CASH00.cbl:L112-L113, from FORMATTIME at L82-L85): resolving it to an
+        // instant needs the CICS region's zone, which arrives as tool.legacy-timezone, so that conversion
+        // belongs to load/LegacyLoader rather than to this carrier.
         String eventDate,
         String eventTime,
         String requestCode,

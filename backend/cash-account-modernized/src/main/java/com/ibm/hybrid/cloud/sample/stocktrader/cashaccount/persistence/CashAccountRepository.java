@@ -1,19 +1,3 @@
-/*
-       Copyright 2025 Kyndryl, All Rights Reserved
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
- */
-
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.persistence;
 
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.domain.CashAccount;
@@ -29,46 +13,33 @@ public interface CashAccountRepository extends JpaRepository<CashAccount, String
 
     Optional<CashAccount> findByOwner(String owner);
 
-    // The JPQL is declared rather than derived because "ForUpdate" is not a property of CashAccount: a derived
-    // query would read the method name as the property path ownerForUpdate and break the repository factory at
-    // context start-up, whereas a declared query pre-empts derivation under the default CREATE_IF_NOT_FOUND
-    // lookup strategy.
-    //
     // This row lock is the FIRST lock every balance mutation takes - the account row here, the reservation row
-    // FOR UPDATE afterwards - and that single fixed order is what keeps the design cycle-free, the expiry sweep
+    // FOR UPDATE afterwards - and that one fixed order is what keeps the design cycle-free, the expiry sweep
     // included: a sweeper and a concurrent settle contend for the account row before either reaches the
     // reservation, so one waits rather than the two deadlocking.
     //
-    // The caller must already be inside its own @Transactional unit. Invoked bare, Spring Data's default
+    // The caller must already be inside its own @Transactional unit: invoked bare, Spring Data's default
     // read-only transaction commits as the method returns and surrenders the lock before the balance it was
     // taken to protect has been read, decided upon and written.
     //
     // Pessimistic row locking is the estate's established strategy
-    // (backend/portfolio/src/main/resources/META-INF/persistence.xml:L13-L14), narrowed here on purpose from
-    // that unit-wide eclipselink.pessimistic-lock setting to this one query so plain reads stay lock-free; the
-    // same file's cache.shared.default=false is why no second-level or query cache is introduced alongside it.
+    // (backend/portfolio/src/main/resources/META-INF/persistence.xml:L13-L14), narrowed here from that
+    // unit-wide setting to the queries that need it so plain reads stay lock-free; the same file's
+    // cache.shared.default=false is why no second-level or query cache is introduced alongside it.
     //
-    // PESSIMISTIC_WRITE reaches PostgreSQL as "for no key update", unqualified by any alias - the clause
-    // observed in the emitted SQL, and rendered by PostgreSQLSqlAstTranslator.getForUpdate() in
-    // hibernate-core 6.5.3.Final. Reading it off PostgreSQLDialect.getWriteLockString instead answers
-    // " for update", which is the pre-6 lock-string path this query does not take; the emitted clause is the
-    // one that decides. It sounds weaker than it locks: FOR NO KEY UPDATE conflicts with itself, with FOR
-    // SHARE and FOR UPDATE, and with any UPDATE or DELETE of the row, leaving only the FOR KEY SHARE a
-    // foreign-key check takes - and no table references cash_account.
-    //
-    // No jakarta.persistence.lock.timeout hint accompanies it: PostgreSQL's row locks express only NOWAIT
-    // and SKIP LOCKED, so a positive wait would be silently ignored. Blocking is therefore left to the server,
-    // whose own deadlock detection surfaces as CannotAcquireLockException - which the error package already
-    // renders as 409 CONCURRENT_MODIFICATION, never a 500, so nothing is caught or translated here.
+    // The JPQL is declared because "ForUpdate" is not a property of CashAccount: derivation would read the
+    // method name as the property path ownerForUpdate and fail the repository factory at start-up. No
+    // lock-timeout hint accompanies the lock, because PostgreSQL's row locks express only NOWAIT and SKIP
+    // LOCKED; blocking is the server's to arbitrate, and its deadlock detection reaches the error package as
+    // CannotAcquireLockException, already rendered there as 409 CONCURRENT_MODIFICATION.
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("select a from CashAccount a where a.owner = :owner")
     Optional<CashAccount> findByOwnerForUpdate(@Param("owner") String owner);
 
-    // A courtesy check, never the guard. Two concurrent creates of one owner can both see false here, so the
-    // authority on whether an account exists is the owner primary key, and the inherited saveAndFlush has to reach
-    // the database as an INSERT for that authority to speak: domain/CashAccount declares a nullable @Version so
-    // Spring Data recognizes an unwritten account and persists it, instead of merging it into whichever row a
-    // concurrent create had just committed. RetailCashAccountService.create translates the resulting
-    // pk_cash_account violation - and only that one - into 409 ACCOUNT_ALREADY_EXISTS.
+    // A courtesy check, never the guard: two concurrent creates of one owner can both see false here, so the
+    // authority is the pk_cash_account primary key and the 409 ACCOUNT_ALREADY_EXISTS its violation becomes.
+    // For that authority to speak, the inherited saveAndFlush has to reach the database as an INSERT, which
+    // is why domain/CashAccount declares a nullable @Version - Spring Data then persists an unwritten account
+    // instead of merging it into whichever row a concurrent create had just committed.
     boolean existsByOwner(String owner);
 }

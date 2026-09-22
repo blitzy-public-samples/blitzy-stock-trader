@@ -1,19 +1,3 @@
-/*
-       Copyright 2025 Kyndryl, All Rights Reserved
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
- */
-
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.migration.reconcile;
 
 import jakarta.persistence.EntityManager;
@@ -33,7 +17,6 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.regex.Pattern;
 
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.context.properties.bind.Bindable;
 import org.springframework.boot.context.properties.bind.Binder;
 import org.springframework.core.env.ConfigurableEnvironment;
@@ -60,22 +43,17 @@ import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.persistence.LegacyRat
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.persistence.MigrationReconciliationRepository;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.persistence.MigrationRunRepository;
 
-/** Turns a legacy export plus the migrated database state into {@code migration_reconciliation} rows and a run summary. */
-// NO @Profile("tool"), deliberately. migration.load.LegacyLoader calls validateSource() and
-// migration.MigrationToolRunner calls reconcile(); a bean without a profile is visible in every profile, so
-// leaving this one un-profiled makes it injectable whichever profile those two carry and removes a way for the
-// tooling to fail to wire. Its presence in the deployed web context is inert: no request mapping, no @Scheduled
-// work, no constructor side effect, and nothing on the request path injects it.
-//
-// Every difference is a ROW, never a log line (AAP 0.6.5): migration_reconciliation is the evidence the runbook's
-// sign-off reads and the deterministic set the integration tests assert over, so a finding that existed only in
-// output would be invisible to both.
+/**
+ * Turns a legacy export plus the migrated database state into {@code migration_reconciliation} rows and a
+ * run summary, deliberately un-profiled so the tooling wires it under whichever profile it runs and the
+ * deployed web context holds it inert.
+ */
 @Service
 public class ReconciliationService {
 
-    // Reason tokens. Held as constants so the two methods that write them cannot drift, and so a test can assert
-    // one verbatim out of the row's value columns. The convention throughout: the legacy-side rendering or reason
-    // goes in legacy_value, the target-side rendering or reason in migrated_value.
+    // Reason tokens, held as constants so the methods that write them cannot drift and a test can assert one
+    // verbatim out of a row. The convention throughout: the legacy-side reason or rendering goes in
+    // legacy_value, the target-side one in migrated_value.
     private static final String NULL_IN_LEGACY = "NULL_IN_LEGACY";
 
     private static final String INVALID_IN_LEGACY = "INVALID_IN_LEGACY";
@@ -91,32 +69,32 @@ public class ReconciliationService {
     /** The counterpart token: the side of the comparison on which the owner does exist. */
     private static final String PRESENT = "PRESENT";
 
-    // The accepted-currency policy has ONE authority, and it is this property as application.yml declares it
-    // (AAP 0.7.2's 31-code estate allowlist). No copy of that set lives in this class: the reconciler decides
-    // whether a legacy export row is loadable, so a second copy here that drifted from the request path's would
-    // stage accounts the service then refuses, or reject accounts it would have accepted - a divergence nothing
-    // would announce. Bound with Binder rather than @Value because application.yml writes the property as a YAML
-    // sequence, which reaches the Environment only as indexed keys: a ${...} placeholder cannot aggregate those,
-    // so it silently resolved to its own literal default and ignored both the file and every list-form override.
+    // The single authority for the accepted-currency policy is this property as application.yml declares it
+    // (AAP 0.7.2's 31-code estate allowlist), never a copy in this class: a copy that drifted from the request
+    // path's would stage accounts the service then refuses, and nothing would announce the divergence.
     private static final String ACCEPTED_CURRENCIES_PROPERTY = "cashaccount.fx.accepted-currencies";
 
     // The three-letter shape the API accepts; membership of the accepted set is the second, independent test.
     private static final Pattern CURRENCY_CODE = Pattern.compile("^[A-Z]{3}$");
 
-    // How many owners one target-only classification query names at a time. The question "was every ledger row
-    // of this owner written by a load?" is answered for a whole set of owners in ONE statement rather than by
-    // reading any owner's history, and the chunk keeps the IN list - and therefore the bind-parameter count and
-    // the planner's work - bounded however many accounts the target holds.
+    // Bounds the IN list - and so the bind-parameter count and the planner's work - of the one statement that
+    // classifies a whole set of target-only owners, however many accounts the target holds.
     private static final int OWNER_CLASSIFICATION_CHUNK = 500;
 
-    // How many exported owners are compared, how many target rows are paged, and how many classified records
-    // pass before the persistence context is flushed and cleared. A property because the value is an operator's
-    // trade-off between round trips and resident rows and not a correctness parameter, and 50 because it matches
-    // hibernate.jdbc.batch_size in application.yml, so one flush maps onto whole JDBC batches. Under
-    // cashaccount.* rather than tool.* because MigrationToolRunner's typo guard admits only the seven tool.*
-    // options it declares; the textual default keeps a context that sets nothing - the deployed web application,
-    // which never reconciles - starting exactly as before.
-    private static final String BATCH_CHUNK_SIZE_PROPERTY = "${cashaccount.migration.batch-chunk-size:50}";
+    // Configuration rather than a literal because the value is an operator's trade-off between round trips and
+    // resident rows, not a correctness parameter; 50 matches hibernate.jdbc.batch_size in application.yml so one
+    // flush maps onto whole JDBC batches. Under cashaccount.* rather than tool.* because MigrationToolRunner's
+    // typo guard admits only the tool.* options it declares, and the default below keeps a context that sets
+    // nothing - the deployed web application, which never reconciles - starting unchanged.
+    private static final String BATCH_CHUNK_SIZE_PROPERTY = "cashaccount.migration.batch-chunk-size";
+
+    private static final int DEFAULT_BATCH_CHUNK_SIZE = 50;
+
+    // The rate source in force for a run, and the default application-tool.yml ships: parity can only be judged
+    // on identical inputs, so an operator who passes nothing gets the legacy-table gate.
+    private static final String RATE_SOURCE_PROPERTY = "tool.rate-source";
+
+    private static final String DEFAULT_RATE_SOURCE = "legacy-table";
 
     private final CashAccountRepository accounts;
 
@@ -136,46 +114,33 @@ public class ReconciliationService {
 
     private final Set<String> acceptedCurrencies;
 
-    // Resolved through MigrationRun.RateSource, never held as raw text: fx/ToolExchangeRateSource picks the
-    // delegate that prices a replay from the same property after canonicalizing it, so a raw comparison here
-    // could classify a live-priced difference as one the parity gate produced - the run's rows would then
-    // contradict the arithmetic behind them.
+    // Canonicalized through MigrationRun.RateSource rather than kept as raw text, because fx/ToolExchangeRateSource
+    // picks the delegate that prices a replay from the same property the same way: a raw comparison here could
+    // classify a live-priced difference as one the parity gate produced.
     private final MigrationRun.RateSource rateSource;
 
     private final int batchChunkSize;
 
-    // WHY AN EntityManager SITS BESIDE THE REPOSITORIES RATHER THAN REPLACING THEM. The repositories remain the
-    // whole query path - nothing below issues JPQL or SQL of its own - and this exists for one thing the Spring
-    // Data interfaces cannot express: bounding the persistence context with flush() and clear() so a reconcile
-    // over a production-sized target does not accumulate every entity it has touched. @PersistenceContext
-    // injects the shared transaction-scoped proxy, so the flush and clear land in the caller's transaction and
-    // never open one of their own (AAP 0.6.3).
-    // CONTEXT CONTROL ONLY, NEVER A DATA PATH. Every row this class reads or writes goes through a repository
-    // under persistence/ (AAP 0.6.5); this reference exists for the one operation no Spring Data interface
-    // exposes - clear(), which bounds the persistence context across a bulk reconcile - paired with the flush
-    // that must precede it. Nothing is persisted, merged, removed or queried through it.
+    // Context control only, never a data path: every row read or written here goes through a repository under
+    // persistence/ (AAP 0.6.5), and this exists for the one operation no Spring Data interface exposes - clear(),
+    // paired with the flush that must precede it - which is what keeps a reconcile over a production-sized target
+    // from accumulating every entity it touched. @PersistenceContext injects the transaction-scoped proxy, so both
+    // land in the caller's transaction and never open one of their own (AAP 0.6.3).
     @PersistenceContext
     private EntityManager entityManager;
 
-    /**
-     * Container constructor.
-     *
-     * @param environment source of the accepted-currency set, read through {@link Binder} because
-     *                    {@code cashaccount.fx.accepted-currencies} is written as a YAML sequence; a
-     *                    {@code @Value} placeholder cannot bind one
-     * @param rateSource  {@code tool.rate-source}, a scalar, so a placeholder binds it correctly
-     * @param batchChunkSize {@code cashaccount.migration.batch-chunk-size}, the rows compared and the findings
-     *                    held between two bounds of the persistence context; refused below 1
-     */
+    // Binder, never @Value, for the two scalars as well as the accepted-currency sequence: a @Value placeholder is
+    // resolved and its resolved text is then handed to Spring's expression resolver, so either scalar written as
+    // #{...} would execute while this service was being created. Binder resolves ${...} and converts, evaluating
+    // nothing, so an unusable rate source is refused by MigrationRun.RateSource.of and an unusable chunk size by
+    // the check below.
     public ReconciliationService(CashAccountRepository accounts,
                                  CashReservationRepository reservations,
                                  LedgerEntryRepository ledgerEntries,
                                  LegacyRateTableRepository legacyRates,
                                  MigrationReconciliationRepository reconciliations,
                                  MigrationRunRepository runs,
-                                 Environment environment,
-                                 @Value("${tool.rate-source:legacy-table}") String rateSource,
-                                 @Value(BATCH_CHUNK_SIZE_PROPERTY) int batchChunkSize) {
+                                 Environment environment) {
         this.accounts = Objects.requireNonNull(accounts, "accounts");
         this.reservations = Objects.requireNonNull(reservations, "reservations");
         this.ledgerEntries = Objects.requireNonNull(ledgerEntries, "ledgerEntries");
@@ -183,7 +148,9 @@ public class ReconciliationService {
         this.reconciliations = Objects.requireNonNull(reconciliations, "reconciliations");
         this.runs = Objects.requireNonNull(runs, "runs");
         this.exportReader = new DelimitedExportReader();
-        this.rateSource = MigrationRun.RateSource.of(rateSource);
+        this.rateSource = MigrationRun.RateSource.of(
+                stringProperty(environment, RATE_SOURCE_PROPERTY, DEFAULT_RATE_SOURCE));
+        int batchChunkSize = integerProperty(environment, BATCH_CHUNK_SIZE_PROPERTY, DEFAULT_BATCH_CHUNK_SIZE);
         // Refused rather than defaulted away: a zero or negative chunk size would make the compare loop below
         // advance by nothing, which is a hang in a migration window rather than a slow run.
         if (batchChunkSize < 1) {
@@ -197,61 +164,86 @@ public class ReconciliationService {
     /**
      * What the source validation established about one legacy export, for the loader that has to act on it.
      *
-     * <p>{@code rejectedOwners} carries owners in their normalized form
-     * ({@link OwnerNormalizer#normalize(String)}); {@code rejectedRateKeys} carries the rate keys exactly as the
-     * export's {@code currnkey} column held them, because that value is the identity the legacy join compared and
-     * the one a staged row is keyed by. They are returned rather than merely recorded so that
-     * {@code migration.load.LegacyLoader} can decline to apply exactly those rows.</p>
-     *
+     * @param rejectedOwners   owners refused, normalized by {@link OwnerNormalizer#normalize(String)}; refusals
+     *                         rather than acceptances, so this stays proportional to the findings a data owner
+     *                         reviews instead of growing with a whole DB2 unload
+     * @param rejectedRateKeys rate keys refused, exactly as the export's {@code currnkey} column held them,
+     *                         because that is the identity the legacy join compared and a staged row is keyed by
      * @param legacyAccountCount rows read from the account export, rejected rows included
      * @param varianceCount      {@code VARIANCE} rows this validation wrote under the run
      */
-    // WHAT WAS REFUSED, NEVER WHAT WAS ACCEPTED. An accepted-list would hold one entry per row of the export and
-    // would therefore grow with a whole DB2 unload, while every consumer of this record is itself reading that
-    // same export row by row and only needs to know whether the row in hand was refused. Refusals are the
-    // exceptions a data owner reviews, so this state is proportional to the findings rather than to the file.
     public record SourceValidation(Set<String> rejectedOwners,
                                    Set<String> rejectedRateKeys,
                                    int legacyAccountCount,
                                    int varianceCount) {
     }
 
-    /** Reads the account and rate exports out of {@code inputDirectory} and validates them. */
-    // Transactional on every public form, and REQUIRED rather than REQUIRES_NEW: load/LegacyLoader and
-    // reconcile() call in from a transaction of their own, which these join, so the findings still land with
-    // the work that produced them (AAP 0.6.3); a direct caller with no transaction of its own gets one here,
-    // because classifying an export bounds the persistence context as it goes and a flush has no meaning
-    // outside a transaction.
+    /**
+     * Resolves the export's two files inside {@code inputDirectory} and validates them.
+     *
+     * @param run            the run the findings are recorded under
+     * @param inputDirectory directory holding {@link LegacyExportFormat#CASH_ACCOUNT_FILE} and
+     *                       {@link LegacyExportFormat#RATE_TABLE_FILE}
+     * @return what was refused, and the counts, for the caller that has to act on it
+     */
     @Transactional
     public SourceValidation validateSource(MigrationRun run, Path inputDirectory) {
         Objects.requireNonNull(run, "run");
         Objects.requireNonNull(inputDirectory, "inputDirectory");
+        // Both children are resolved through LegacyExportFormat, which refuses a symbolic link, a
+        // non-ordinary file and anything whose real path is not a child of the approved directory: a link
+        // named cashaccounty.csv would otherwise be classified as legacy data and echoed back in the findings
+        // it produced (AAP 0.3.2). The approval is taken once and carried into the reads, so each file is
+        // opened relative to the directory that was validated rather than to its name - a directory
+        // component substituted in between is then refused instead of followed. A file that is simply absent
+        // is still reported by the reader that opens it, naming the file and the column shape it wanted.
+        LegacyExportFormat.ApprovedDirectory approved =
+                LegacyExportFormat.approveInputDirectory(inputDirectory);
+        LegacyExportFormat.resolveInputFile(inputDirectory, LegacyExportFormat.CASH_ACCOUNT_FILE);
+        LegacyExportFormat.resolveInputFile(inputDirectory, LegacyExportFormat.RATE_TABLE_FILE);
         return validateSource(run,
-                inputDirectory.resolve(LegacyExportFormat.CASH_ACCOUNT_FILE),
-                inputDirectory.resolve(LegacyExportFormat.RATE_TABLE_FILE));
+                LegacyExportFormat.ExportFile.inApprovedDirectory(approved,
+                        LegacyExportFormat.CASH_ACCOUNT_FILE),
+                LegacyExportFormat.ExportFile.inApprovedDirectory(approved,
+                        LegacyExportFormat.RATE_TABLE_FILE));
     }
 
     /**
-     * Classifies the named exports without holding either file, applying the same per-record rules the list
-     * form applies.
+     * Classifies the named exports without holding either file, which is why both {@code load} and
+     * {@code reconcile} validate through this form: a bulk load must classify a whole DB2 unload before it
+     * writes its first account row, and holding that file as a list of records to do so is exactly the
+     * unbounded read this form avoids.
+     *
+     * @param run         the run the findings are recorded under
+     * @param accountFile the account export, required
+     * @param rateFile    the rate-table export, or {@code null} for a run that carries accounts alone
+     * @return what was refused, and the counts, for the caller that has to act on it
+     */
+    @Transactional
+    public SourceValidation validateSource(MigrationRun run, Path accountFile, Path rateFile) {
+        Objects.requireNonNull(accountFile, "accountFile");
+        return validateSource(run, LegacyExportFormat.ExportFile.named(accountFile),
+                rateFile == null ? null : LegacyExportFormat.ExportFile.named(rateFile));
+    }
+
+    /**
+     * Classifies exports already resolved to their open policy, which is how a runbook directory's files are
+     * read: relative to the approved directory rather than by a name resolved again at open time.
      *
      * @param accountFile the account export, required
      * @param rateFile    the rate-table export, or {@code null} for a run that carries accounts alone
      */
-    // The bounded entry point, and the one load/LegacyLoader's first pass uses: a bulk load has to classify a
-    // whole DB2 unload before it writes its first account row, and holding that file as a list of records in
-    // order to do so is exactly the unbounded read this form exists to avoid. No rule is restated here - all
-    // three entry points drive classifyAccount/classifyRate against one accumulator, so the classification
-    // keeps a single home and the list form stays behaviourally identical to it.
     @Transactional
-    public SourceValidation validateSource(MigrationRun run, Path accountFile, Path rateFile) {
+    public SourceValidation validateSource(MigrationRun run,
+                                           LegacyExportFormat.ExportFile accountFile,
+                                           LegacyExportFormat.ExportFile rateFile) {
         Objects.requireNonNull(run, "run");
         Objects.requireNonNull(accountFile, "accountFile");
 
         SourceClassification classification = new SourceClassification();
         exportReader.streamCashAccounts(accountFile, record -> classifyAccount(run, record, classification));
-        // A null rate file is the accounts-only shape: the validation then sees no rate row at all, so nothing
-        // is staged and no rate finding is recorded - the run simply has nothing to say about currencies.
+        // The accounts-only shape sees no rate row at all, so nothing is staged and no rate finding is
+        // recorded - the run simply has nothing to say about currencies.
         if (rateFile != null) {
             exportReader.streamRates(rateFile, rateRecord -> classifyRate(run, rateRecord, classification));
         }
@@ -259,22 +251,23 @@ public class ReconciliationService {
     }
 
     /**
-     * Classifies every exported row that the target's {@code NOT NULL} columns and accepted-currency set cannot
-     * accept, writing one row per finding and naming what may be loaded.
+     * Classifies rows a caller already holds, writing one {@code NULL_IN_LEGACY}, {@code INVALID_IN_LEGACY} or
+     * {@code NULL_RATE} row per finding and naming what may be loaded.
      *
-     * <p>Both {@code load} and {@code reconcile} run this first, under their own run identifier.</p>
+     * <p>Classification, never repair: five of the eight legacy columns are nullable and the program declared no
+     * null indicators (DB2DDL.jcl:L48-L49, L56-L58; DCLFRANK.cpy:L19-L23), so a null in an export is a
+     * legitimate legacy state only the data owner can settle, and substituting a zero or a default here would
+     * erase the finding an operator has to review.</p>
+     *
+     * @param run            the run the findings are recorded under
+     * @param accountRecords exported account rows, in file order
+     * @param rateRecords    exported rate rows, empty for a run that carries accounts alone
+     * @return what was refused, and the counts, for the caller that has to act on it
      */
-    // @Transactional with the default REQUIRED, and never REQUIRES_NEW: a load applies the whole export in ONE
-    // transaction (AAP 0.6.3), so either every row lands or none does, and this joins that transaction when the
-    // loader calls in. A transaction of its own here would commit these variance rows even where the load it
-    // belongs to then rolled back, leaving findings attributed to a run that applied nothing. The annotation is
-    // there for a caller with no transaction at all: classifying bounds the persistence context as it goes, and
-    // a flush has no meaning outside one.
-    //
-    // Classification, never repair. Five of the eight legacy columns are nullable and the program declared no null
-    // indicators (DB2DDL.jcl:L48-L49, L56-L58; DCLFRANK.cpy:L19-L23), so a null in an export is a legitimate
-    // legacy state whose meaning only the data owner can settle. Substituting a zero or a default here would erase
-    // the very finding an operator has to review.
+    // @Transactional with the default REQUIRED on every public form, never REQUIRES_NEW: a load applies its whole
+    // export in one transaction (AAP 0.6.3) and these join it, so a variance row can never be committed under a
+    // run whose load then rolled back. The annotation is there for a caller with no transaction at all, because
+    // classifying bounds the persistence context as it goes and a flush has no meaning outside one.
     @Transactional
     public SourceValidation validateSource(MigrationRun run,
                                            List<LegacyCashAccountRecord> accountRecords,
@@ -293,23 +286,21 @@ public class ReconciliationService {
         return classification.toValidation();
     }
 
-    // One exported account row against the two conditions the legacy catalog genuinely permitted, and the only
-    // place they are written down: the list form and the streaming form both call this, so neither can drift.
+    // The only place the two conditions the legacy catalog genuinely permitted are written down: the list form
+    // and the streaming form both call this, so neither can drift.
     private void classifyAccount(MigrationRun run, LegacyCashAccountRecord record,
                                  SourceClassification classification) {
         classification.legacyAccountCount++;
         boundFindings(classification);
 
-        // An owner the legacy CHAR(32) column could not have held is a malformed export rather than a
-        // variance: normalize(...) raises, the transaction aborts and the run is recorded FAILED, which is the
-        // right outcome for a file that cannot be trusted at all. Only the conditions the legacy catalog
-        // genuinely permitted are classified below.
+        // An owner the legacy CHAR(32) column could not have held is a malformed export rather than a variance:
+        // normalize(...) raises, the transaction aborts and the run is recorded FAILED, which is the right
+        // outcome for a file that cannot be trusted at all.
         String owner = OwnerNormalizer.normalize(record.owner());
 
-        // Rule 1 - a NULL balance or currency. Selecting either into a host variable with no indicator was the
-        // SQLCODE -305 case, so the legacy account was unreachable through Q/U/X/C/D for as long as the null
-        // stood (CASH00.cbl:L136-L150, L204-L211). The target's columns are NOT NULL, so the row is recorded
-        // and not loaded.
+        // Selecting a NULL balance or currency into a host variable with no indicator was the SQLCODE -305 case,
+        // so the legacy account was unreachable through Q/U/X/C/D while the null stood (CASH00.cbl:L136-L150,
+        // L204-L211); the target's columns are NOT NULL, so the row is recorded and not loaded.
         if (record.balance() == null || LegacyExportFormat.isNull(record.currency())) {
             record(run, owner, VarianceKind.STATE, ReconciliationStatus.VARIANCE,
                     NULL_IN_LEGACY, null, null, null);
@@ -318,14 +309,13 @@ public class ReconciliationService {
             return;
         }
 
-        // Rule 2 - a currency outside the accepted set. The legacy column was a nullable CHAR(8) and the rate
-        // join only ever compared its first five characters (CASH00.cbl:L213-L219), so values the target can
-        // neither validate nor convert could be stored. Recorded rather than coerced to a default currency,
-        // which would silently re-denominate real money.
+        // The legacy column was a nullable CHAR(8) whose rate join compared only its first five characters
+        // (CASH00.cbl:L213-L219), so values the target can neither validate nor convert could be stored. Recorded
+        // rather than coerced to a default currency, which would silently re-denominate real money.
         String currency = normalizeCurrency(record.currency());
         if (!isAcceptedCurrency(currency)) {
-            // The token stands alone in legacy_value so a test can assert it verbatim; the offending code
-            // itself stays in the export, which is the checksummed evidence artifact the row's owner joins to.
+            // The offending code itself stays in the export, which is the checksummed evidence artifact the
+            // row's owner joins to, so only the token goes in legacy_value.
             record(run, owner, VarianceKind.CURRENCY, ReconciliationStatus.VARIANCE,
                     INVALID_IN_LEGACY, null, null, null);
             classification.rejectedOwners.add(owner);
@@ -333,22 +323,20 @@ public class ReconciliationService {
             return;
         }
 
-        // Once rejected, always rejected, and file order cannot undo it: an export that names one owner twice -
-        // a shape a delimited unload of a CHAR(32) primary key should not produce - must not have a later clean
-        // row reinstate a row already recorded as unloadable. Recording refusals rather than acceptances is what
-        // makes that true for free: a clean row adds nothing, so it cannot remove an earlier refusal.
+        // Once rejected, always rejected, whatever the file order: recording refusals rather than acceptances
+        // makes that hold for free, since a later clean row for an owner named twice adds nothing and so cannot
+        // reinstate a row already recorded as unloadable.
     }
 
-    // One exported rate row, classified by the same rules whichever entry point read it.
     private void classifyRate(MigrationRun run, LegacyRateRecord rateRecord,
                               SourceClassification classification) {
         String rateKey = LegacyExportFormat.trimPadding(rateRecord.currnkey());
         boundFindings(classification);
 
-        // Rule 3 - a NULL rate. This is the condition the legacy program hid: the rate SELECT raised -305, the
-        // COMPUTE ran on an uninitialized RATES and the following UPDATE's SQLCODE 0 overwrote the failure
-        // before anyone saw it (CASH00.cbl:L215-L231, L249-L264). The row is not staged, so a later C/D replay
-        // for that currency is rejected by the target instead of being computed against an invented rate.
+        // The condition the legacy program hid: the rate SELECT raised -305, the COMPUTE ran on an uninitialized
+        // RATES and the following UPDATE's SQLCODE 0 overwrote the failure before anyone saw it
+        // (CASH00.cbl:L215-L231, L249-L264). Not staged, so a later C/D replay for that currency is rejected by
+        // the target instead of being computed against an invented rate.
         if (rateRecord.rates() == null) {
             record(run, rateKey, VarianceKind.RATE_SOURCE, ReconciliationStatus.VARIANCE,
                     NULL_RATE, null, null, null);
@@ -357,17 +345,17 @@ public class ReconciliationService {
             return;
         }
 
-        // Rule 4 - a NULL currnbase or amount is NOT a finding and gets no row. Both columns are fetched by
-        // the rate SELECT (CASH00.cbl:L215, L249) and then referenced by no COMPUTE and no MOVE anywhere in
-        // the program, so a null in either changed no balance the reconciliation could be judging. They are
-        // staged as NULL for the evidence trail (AAP 0.4.1).
-        // Nothing is recorded for an acceptable rate row, for the same reason as above: the staging pass reads
-        // this file itself and asks only whether the key in hand was refused.
+        // A NULL currnbase or amount is deliberately not a finding: the rate SELECT fetches both columns
+        // (CASH00.cbl:L215, L249) and no COMPUTE or MOVE in the program then references them, so a null in
+        // either changed no balance this could be judging. They are staged as NULL for the evidence trail
+        // (AAP 0.4.1).
     }
 
     /**
      * Compares the legacy export in {@code inputDirectory} with the migrated state, owner by owner.
      *
+     * @param run            the run the findings and the summary are recorded under
+     * @param inputDirectory directory holding the legacy export
      * @return the number of {@code VARIANCE} rows standing under this run, which is what makes the tool exit 2
      *         rather than 0; {@code ACCEPTED_EXCEPTION} rows are deliberately not counted
      */
@@ -378,63 +366,50 @@ public class ReconciliationService {
         Objects.requireNonNull(run, "run");
         Objects.requireNonNull(inputDirectory, "inputDirectory");
 
-        // Materialized before the first finding because migration_reconciliation.run_id references migration_run:
-        // a row written under a run whose own row does not exist yet would fail on the foreign key. For the runner,
-        // which opens the run before calling in, this is a no-op merge. Flushed immediately so the run row is in
-        // the database before any finding row is ordered against it, rather than relying on the insert ordering
-        // hibernate.order_inserts chooses (application.yml).
+        // Materialized and flushed before the first finding because migration_reconciliation.run_id references
+        // migration_run, so a finding written under a run whose own row does not exist yet fails on the foreign
+        // key - relying on the ordering hibernate.order_inserts chooses (application.yml) would not be enough.
         runs.save(run);
         entityManager.flush();
 
-        // File names come from LegacyExportFormat and are written down nowhere else, so the export's shape keeps
-        // one home. CASH_ACCOUNT_FILE is the legacy truth; TARGET_STATE_FILE carries a migrated state a caller
-        // loads beforehand and is deliberately never read here - the target side of this comparison is the
-        // database, not a file.
-        Path accountFile = inputDirectory.resolve(LegacyExportFormat.CASH_ACCOUNT_FILE);
-        Path rateFile = inputDirectory.resolve(LegacyExportFormat.RATE_TABLE_FILE);
+        // The target side of this comparison is the database, so LegacyExportFormat.TARGET_STATE_FILE is
+        // deliberately never resolved here: that fixture is a migrated state a caller loads beforehand. Files
+        // are resolved through LegacyExportFormat and opened relative to one approval taken here: only an
+        // ordinary file beneath the directory that was validated is an input of this tooling, whatever that
+        // directory's name leads to later (AAP 0.3.2).
+        LegacyExportFormat.ApprovedDirectory approved =
+                LegacyExportFormat.approveInputDirectory(inputDirectory);
+        LegacyExportFormat.resolveInputFile(inputDirectory, LegacyExportFormat.CASH_ACCOUNT_FILE);
+        LegacyExportFormat.resolveInputFile(inputDirectory, LegacyExportFormat.RATE_TABLE_FILE);
+        LegacyExportFormat.ExportFile accountFile =
+                LegacyExportFormat.ExportFile.inApprovedDirectory(approved, LegacyExportFormat.CASH_ACCOUNT_FILE);
+        LegacyExportFormat.ExportFile rateFile =
+                LegacyExportFormat.ExportFile.inApprovedDirectory(approved, LegacyExportFormat.RATE_TABLE_FILE);
 
-        // First, always: the export's own rows that cannot be applied are findings of this run, and the owners they
-        // name are the ones the comparison below must leave alone.
+        // First, always: the export's own unloadable rows are findings of this run, and the owners they name are
+        // the ones the comparison below must leave alone.
         SourceValidation validation = validateSource(run, accountFile, rateFile);
 
-        // JOIN ON THE NORMALIZED OWNER KEY, never on sort order and never on ordinal position. EBCDIC and
-        // ASCII/UTF-8 collate differently - digits sort after letters in EBCDIC and before them in ASCII (AAP
-        // 0.12.2) - so two exports of the same data can arrive in different orders, and an index-wise or
-        // sort-wise comparison would report differences that are purely an artifact of the code page.
-        //
-        // The export is streamed and compared batchChunkSize owners at a time, so neither the file nor the target
-        // table is ever resident whole. The one structure that grows with the export is the set of owner keys it
-        // named - a short String per row, never a record and never an entity - because the second direction below
-        // has to distinguish an owner the export omitted from one it named, and no query over the database can
-        // answer that about a file.
-        // ONE SNAPSHOT FOR THE WHOLE COMPARISON, taken before the first owner is examined. The rates a
-        // live-mode difference is judged against belong to the batch's completed load, so resolving that run
-        // and reading its table here - rather than per differing owner - both fixes the number of statements a
-        // reconcile issues and fixes WHICH rows every owner is judged on: a retry load committing under the
-        // same batch while this loop runs cannot move half the comparison onto a different table.
-        //
-        // Read unconditionally, not behind another reading of tool.rate-source: it is two statements before a
-        // loop that already reads every account row and an export file, and one place deciding the mode
-        // (recordBalanceDifference) is worth more than the reads it would save in legacy-table mode.
+        // One snapshot for the whole comparison, taken before the first owner is examined, so a retry load
+        // committing under the same batch while the loop runs cannot move half the comparison onto a different
+        // rate table (AAP 0.12.5).
         Map<String, BigDecimal> stagedRates = stagedRatesOfBatchLoad(run.batchId());
 
         TargetComparison comparison = new TargetComparison(stagedRates);
         exportReader.streamCashAccounts(accountFile, record -> {
             String owner = OwnerNormalizer.normalize(record.owner());
 
-            // An export naming one owner twice is malformed - the legacy primary key was the owner itself and
-            // storage was upper case (CASH00.cbl:L155), and load/LegacyLoader refuses such a file outright - so the
-            // first occurrence is the one compared and a repeat is passed over. Comparing both would report one
-            // owner's single condition as two findings.
+            // The owner was the legacy primary key, stored upper case (CASH00.cbl:L155), so a repeat is a
+            // malformed export: the first occurrence is compared and the repeat passed over, because comparing
+            // both would report one owner's single condition as two findings. Owners are joined on the
+            // normalized key and never on sort order, since EBCDIC and ASCII collate differently (AAP 0.12.2).
             if (!comparison.namedByExport.add(owner)) {
                 return;
             }
 
-            // THE SKIP-REJECTED INVARIANT. An owner validateSource already recorded has been reported once, and
-            // the reason it was rejected is also the reason it was never loaded - so comparing it would report its
-            // absence from the target a second time, as a MISSING_IN_TARGET row that describes the same single
-            // fact. One condition, one row. It stays counted as named by the export, so the second direction
-            // below does not then report it as MISSING_IN_LEGACY either.
+            // One condition, one row: the reason validateSource rejected this owner is also the reason it was
+            // never loaded, so comparing it would report the same fact again as MISSING_IN_TARGET. It stays
+            // counted as named by the export, so the second direction does not report MISSING_IN_LEGACY either.
             if (validation.rejectedOwners().contains(owner)) {
                 return;
             }
@@ -446,18 +421,15 @@ public class ReconciliationService {
         });
         compareChunk(run, comparison);
 
-        // The other direction, a page at a time rather than accounts.findAll(): the target is the unbounded side
-        // here, and this transaction inserts only migration_reconciliation rows, so a page window ordered by the
-        // primary key is stable while it runs.
+        // The other direction, a page at a time rather than accounts.findAll(): the target is the unbounded side,
+        // and this transaction inserts only migration_reconciliation rows, so a window ordered by the primary key
+        // is stable while it runs.
         for (int page = 0; ; page++) {
             Page<CashAccount> targetRows = accounts.findAll(PageRequest.of(page, batchChunkSize, Sort.by("owner")));
 
-            // The owners of this page the export does not name at all, gathered before any of them is classified.
-            // Their classification is a question about ledger_entry, and asking it once for the whole page is the
-            // difference between one statement and one read per owner: a partial or empty export against a target
-            // of N accounts makes every one of them a candidate, so a per-owner read is O(N) statements for an
-            // answer the database can compute for the whole set in a single pass. The page is what bounds the
-            // set, so neither this map nor the statement it feeds grows with the target.
+            // Gathered before any of them is classified, because the classification is a question about
+            // ledger_entry that the database answers for a whole page in one statement: a partial export against
+            // a target of N accounts makes every one a candidate, so a per-owner read would be O(N) statements.
             Map<String, CashAccount> targetOnlyByOwner = new LinkedHashMap<>();
             for (CashAccount target : targetRows) {
                 String owner = OwnerNormalizer.normalize(target.owner());
@@ -475,19 +447,17 @@ public class ReconciliationService {
             for (Map.Entry<String, CashAccount> entry : targetOnlyByOwner.entrySet()) {
                 CashAccount target = entry.getValue();
 
-                // Only an account the tooling itself produced is reported: if anything other than a load has written
-                // to this owner's ledger, its absence from the export is ordinary post-load activity rather than a
-                // migration variance.
+                // Only an account the tooling itself produced is reported: if anything other than a load has
+                // written to this owner's ledger, its absence from the export is ordinary post-load activity.
                 if (!producedByMigration.contains(target.owner())) {
                     continue;
                 }
 
                 comparison.consideredTargetRows++;
 
-                // NEVER DELETED AUTOMATICALLY (AAP 0.6.3): a delta export that omits an owner may equally mean the row
-                // was removed upstream or that the export was partial, and only the operator can tell which. The
-                // decision is theirs, taken through the retail DELETE endpoint, which writes an ACCOUNT_DELETED ledger
-                // event; a reconciler that deleted rows would destroy evidence on the strength of a missing line.
+                // Never deleted automatically (AAP 0.6.3): an omitted owner may mean the row was removed upstream
+                // or that the export was partial, and only the operator can tell which - through the retail DELETE
+                // endpoint, which writes ACCOUNT_DELETED. Deleting here would destroy evidence on a missing line.
                 record(run, entry.getKey(), VarianceKind.STATE, ReconciliationStatus.VARIANCE,
                         MISSING_IN_LEGACY, PRESENT, null, target.availableBalance().amount());
             }
@@ -499,44 +469,41 @@ public class ReconciliationService {
 
         int consideredTargetRows = comparison.consideredTargetRows;
 
-        // NO VarianceKind.TRANSACTION_COUNT HERE. After a bulk load the target holds one MIGRATION_LOAD row per
-        // account and no per-transaction history, so there is no target count to compare a legacy count against;
-        // the kind belongs to a shadow window, where both sides processed the same stream (AAP 0.10.3).
+        // No VarianceKind.TRANSACTION_COUNT here: after a bulk load the target holds one MIGRATION_LOAD row per
+        // account and no per-transaction history to count against, so the kind belongs to a shadow window, where
+        // both sides processed the same stream (AAP 0.10.3).
 
-        // One authority for the number, read back from the rows themselves rather than accumulated in a local:
-        // only VARIANCE counts, so an ACCEPTED_EXCEPTION never inflates the count or changes the exit code.
+        // Read back from the rows rather than accumulated in a local, so the count has one authority: only
+        // VARIANCE counts, and an ACCEPTED_EXCEPTION never inflates it or changes the exit code.
         int varianceCount = Math.toIntExact(
                 reconciliations.countByRunIdAndStatus(run.runId(), ReconciliationStatus.VARIANCE));
 
         run.setLegacyRecordCount(validation.legacyAccountCount());
         run.setMigratedRecordCount(consideredTargetRows);
         run.setVarianceCount(varianceCount);
-        // The verdict is set here because it is this comparison's finding; finishedAt is deliberately left unset so
-        // MigrationToolRunner stays the single closer of the row.
+        // finishedAt is deliberately left unset so MigrationToolRunner stays the single closer of the row.
         run.setStatus(varianceCount == 0 ? MigrationRun.Status.CLEAN : MigrationRun.Status.VARIANCE);
-        // Bounding the context detached this instance, so this is a merge of a detached run - which is what it
-        // already was for every caller that opened the run in an earlier transaction. It is safe because
-        // MigrationRun carries no @Version and nothing else writes the row inside this transaction, and it is
-        // required: without it the counts and the verdict would exist only in memory.
+        // Bounding the context detached this instance, so this is a merge of a detached run - safe because
+        // MigrationRun carries no @Version and nothing else writes the row inside this transaction, and required,
+        // because without it the counts and the verdict would exist only in memory.
         runs.save(run);
 
         // A variance is a row plus an exit code, never an exception: throwing would abort the transaction and
-        // destroy the very findings the run exists to record. Exceptions are reserved for a missing or unreadable
-        // export and for database failures, which must abort so the run is recorded FAILED.
+        // destroy the findings the run exists to record. Exceptions are reserved for an unreadable export and for
+        // database failures, which must abort so the run is recorded FAILED.
         return varianceCount;
     }
 
-    // One chunk of the export against exactly the target rows that chunk names, then the context is bounded
-    // again. The per-owner comparison inside is the whole of the comparison and is unchanged by the chunking:
-    // what chunking changes is only how many of the export's records and the target's entities exist at once.
+    // Chunking changes only how many of the export's records and the target's entities exist at once; the
+    // per-owner comparison inside is the whole of the comparison and is unchanged by it.
     private void compareChunk(MigrationRun run, TargetComparison comparison) {
         if (comparison.chunk.isEmpty()) {
             return;
         }
 
-        // findAllById, not findAll: the owner IS cash_account's primary key, so this reads exactly the rows this
-        // chunk asks about instead of materializing the table. Re-keyed through the same normalizer the export
-        // side used, so the join cannot depend on how a stored owner happens to be cased.
+        // findAllById, not findAll: the owner is cash_account's primary key, so this reads exactly the rows the
+        // chunk asks about. Re-keyed through the normalizer the export side used, so the join cannot depend on
+        // how a stored owner happens to be cased.
         Map<String, CashAccount> targetByOwner = new LinkedHashMap<>();
         for (CashAccount account : accounts.findAllById(comparison.chunk.keySet())) {
             targetByOwner.put(OwnerNormalizer.normalize(account.owner()), account);
@@ -548,9 +515,8 @@ public class ReconciliationService {
             CashAccount target = targetByOwner.get(owner);
 
             if (target == null) {
-                // Present in the legacy export, absent from the target: the load either has not run for this owner
-                // or declined to apply it. Recorded with the legacy balance so the operator can see what is
-                // missing; no migrated balance exists to render.
+                // Recorded with the legacy balance so the operator can see what is missing; no migrated balance
+                // exists to render.
                 record(run, owner, VarianceKind.STATE, ReconciliationStatus.VARIANCE,
                         PRESENT, MISSING_IN_TARGET, legacy.balance(), null);
                 continue;
@@ -558,13 +524,10 @@ public class ReconciliationService {
 
             comparison.consideredTargetRows++;
 
-            // FUNDS ON HOLD ARE A STATE FINDING, NOT A BALANCE DIFFERENCE - and the test comes FIRST, before
-            // either comparison below. A hold moves money out of available_balance into reserved_balance, so an
-            // owner with a HELD reservation legitimately carries a lower available balance than the legacy
-            // absolute figure, and the currency or balance rows a comparison would write here would describe the
-            // hold rather than a migration difference. It is the same condition the load records when it declines
-            // to overwrite such an owner (AAP 0.6.3), reported in the same shape, so the operator reads one row
-            // for one fact whichever command found it. continue, therefore: one condition, one row.
+            // Tested before either comparison, because a hold moves money out of available_balance into
+            // reserved_balance: the rows a comparison would then write would describe the hold rather than a
+            // migration difference. Reported in the same shape as the load's refusal to overwrite such an owner
+            // (AAP 0.6.3), so one fact reads as one row whichever command found it.
             if (fundsAreOnHold(target)) {
                 recordReservationsOutstanding(run, target);
                 continue;
@@ -576,14 +539,12 @@ public class ReconciliationService {
             String targetCurrency = normalizeCurrency(target.currency());
             BigDecimal legacyBalance = legacy.balance();
 
-            // The available balance, not the total: retail balance IS the available balance (AAP 0.6.2), and with
-            // no reservation outstanding the two are equal, which is what makes legacy parity exact. Reaching
-            // this line already means nothing is on hold - the gate above reported any such owner and skipped it
-            // - so this figure is never compared against a legacy balance the hold has moved.
+            // The available balance, not the total: retail balance is the available balance (AAP 0.6.2), and the
+            // gate above guarantees nothing is on hold here, so the two are equal and legacy parity is exact.
             BigDecimal targetBalance = target.availableBalance().amount();
 
-            // The currency check and the balance check are INDEPENDENT, each writing at most one row, so an owner
-            // may produce both, one or neither. Collapsing them would hide the second difference behind the first.
+            // The currency and balance checks are independent, each writing at most one row, so an owner may
+            // produce both: collapsing them would hide the second difference behind the first.
             if (!Objects.equals(legacyCurrency, targetCurrency)) {
                 record(run, owner, VarianceKind.CURRENCY, ReconciliationStatus.VARIANCE,
                         legacyCurrency, targetCurrency, legacyBalance, targetBalance);
@@ -596,21 +557,18 @@ public class ReconciliationService {
                         comparison.stagedRates);
             }
 
-            // A MATCHING OWNER GETS NO ROW AT ALL - not even a MATCHED one. The acceptance criteria are "zero
-            // VARIANCE rows" for a matched fixture and "exactly the seeded rows" for a seeded one, asserted over
-            // the deterministic set findByRunIdOrderByReconciliationIdAsc returns; a row per agreeing owner would
-            // bury the seeded rows in it and make both assertions depend on fixture size. MATCHED is the value an
-            // operator sets when reclassifying a reviewed row, not something this comparison writes.
+            // An agreeing owner gets no row at all, not even a MATCHED one: the acceptance criteria are "zero
+            // VARIANCE rows" for a matched fixture and "exactly the seeded rows" for a seeded one, and a row per
+            // agreeing owner would make both depend on fixture size.
         }
 
         comparison.chunk.clear();
         boundPersistenceContext();
     }
 
-    // The classification's own bound. A finding row is a managed entity until it is flushed, so an export whose
-    // every row is a finding - an unload of a table with a nullable balance, for instance - would hold one per
-    // row for the length of the validation. Counted per classified record rather than per finding so the check
-    // is reached on a clean export too, where it costs one comparison and never flushes anything.
+    // A finding row is a managed entity until it is flushed, so an export whose every row is a finding would
+    // hold one per row for the length of the validation. Counted per classified record rather than per finding,
+    // so the check is reached on a clean export too, where it costs one comparison and flushes nothing.
     private void boundFindings(SourceClassification classification) {
         if (++classification.classifiedSinceFlush < batchChunkSize) {
             return;
@@ -619,10 +577,9 @@ public class ReconciliationService {
         boundPersistenceContext();
     }
 
-    // FLUSH BEFORE CLEAR, ALWAYS. clear() discards everything pending, so clearing without flushing would drop
-    // the very findings this run exists to record. Both stay inside the one ambient transaction (AAP 0.6.3): a
-    // flush is not a commit, so a failure after one still leaves the database as it was, and no chunk of a
-    // reconcile is durable until the whole reconcile is.
+    // Flush before clear, always: clear() discards everything pending, so clearing first would drop the findings
+    // this run exists to record. Both stay inside the one ambient transaction (AAP 0.6.3), and a flush is not a
+    // commit, so no chunk of a reconcile is durable until the whole reconcile is.
     private void boundPersistenceContext() {
         entityManager.flush();
         entityManager.clear();
@@ -636,13 +593,12 @@ public class ReconciliationService {
                                          BigDecimal legacyBalance, BigDecimal targetBalance,
                                          Map<String, BigDecimal> stagedRates) {
         // With the default tool.rate-source=legacy-table nothing is reclassified: both sides were computed from
-        // the same staged RATES, so a difference cannot be a rate difference and every one of them is a genuine
-        // VARIANCE (AAP 0.12.5). This is why the seeded KARRI difference stays BALANCE/VARIANCE.
+        // the same staged RATES, so a difference cannot be a rate difference (AAP 0.12.5).
         if (rateSource.isLive() && rateExplains(stagedRates, currency, legacyBalance, targetBalance)) {
             // The two figures are rendered into the value columns because this row is no longer a BALANCE row and
-            // so does not pass through MigrationReconciliation.balance(...). The variance column stays null on
-            // purpose: it means "the signed difference this row leaves outstanding", and an accepted exception
-            // leaves none - the difference is still readable from the two balance columns beside it.
+            // so does not pass through MigrationReconciliation.balance(...). The variance column stays null
+            // deliberately: it carries the signed difference a row leaves outstanding, and an accepted exception
+            // leaves none.
             record(run, owner, VarianceKind.RATE_SOURCE, ReconciliationStatus.ACCEPTED_EXCEPTION,
                     legacyBalance.toPlainString(), targetBalance.toPlainString(),
                     legacyBalance, targetBalance);
@@ -652,28 +608,15 @@ public class ReconciliationService {
                 null, null, legacyBalance, targetBalance);
     }
 
-    /**
-     * Whether re-deriving the target balance with the staged legacy rate yields the legacy balance exactly.
-     */
-    // Deliberately narrow, and conservative by design. Reconcile mode holds two absolute balances and not the
-    // transaction behind them, so "the difference is a rate difference" is only decidable for the one shape that
-    // re-derives exactly: the target carries the unconverted figure while the legacy carried it scaled by the
-    // staged RATES - truncate2(RATES x target) == legacy, the legacy COMPUTE of CASH00.cbl:L222 applied from zero.
-    // Anything else keeps its BALANCE/VARIANCE row, because accepting a difference no arithmetic re-derives
-    // would sign off a defect. The general live-versus-legacy rule needs the replayed transaction and therefore belongs
-    // to shadow.ShadowComparator.
+    // Conservative by design: reconcile mode holds two absolute balances and not the transaction behind them, so
+    // a rate difference is only decidable for the one shape that re-derives exactly - truncate2(RATES x target)
+    // == legacy, the COMPUTE of CASH00.cbl:L222 applied from zero. Anything else keeps its BALANCE/VARIANCE row,
+    // because accepting a difference no arithmetic re-derives would sign off a defect; the general rule needs the
+    // replayed transaction and so belongs to shadow.ShadowComparator.
     //
-    // THE RATE COMES FROM THE BATCH'S LOAD RUN, NEVER FROM THIS RUN. legacy_rate_table is staged by the load,
-    // and a reconcile is a different invocation with its own run_id under the same --tool.batch-id (AAP 0.6.3);
-    // a lookup keyed on the reconcile's own run_id therefore matches nothing in normal operation, which would
-    // silence this path entirely and leave every live-mode rate difference recorded as a BALANCE variance. The
-    // owning run is resolved from the batch instead, exactly as shadow.ShadowComparator and
-    // fx.LegacyRateTableSource resolve it - once per reconcile, into the snapshot passed in here.
-    //
-    // An absent rate is an ordinary outcome and must stay one: a batch whose load has not run, a load that
-    // failed and staged nothing, a currency the export never carried, and a currency whose exported rates
-    // column was NULL - which validateSource refuses to stage and records as RATE_SOURCE/NULL_RATE - all reach
-    // here as "no rate", and every one of them means the difference is not explained away.
+    // An absent rate is an ordinary outcome and must stay one: a batch whose load has not run, a load that failed
+    // and staged nothing, a currency the export never carried, and one whose exported rates column was NULL all
+    // reach here as "no rate", and every one of them means the difference is not explained away.
     private boolean rateExplains(Map<String, BigDecimal> stagedRates, String currency,
                                  BigDecimal legacyBalance, BigDecimal targetBalance) {
         BigDecimal stagedRate = stagedRates.get(rateKey(currency));
@@ -684,15 +627,11 @@ public class ReconciliationService {
         return rederived.amount().compareTo(legacyBalance) == 0;
     }
 
-    /**
-     * The rates the batch's completed load staged, by staged key: the one snapshot a whole reconcile judges on.
-     */
-    // Read whole rather than key by key because the table is one row per currency - the legacy catalog keyed it
-    // on CURRNKEY CHAR(5) (DB2DDL.jcl:L54-L62) against an accepted set of 31 codes (AAP 0.7.2) - so the whole
-    // table costs less than the per-key statements it replaces, and an immutable map is what lets every owner
-    // in the loop be judged on identical inputs (AAP 0.12.5). Rows whose rates column is NULL are left out, so
-    // a staged-but-unusable rate cannot be mistaken for a usable one. An empty map is the correct answer for a
-    // batch with no completed load: nothing was staged, so nothing can be explained away.
+    // Read whole rather than key by key: the legacy catalog keyed this table on CURRNKEY CHAR(5)
+    // (DB2DDL.jcl:L54-L62) against an accepted set of 31 codes (AAP 0.7.2), so one row per currency costs less
+    // than the per-key statements it replaces, and an immutable map is what lets every owner in the loop be
+    // judged on identical inputs (AAP 0.12.5). Rows whose rates column is NULL are left out, so a
+    // staged-but-unusable rate cannot be mistaken for a usable one.
     private Map<String, BigDecimal> stagedRatesOfBatchLoad(UUID batchId) {
         UUID loadRunId = latestLoadRunId(batchId);
         if (loadRunId == null) {
@@ -707,35 +646,24 @@ public class ReconciliationService {
         return Map.copyOf(rates);
     }
 
-    /** The run whose staged rate rows a reconcile of this batch judges: the batch's latest load that did not fail. */
-    // A load applies its whole export in one database transaction (AAP 0.6.3), so it either ends CLEAN or
-    // VARIANCE with every row staged, or FAILED with none staged, and a retry is a new run_id under the same
-    // batch_id. A FAILED run therefore names a table that was never written, and because the repository returns
-    // the batch ordered by started_at ascending, the last non-FAILED load is the most recent one that did stage.
+    // The batch's latest completed load is the run whose staged rates a reconcile judges on, resolved through
+    // MigrationRunRepository's shared selector so this reconcile, a shadow window of the same batch and
+    // fx/LegacyRateTableSource all judge on one run's rows. The selector admits only CLEAN and VARIANCE - the
+    // statuses in which a load actually staged (AAP 0.6.3) - so a newer RUNNING attempt cannot mask the load this
+    // batch was reconciled against. Empty stays an ordinary outcome: with no rate to explain a difference away,
+    // every difference remains an outstanding BALANCE variance, which is the safe answer.
     private UUID latestLoadRunId(UUID batchId) {
-        UUID resolved = null;
-        for (MigrationRun candidate : runs.findByBatchIdOrderByStartedAtAsc(batchId)) {
-            if (candidate.mode() == MigrationRun.Mode.LOAD && candidate.status() != MigrationRun.Status.FAILED) {
-                resolved = candidate.runId();
-            }
-        }
-        return resolved;
+        return runs.findLatestCompletedLoad(batchId)
+                .map(MigrationRun::runId)
+                .orElse(null);
     }
 
-    /**
-     * Which of {@code owners} carry at least one ledger row and not one written by anything but the migration
-     * tooling.
-     */
-    // The two conditions are the ones the reported owner has to satisfy, and the query decides both at once:
-    // an owner with NO ledger row was not produced by a load - a load always writes its MIGRATION_LOAD event -
-    // and an owner with a row from any other source has been written to since, so its absence from the export
-    // is ordinary post-load activity rather than a migration variance. Neither owner is reported, and the two
-    // are deliberately not distinguished here because the comparison does the same thing with both.
+    // One query decides both conditions: an owner with no ledger row was not produced by a load, since a load
+    // always writes its MIGRATION_LOAD event, and an owner with a row from any other source has been written to
+    // since. Neither is reported, so the two are deliberately not distinguished.
     //
-    // Set-based and chunked, never per owner: the answer is a property of ledger_entry that the database can
-    // evaluate for a whole set in one statement, so a target of N unexported owners costs ceil(N/CHUNK)
-    // statements instead of N reads of unbounded history. The chunk is what keeps the statement itself
-    // bounded, so neither the query count nor any single query grows with the target.
+    // Set-based and chunked, never per owner: the database evaluates this for a whole set in one statement, so a
+    // target of N unexported owners costs ceil(N/CHUNK) statements instead of N reads of unbounded history.
     private Set<String> ownersProducedOnlyByMigration(Collection<String> owners) {
         if (owners.isEmpty()) {
             return Set.of();
@@ -758,16 +686,22 @@ public class ReconciliationService {
     }
 
     /**
-     * Persists one reconciliation row: the single place the row shape and the variance sign are decided.
+     * Persists one reconciliation row: the single place the row shape and the variance sign are decided, which is
+     * why {@code shadow.ShadowComparator} writes its rows through here too. Every difference is a row and never a
+     * log line (AAP 0.6.5), because these rows are both the runbook's sign-off evidence and the set the
+     * integration tests assert over.
      *
-     * <p>{@code shadow.ShadowComparator} writes its {@code BALANCE}, {@code TRANSACTION_COUNT},
-     * {@code REJECTED_BY_TARGET} and {@code RATE_SOURCE} rows through here for that reason. For
-     * {@link VarianceKind#BALANCE} the value columns are the two balances rendered as plain decimal text and the
-     * variance is {@code migrated - legacy}, both computed by {@link MigrationReconciliation#balance}, so the
-     * {@code legacyValue} and {@code migratedValue} arguments are not used for that kind and callers pass null.
-     * Every other kind carries the caller's own value text - a reason token, a rendered figure or a count - and a
-     * null variance, because a row that leaves no signed balance difference outstanding must not claim one.</p>
-     *
+     * @param run             the run the row belongs to
+     * @param owner           the normalized owner, or the rate key for a {@code RATE_SOURCE} finding of
+     *                        {@code validateSource}
+     * @param kind            which difference this row records
+     * @param status          whether it counts against the run
+     * @param legacyValue     legacy-side reason or rendering; unused for {@link VarianceKind#BALANCE}, whose value
+     *                        columns and {@code migrated - legacy} variance are computed by
+     *                        {@link MigrationReconciliation#balance}, so callers pass null for that kind
+     * @param migratedValue   target-side reason or rendering, under the same rule
+     * @param legacyBalance   the legacy balance, or null where the row has none to show
+     * @param migratedBalance the target balance, or null where the row has none to show
      * @return the saved row, carrying its generated {@code reconciliationId}
      */
     public MigrationReconciliation record(MigrationRun run,
@@ -793,19 +727,15 @@ public class ReconciliationService {
     /**
      * Records the row that says an owner holding reserved funds was reported rather than overwritten or compared.
      *
+     * @param run     the run the row belongs to
      * @param account the account row the caller has already established as holding funds - the very row a load
      *                declined to overwrite, or the row a reconcile declined to compare
      * @return the saved row, never {@code null}
      */
-    // A PURE RECORDER: the caller establishes the condition and this method only writes what it found. Both
-    // callers already hold the answer and the row it concerns - migration.load.LegacyLoader has the account
-    // locked FOR UPDATE and has tested cash_reservation under that lock, and reconcile has tested it against
-    // the row it is comparing - so re-asking the database here would repeat two statements to reach a state
-    // neither caller can have lost: a release has to take the same cash_account row lock the loader holds, so
-    // the condition cannot change underneath it.
-    //
-    // The retained target balance is rendered so the operator can see what was kept; the legacy figure belongs
-    // to the export the caller was applying and is not this row's claim.
+    // A pure recorder, because both callers already hold the answer under a lock the condition cannot change
+    // beneath: LegacyLoader has the account FOR UPDATE and tested cash_reservation under it, reconcile tested the
+    // row it is comparing, and a release would have to take that same cash_account lock. Only the retained target
+    // balance is rendered; the legacy figure belongs to the export the caller was applying, not to this row.
     public MigrationReconciliation recordReservationsOutstanding(MigrationRun run, CashAccount account) {
         Objects.requireNonNull(run, "run");
         Objects.requireNonNull(account, "account");
@@ -813,32 +743,26 @@ public class ReconciliationService {
                 PRESENT, RESERVATIONS_OUTSTANDING, null, account.availableBalance().amount());
     }
 
-    /** Whether this account holds reserved funds, so that comparing its available balance would report the hold. */
-    // The account's own reserved_balance is tested FIRST because the row is already in hand and answers for
-    // free: it is the aggregate of the owner's HELD reservations, so a zero there is every owner that has
-    // nothing on hold - which is every owner, in every fixture and in the overwhelming majority of a real
-    // estate - and none of them costs a statement. cash_reservation then decides for the few that remain,
-    // because the row this gate leads to names outstanding RESERVATIONS and must not be written on the strength
-    // of a balance column alone. Neither test alone is enough: without the first this would be a query per
-    // compared owner, and without the second a reserved figure with no reservation behind it would be reported
-    // as one.
+    // Neither test alone is enough. reserved_balance comes first because the row is in hand and answers for free:
+    // it aggregates the owner's HELD reservations, so a zero clears every owner with nothing on hold - nearly all
+    // of them - at no statement cost. cash_reservation then decides for the few that remain, because the row this
+    // gate leads to names outstanding reservations and must not be written on a balance column alone.
     private boolean fundsAreOnHold(CashAccount account) {
         return !account.reservedBalance().isZero()
                 && reservations.existsByOwnerAndState(account.owner(), ReservationState.HELD);
     }
 
     // Binder, never @Value: application.yml writes cashaccount.fx.accepted-currencies as a YAML sequence, which
-    // the Environment exposes only as indexed keys, and Binder is what aggregates those back into a Set. It also
-    // accepts the comma-separated scalar form, so relaxed binding through CASHACCOUNT_FX_ACCEPTED_CURRENCIES keeps
+    // the Environment exposes only as indexed keys and a ${...} placeholder cannot aggregate. Binder also accepts
+    // the comma-separated scalar form, so relaxed binding through CASHACCOUNT_FX_ACCEPTED_CURRENCIES keeps
     // working. The Environment rather than config/CashAccountProperties because this package must not depend on
-    // config (AAP 0.8.2) - the same route retail/RetailCashAccountService takes to the same property.
+    // config (AAP 0.8.2).
     private static Set<String> acceptedCurrenciesFrom(Environment environment) {
         Objects.requireNonNull(environment, "environment");
 
-        // Fail closed rather than substitute a set of this class's own. An Environment that cannot expose property
-        // sources, an absent property and an empty one all mean the same thing: the accepted-currency policy this
-        // reconciler must judge an export against is unknown. Guessing it is how a reconciliation silently
-        // classifies rows under a policy the running service does not enforce.
+        // Fail closed rather than substitute a set of this class's own: an Environment that cannot expose property
+        // sources, an absent property and an empty one all mean the accepted-currency policy is unknown, and
+        // guessing it classifies rows under a policy the running service does not enforce.
         if (!(environment instanceof ConfigurableEnvironment)) {
             throw new IllegalStateException(ACCEPTED_CURRENCIES_PROPERTY + " cannot be read from a"
                     + " non-configurable Environment; reconciliation has no accepted-currency policy to apply");
@@ -846,6 +770,23 @@ public class ReconciliationService {
         return normalizedCodes(Binder.get(environment)
                 .bind(ACCEPTED_CURRENCIES_PROPERTY, Bindable.setOf(String.class))
                 .orElse(null));
+    }
+
+    // The two scalar readers. A non-configurable Environment exposes no property sources, so each takes the value
+    // an unset key would give - unlike the accepted-currency policy above, neither of these is a judgement the
+    // reconciler would be wrong to make from its documented default.
+    private static String stringProperty(Environment environment, String key, String fallback) {
+        if (!(environment instanceof ConfigurableEnvironment)) {
+            return fallback;
+        }
+        return Binder.get(environment).bind(key, Bindable.of(String.class)).orElse(fallback);
+    }
+
+    private static int integerProperty(Environment environment, String key, int fallback) {
+        if (!(environment instanceof ConfigurableEnvironment)) {
+            return fallback;
+        }
+        return Binder.get(environment).bind(key, Bindable.of(Integer.class)).orElse(fallback);
     }
 
     private static Set<String> normalizedCodes(Collection<String> codes) {
@@ -865,7 +806,6 @@ public class ReconciliationService {
         return Set.copyOf(normalized);
     }
 
-    /** The accepted-currency test: the three-letter shape and membership of the accepted set, both required. */
     private boolean isAcceptedCurrency(String currency) {
         return currency != null
                 && CURRENCY_CODE.matcher(currency).matches()
@@ -873,8 +813,8 @@ public class ReconciliationService {
     }
 
     // The legacy join compared only the first RATE_KEY_LENGTH characters of the account's currency
-    // (MOVE CURRENCYC TO WS-CURRENCY-KEY, CASH00.cbl:L213), and the width comes from LegacyCharacterization rather
-    // than from a literal here so the characterized parameters have one declaration point.
+    // (MOVE CURRENCYC TO WS-CURRENCY-KEY, CASH00.cbl:L213); the width comes from LegacyCharacterization rather
+    // than a literal so the characterized parameters keep one declaration point.
     private static String rateKey(String currency) {
         if (currency == null) {
             return "";
@@ -892,9 +832,11 @@ public class ReconciliationService {
         return trimmed == null ? null : trimmed.strip().toUpperCase(Locale.ROOT);
     }
 
-    /** The accumulating state of one source validation, shared by the list, path-pair and directory entry points. */
-    // Identity keys and counters only, never the classified records: that is what lets a streaming validation of a
-    // bulk export stay bounded by the number of distinct owners and rate keys instead of by the file's length.
+    /**
+     * The accumulating state of one source validation: identity keys and counters only, never the classified
+     * records, so a streaming validation stays bounded by the distinct owners and rate keys rather than by the
+     * export's length.
+     */
     private static final class SourceClassification {
 
         private final Set<String> rejectedOwners = new LinkedHashSet<>();
@@ -905,9 +847,7 @@ public class ReconciliationService {
 
         private int variances;
 
-        // Records classified since the last time the findings were flushed out of the persistence context. An
-        // export in which every row is a finding would otherwise hold one managed MigrationReconciliation per
-        // row until the validation ended.
+        // Records classified since the findings were last flushed out of the persistence context.
         private int classifiedSinceFlush;
 
         private SourceValidation toValidation() {
@@ -916,14 +856,15 @@ public class ReconciliationService {
         }
     }
 
-    /** The state of one chunked export-versus-target comparison, carried across its chunks. */
-    // chunk holds at most batchChunkSize exported records and is emptied by every compareChunk; namedByExport is
-    // the only member that grows with the export, and it holds one normalized owner key per row - the compact
-    // identity the second direction needs and nothing else.
+    /**
+     * The state of one chunked export-versus-target comparison, whose only member that grows with the export is
+     * {@code namedByExport} - one normalized owner key per row, the compact identity the second direction of the
+     * comparison needs and nothing else.
+     */
     private static final class TargetComparison {
 
-        // The batch load's staged rates, read once before the first chunk so every owner is judged on identical
-        // inputs (AAP 0.12.5); immutable, and empty for a batch with no completed load.
+        // Read once before the first chunk so every owner is judged on identical inputs (AAP 0.12.5); immutable,
+        // and empty for a batch with no completed load.
         private final Map<String, BigDecimal> stagedRates;
 
         private final Set<String> namedByExport = new LinkedHashSet<>();

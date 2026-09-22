@@ -1,19 +1,3 @@
-/*
-       Copyright 2025 Kyndryl, All Rights Reserved
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
- */
-
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.error;
 
 import jakarta.validation.ConstraintViolationException;
@@ -49,14 +33,11 @@ import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 import java.util.List;
 
-// This class does not extend ResponseEntityExceptionHandler: that base class answers with Spring's
-// ProblemDetail (RFC 7807) body, which would put a second error shape on the wire beside ApiError. The
-// legacy program's single status channel is precisely what is being replaced - "MOVE SQLCODE TO WS-RETCODE"
-// [backend/cash-account-cobol/COBOL/CASH00.cbl:L104] rendered every condition as ten unsigned digits - so
-// one payload shape everywhere is not a preference here, it is the deliverable. Plain @ExceptionHandler
-// methods are resolved by ExceptionHandlerExceptionResolver, which runs ahead of
-// DefaultHandlerExceptionResolver, so these mappings win over the framework's own defaults.
-/** Renders everything that escapes a controller, or that Spring MVC raises during dispatch, as one ApiError. */
+/**
+ * Renders everything that escapes a controller, or that Spring MVC raises during dispatch, as one ApiError -
+ * deliberately not extending ResponseEntityExceptionHandler, whose ProblemDetail body would put a second error
+ * shape on the wire.
+ */
 @RestControllerAdvice
 public class ApiExceptionHandler {
 
@@ -67,77 +48,75 @@ public class ApiExceptionHandler {
     private static final String OWNER = "owner";
     private static final String IDEMPOTENCY_KEY_HEADER = "Idempotency-Key";
 
+    private static final int MAX_CAUSE_DEPTH = 8;
+
+    // The owner is the one caller-controlled value these records carry, and it reaches them RAW: every rejection
+    // raised through CashAccountException.forOwner echoes back what the caller sent, precisely so the payload can
+    // name what was refused, which means the value most likely to be logged here is the one least likely to have
+    // been normalized. Interpolated unencoded it forges log structure - a newline splits one record into two, the
+    // second indistinguishable from one this service wrote (CWE-117) - so it is passed through LogSafeText, which
+    // escapes the code points that could do that and bounds the field's length. domain/OwnerNormalizer is
+    // deliberately NOT narrowed to compensate: the accepted owner set is fixed by AAP 0.4.2 and 0.6.2, and the
+    // sink is this log format rather than the stored value.
+    //
+    // Every OTHER caller-derived string this class logs goes through the same encoder, because a control applied
+    // to one field of a record and not its neighbours is not a control: a no-handler message is built around the
+    // percent-DECODED request path, a method-not-supported message around the request's verb, and a message
+    // carried by a CashAccountException may quote a rejected value. Only the arguments that are a Throwable are
+    // passed unencoded - those are rendered by the logging framework as a stack trace, which is multi-line by
+    // nature and which every log consumer already parses as one event.
     @ExceptionHandler(CashAccountException.class)
     public ResponseEntity<ApiError> handleCashAccountException(CashAccountException exception) {
         CashAccountErrorCode code = exception.errorCode();
+        String owner = LogSafeText.of(exception.owner());
         if (code == CashAccountErrorCode.INTERNAL) {
-            LOGGER.error("Internal failure handling a request for owner {}", exception.owner(), exception);
+            LOGGER.error("Internal failure handling a request for owner {}", owner, exception);
         } else if (code.status().is5xxServerError()) {
-            // The cause matters operationally here - an unreachable exchange-rate endpoint or a datastore
-            // outage - and it is recorded only in the log, never in the response body. This is the one WARN
-            // record a rejected request produces for a 5xx condition, and the cause chain it carries is the
-            // only place that exchange-rate or datastore failure is recorded at all: fx's own client logs the
-            // same failure at DEBUG precisely so one provider outage cannot cost two WARN records per request.
-            LOGGER.warn("Rejecting request for owner {}: {}", exception.owner(), code.code(), exception);
+            // The cause chain stays in the log and never in the response body, and this is the only place an
+            // exchange-rate or datastore failure is recorded: the fx client logs the same failure at DEBUG so
+            // one provider outage cannot cost two WARN records per request.
+            LOGGER.warn("Rejecting request for owner {}: {}", owner, code.code(), exception);
         } else {
-            LOGGER.debug("Rejecting request for owner {}: {} - {}", exception.owner(), code.code(),
-                    exception.getMessage());
+            LOGGER.debug("Rejecting request for owner {}: {} - {}", owner, code.code(),
+                    LogSafeText.ofMessage(exception.getMessage()));
         }
         return respond(ApiError.from(exception));
     }
 
-    // Deliberate, authorized behavioural change: the service fails closed where the legacy program fell
-    // through. "EVALUATE WS-REQ" [backend/cash-account-cobol/COBOL/CASH00.cbl:L89-L102] branches on the six
-    // request codes A/Q/U/X/C/D and carries no WHEN OTHER, so an unknown code executed no SQL at all -
-    // SQLCODE kept whatever the SQLCA already held, which this task never sets, and "MOVE SQLCODE TO
-    // WS-RETCODE" [CASH00.cbl:L104] therefore handed back a success-looking status field. The COMMAREA was
-    // then copied back verbatim [CASH00.cbl:L104-L108], so the caller read its OWN submitted amount as the
-    // "balance", and the unconditional history write [CASH00.cbl:L111-L131] recorded the non-event as though
-    // it had happened. In the replacement the HTTP verb and path ARE the request code and Spring MVC's
-    // routing supplies the catch-all the COBOL never had: an unmapped path is 404 and an unmapped verb 405,
-    // both in the one ApiError shape. This advice is deliberately declared with no basePackages or
-    // assignableTypes selector, because a no-handler exception is raised before any controller is chosen and
-    // a selector-restricted advice is never consulted for it - which would leave Spring Boot's white-label
-    // body on the wire instead of an ApiError.
-    //
-    // Both no-handler types are handled so the fail-closed 404 does not depend on which one Spring raises.
-    // The active route is NoResourceFoundException: under Spring Framework 6.1's default static-resource
-    // handling - which this module configures nothing about, carrying no spring.mvc or spring.web.resources
-    // settings at all - a path no handler matches falls through to the resource handler and surfaces as that
-    // type. NoHandlerFoundException is declared beside it as defensive coverage, for a build that ever
+    // Deliberate, authorized behavioural change - the service fails closed where the legacy program fell
+    // through: "EVALUATE WS-REQ" [backend/cash-account-cobol/COBOL/CASH00.cbl:L89-L102] carries no WHEN
+    // OTHER, so an unknown request code ran no SQL, handed back a success-looking status field
+    // [CASH00.cbl:L104], echoed the caller's own submitted amount back as the balance [CASH00.cbl:L104-L108]
+    // and still wrote its history record [CASH00.cbl:L111-L131]. Here an unmapped path is 404 and an
+    // unmapped verb 405, both in the one ApiError shape. The advice carries no basePackages or
+    // assignableTypes selector because a no-handler exception is raised before any controller is chosen, and
+    // a selector-restricted advice is never consulted for it - leaving Spring Boot's white-label body on the
+    // wire. Both no-handler types are declared so the 404 does not depend on which one Spring raises:
+    // NoResourceFoundException is the live route under Spring Framework 6.1's default static-resource
+    // handling, which this module configures nothing about, and NoHandlerFoundException covers a build that
     // configures no-handler dispatch to throw instead.
     @ExceptionHandler({ NoResourceFoundException.class, NoHandlerFoundException.class })
     public ResponseEntity<ApiError> handleUnsupportedPath(Exception exception) {
-        LOGGER.debug("Rejecting request: no resource mapped - {}", exception.getMessage());
+        LOGGER.debug("Rejecting request: no resource mapped - {}", LogSafeText.ofMessage(exception.getMessage()));
         return respond(ApiError.of(CashAccountErrorCode.UNSUPPORTED_PATH));
     }
 
-    // Same fail-closed rationale as the handler above: a known path reached with a verb this service does
-    // not implement is rejected explicitly rather than dispatched to whatever the legacy fall-through would
-    // have echoed back.
-    //
-    // The exception's own headers travel with the response because they carry Allow whenever Spring MVC knew
-    // which verbs the path does support: a caller told only "not this verb" has to rediscover the contract by
-    // trial, which is the discovery-by-guesswork the legacy single status channel forced. The body is unchanged -
-    // Allow is method metadata, not a second error shape.
+    // Fail-closed for the same reason as the handler above. The exception's own headers travel with the
+    // response because they carry Allow whenever Spring MVC knew which verbs the path supports, sparing the
+    // caller the discovery-by-trial the legacy status channel forced; Allow is method metadata, so the body
+    // is still the one error shape.
     @ExceptionHandler(HttpRequestMethodNotSupportedException.class)
     public ResponseEntity<ApiError> handleUnsupportedMethod(HttpRequestMethodNotSupportedException exception) {
-        LOGGER.debug("Rejecting request: method not supported - {}", exception.getMessage());
+        LOGGER.debug("Rejecting request: method not supported - {}",
+                LogSafeText.ofMessage(exception.getMessage()));
         return respond(ApiError.of(CashAccountErrorCode.UNSUPPORTED_METHOD), exception.getHeaders());
     }
 
-    // The value's own name selects the code, and one route into here is live today: an ABSENT "?amount=" on
-    // retail debit or credit, which @RequestParam without a default raises as
-    // MissingServletRequestParameterException and whose parameter name maps to INVALID_AMOUNT. Everything
-    // else in that family is parsed in code and never reaches this method - a present-but-invalid amount
-    // (retail/RetailCashAccountController declares it as String and parses it, throwing INVALID_AMOUNT), an
-    // unparsable "since" (institutional/ReservationController, INVALID_QUERY) and an out-of-range "limit"
-    // (audit/LedgerService, INVALID_QUERY) all arrive as CashAccountException instead, which keeps every
-    // status inside the closed sets those contracts fix. MethodArgumentTypeMismatchException and
-    // MissingRequestHeaderException are declared defensively rather than for a current caller: no handler
-    // method declares a typed query parameter, and the mandatory Idempotency-Key is read with
-    // required = false so ReservationService reports it missing. Declaring them means that if one is ever
-    // introduced its failure renders in this one payload shape instead of Spring's ProblemDetail.
+    // The value's own name selects the code. One route in is live - an absent "?amount=" on retail debit or
+    // credit - because every present-but-invalid value is parsed in code and arrives as a
+    // CashAccountException instead, keeping each status inside the closed set its contract fixes. The other
+    // two types are defensive coverage: no handler method declares a typed query parameter, and the
+    // mandatory Idempotency-Key is read with required = false so ReservationService reports it missing.
     @ExceptionHandler({ MethodArgumentTypeMismatchException.class, MissingServletRequestParameterException.class,
             MissingRequestHeaderException.class })
     public ResponseEntity<ApiError> handleRequestValueBinding(Exception exception) {
@@ -147,9 +126,8 @@ public class ApiExceptionHandler {
         return respond(ApiError.of(code));
     }
 
-    // Bean Validation on the institutional payloads would otherwise be rendered by Spring as a
-    // ProblemDetail, i.e. a second error shape; the offending field name maps onto the codes that already
-    // exist for it rather than onto a new constant.
+    // Spring would render Bean Validation failures as a ProblemDetail, a second error shape; the offending
+    // field name maps onto the codes that already exist for it rather than onto a new constant.
     @ExceptionHandler({ MethodArgumentNotValidException.class, HandlerMethodValidationException.class,
             ConstraintViolationException.class })
     public ResponseEntity<ApiError> handleValidationFailure(Exception exception) {
@@ -159,46 +137,58 @@ public class ApiExceptionHandler {
         return respond(ApiError.of(code));
     }
 
-    // A body Jackson cannot read is reported as INVALID_AMOUNT because the closed code set holds no generic
-    // "malformed body" condition and widening the enum is out of scope; INVALID_AMOUNT is its designated 400
-    // for a body-binding failure. Only the exception's type is logged: its message embeds the offending
-    // request content, which must not reach a log any more than it reaches the response.
+    // INVALID_AMOUNT is the closed code set's designated 400 for a body-binding failure; the set holds no
+    // generic "malformed body" condition. Only the exception's type is logged, because its message embeds
+    // the offending request content, which must not reach a log any more than it reaches the response.
+    // The cause chain is inspected first because that is the only route by which an oversized chunked body is
+    // reported correctly: config/RequestBodySizeLimitFilter's counting stream fails the read mid-parse with a
+    // RequestBodyTooLargeException, which Spring's Jackson converter re-throws wrapped in this type; without the
+    // unwrap an over-limit body would answer 400 INVALID_AMOUNT for a body that was never parsed at all.
     @ExceptionHandler(HttpMessageNotReadableException.class)
     public ResponseEntity<ApiError> handleUnreadableBody(HttpMessageNotReadableException exception) {
+        RequestBodyTooLargeException oversized = oversizedBodyCause(exception);
+        if (oversized != null) {
+            return handleOversizedBody(oversized);
+        }
         LOGGER.debug("Rejecting request: unreadable body - {}", exception.getClass().getSimpleName());
         return respond(ApiError.of(CashAccountErrorCode.INVALID_AMOUNT));
     }
 
-    // A lock conflict is an explicit, retryable 409 with a Retry-After hint rather than a 500, because it is
-    // a normal outcome of two callers touching one account row: the balance is unchanged, no ledger row was
-    // written, and the caller may simply retry. Its legacy counterparts were two distinct codes: -911 was
-    // returned once the unit of work had already been rolled back, -913 when it had not and the application
-    // still owned the commit-or-rollback decision. Which one a CICS caller saw depended on the attachment's
-    // DROLLBACK setting, which is not in this repository [docs/legacy-characterization.md section 9.9]; either
-    // way the caller received unsigned digits [backend/cash-account-cobol/COBOL/CASH00.cbl:L104],
-    // indistinguishable from a validation failure. PessimisticLockingFailureException is declared beside
-    // CannotAcquireLockException because Hibernate's jakarta.persistence.PessimisticLockException translates
-    // to that supertype, not to CannotAcquireLockException, and a lock conflict must never degrade to 500.
+    // Declared for the direct throw as well as the wrapped one, so the status does not depend on whether the
+    // stream failed inside a message converter or outside one. Nothing but the limit is logged: the body was
+    // refused precisely so its content would never be materialized, in a log or anywhere else.
+    @ExceptionHandler(RequestBodyTooLargeException.class)
+    public ResponseEntity<ApiError> handleOversizedBody(RequestBodyTooLargeException exception) {
+        LOGGER.debug("Rejecting request: body exceeds the {}-byte limit", exception.limitBytes());
+        return respond(ApiError.of(CashAccountErrorCode.REQUEST_TOO_LARGE));
+    }
+
+    // A retryable 409 with a Retry-After hint rather than a 500: two callers touching one account row is a
+    // normal outcome that leaves the balance unchanged and writes no ledger row, where the legacy -911/-913
+    // reached the caller as unsigned digits indistinguishable from a validation failure
+    // [backend/cash-account-cobol/COBOL/CASH00.cbl:L104] (docs/legacy-characterization.md section 9.9).
+    // PessimisticLockingFailureException is declared beside CannotAcquireLockException because Hibernate's
+    // jakarta.persistence.PessimisticLockException translates to that supertype, and a lock conflict must
+    // never degrade to 500.
     @ExceptionHandler({ ObjectOptimisticLockingFailureException.class, PessimisticLockingFailureException.class,
             CannotAcquireLockException.class })
     public ResponseEntity<ApiError> handleLockConflict(Exception exception) {
-        LOGGER.warn("Rejecting request: concurrent modification - {}", exception.toString());
+        LOGGER.warn("Rejecting request: concurrent modification - {}", LogSafeText.ofMessage(exception.toString()));
         return respond(ApiError.of(CashAccountErrorCode.CONCURRENT_MODIFICATION));
     }
 
     @ExceptionHandler({ DataAccessResourceFailureException.class, CannotCreateTransactionException.class,
             QueryTimeoutException.class })
     public ResponseEntity<ApiError> handleDatastoreUnavailable(Exception exception) {
-        LOGGER.warn("Rejecting request: datastore unavailable - {}", exception.toString());
+        LOGGER.warn("Rejecting request: datastore unavailable - {}", LogSafeText.ofMessage(exception.toString()));
         return respond(ApiError.of(CashAccountErrorCode.DATASTORE_UNAVAILABLE));
     }
 
-    // These two exist so the catch-all below can never downgrade a security rejection into a 500. They fire
-    // only for a rejection raised after the filter chain has admitted the request - method security, say -
-    // because Spring Security's own pre-controller rejections never reach a @RestControllerAdvice at all:
-    // those are rendered by ApiErrorAuthenticationEntryPoint and ApiErrorAccessDeniedHandler, which produce
-    // this identical payload, so a caller sees one shape wherever the decision was taken. Only the
-    // exception's type is logged - never a token, a credential or an Authorization header value.
+    // These two exist so the catch-all below can never downgrade a security rejection into a 500, and they
+    // fire only for a rejection raised after the filter chain has admitted the request: Spring Security's
+    // own pre-controller 401 and 403 never reach a @RestControllerAdvice, which is why
+    // ApiErrorAuthenticationEntryPoint and ApiErrorAccessDeniedHandler render them into this same payload.
+    // Only the exception's type is logged - never a token, a credential or an Authorization header value.
     @ExceptionHandler(AuthenticationException.class)
     public ResponseEntity<ApiError> handleAuthenticationFailure(AuthenticationException exception) {
         LOGGER.info("Rejecting request: authentication failed - {}", exception.getClass().getSimpleName());
@@ -211,25 +201,20 @@ public class ApiExceptionHandler {
         return respond(ApiError.of(CashAccountErrorCode.FORBIDDEN));
     }
 
-    // The payload carries the code's generic message and nothing else: no exception message, class name, SQL
-    // text or stack element leaves the process. Reporting raw internal status detail to the caller is exactly
-    // the legacy habit being replaced [backend/cash-account-cobol/COBOL/CASH00.cbl:L104], and an unexpected
-    // failure is the one case where that detail is most likely to expose schema or infrastructure. The full
-    // stack is recorded here, in the log, because this is the only place it is recorded at all.
+    // The payload carries the code's generic message and nothing else - no exception message, class name,
+    // SQL text or stack element - because an unexpected failure is where that detail is most likely to
+    // expose schema or infrastructure. The full stack is recorded here, in the log, and nowhere else.
     @ExceptionHandler(Exception.class)
     public ResponseEntity<ApiError> handleUnexpected(Exception exception) {
         LOGGER.error("Unexpected failure handling a request", exception);
         return respond(ApiError.of(CashAccountErrorCode.INTERNAL));
     }
 
-    // Status and Retry-After are derived here and only here, from the code the payload already carries, so
-    // no handler can choose a status of its own and no condition can acquire or lose a retry hint by being
-    // rendered in one place rather than another. The content type is set explicitly so the ApiError is
-    // written as JSON even when the request's Accept header asked for something else - a request that fails
-    // closed must still answer in the one shape every consumer parses. A handler that has protocol metadata of
-    // its own to add passes it as headers through the overload rather than building its own response, so that
-    // derivation stays in this one place; the content type is applied after them, so no caller of the overload
-    // can displace it.
+    // Status and Retry-After are derived here and only here, from the code the payload already carries, so no
+    // handler chooses a status of its own and no condition gains or loses a retry hint by where it was
+    // rendered. The content type is explicit so a request that fails closed still answers in the one shape
+    // every consumer parses even when Accept asked for something else, and it is applied after the caller's
+    // headers so the overload cannot displace it.
     private ResponseEntity<ApiError> respond(ApiError body) {
         return respond(body, HttpHeaders.EMPTY);
     }
@@ -243,6 +228,25 @@ public class ApiExceptionHandler {
             response = response.header(HttpHeaders.RETRY_AFTER, code.retryAfterSeconds().toString());
         }
         return response.body(body);
+    }
+
+    // Depth-bounded rather than a plain walk to the end of the chain: a cause graph that references itself, which
+    // a wrapping converter can produce, would otherwise spin here while rendering an error. Eight levels is more
+    // than the two this path actually produces (converter wrapping the stream failure) and is reached by nothing
+    // legitimate.
+    private static RequestBodyTooLargeException oversizedBodyCause(Throwable exception) {
+        Throwable cause = exception;
+        for (int depth = 0; cause != null && depth < MAX_CAUSE_DEPTH; depth++) {
+            if (cause instanceof RequestBodyTooLargeException oversized) {
+                return oversized;
+            }
+            Throwable next = cause.getCause();
+            if (next == cause) {
+                break;
+            }
+            cause = next;
+        }
+        return null;
     }
 
     private static String boundValueName(Exception exception) {
@@ -275,10 +279,8 @@ public class ApiExceptionHandler {
         return CashAccountErrorCode.INVALID_AMOUNT;
     }
 
-    // Each of the three validation exceptions reports the offending member differently - a bound body
-    // through its BindingResult, a constrained method parameter through per-parameter results, a programmatic
-    // validator through a property path - so the name is extracted per type and the code selection stays in
-    // one place.
+    // The three validation exceptions report the offending member differently - a BindingResult,
+    // per-parameter results, a property path - so extraction is per type and code selection stays in one place.
     private static String offendingField(Exception exception) {
         if (exception instanceof MethodArgumentNotValidException invalidArgument) {
             return firstNamed(invalidArgument.getBindingResult().getFieldErrors().stream()
@@ -308,8 +310,8 @@ public class ApiExceptionHandler {
         return null;
     }
 
-    // The leaf node of a property path is the constrained member itself; the enclosing method and argument
-    // nodes that precede it name the call, not the field the caller has to correct.
+    // The leaf node is the constrained member itself; the method and argument nodes preceding it name the
+    // call, not the field the caller has to correct.
     private static String leafName(Path propertyPath) {
         String leaf = null;
         for (Path.Node node : propertyPath) {

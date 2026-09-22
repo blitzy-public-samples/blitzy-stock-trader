@@ -1,19 +1,3 @@
-/*
-       Copyright 2025 Kyndryl, All Rights Reserved
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
- */
-
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.institutional;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -107,14 +91,10 @@ class ReservationLifecycleIT extends PostgresTestSupport {
         registry.add("cashaccount.security.jwt.public-key-location", JwtTestTokens::publicKeyLocation);
     }
 
-    /*
-     * WHY EVERY TEST OWNS ITS OWN ACCOUNT INSTEAD OF THE CLASS CLEANING UP. ledger_entry carries a BEFORE UPDATE
-     * OR DELETE trigger (schema/cash-account-schema.sql) and LedgerEntryRepository declares no delete method, so
-     * the rows this suite writes cannot be removed between tests by design - that immutability is the audit
-     * guarantee under test (AAP 0.7.4), not an obstacle to work around. Distinct short uppercase owners, each
-     * inside the 32-character cash_account.owner width, are therefore the isolation mechanism, and no assertion
-     * in this class may assume an empty table.
-     */
+    // Every test owns its own account because the rows this suite writes cannot be removed between tests:
+    // ledger_entry carries a BEFORE UPDATE OR DELETE trigger (schema/cash-account-schema.sql) and that
+    // immutability is the audit guarantee under test (AAP 0.7.4). Distinct owners are therefore the isolation
+    // mechanism, and no assertion in this class may assume an empty table.
 
     @Test
     void holdMovesFundsIntoReservedAndWritesOneHoldRow() throws Exception {
@@ -207,11 +187,10 @@ class ReservationLifecycleIT extends PostgresTestSupport {
     void replayIsRecognizedFromTheReturnedOrderReferenceAndOnlyFromTheExactPayload() throws Exception {
         String owner = "REPLAYECHO";
         String key = "IDEM-REPLAY-ECHO";
-        // An order reference carrying surrounding blanks, and an explicit expiry in a non-UTC offset at
-        // nanosecond precision. The two are treated differently on purpose: the reference is stored and
-        // returned verbatim because the idempotency hash is taken from it exactly (AAP 0.7.3), while the
-        // expiry is stored and returned as the same instant in UTC at the microsecond resolution TIMESTAMPTZ
-        // keeps, so the body a caller receives cannot differ from any later read of the row.
+        // A blank-padded order reference and an explicit expiry in a non-UTC offset at nanosecond precision are
+        // treated differently: the reference is stored and returned verbatim because the idempotency hash is
+        // taken from it exactly (AAP 0.7.3), while the expiry is returned as the same instant in UTC at the
+        // microsecond resolution TIMESTAMPTZ keeps, so the body cannot differ from a later read of the row.
         String orderReference = "  ORD-REPLAY-ECHO  ";
         OffsetDateTime expiry = OffsetDateTime.parse("2099-06-01T14:00:00.123456789+02:00");
         ResponseEntity<String> first =
@@ -220,6 +199,15 @@ class ReservationLifecycleIT extends PostgresTestSupport {
         ReservationResponse created = reservationOf(first);
         assertThat(created.orderReference()).isEqualTo(orderReference);
         assertThat(created.expiresAt()).isEqualTo(OffsetDateTime.parse("2099-06-01T12:00:00.123456Z"));
+
+        // The audit row records the reference the reservation holds, character for character. The ledger is
+        // the half of this pair that can never be corrected - ledger_entry accepts no UPDATE - so a row that
+        // dropped the blanks would leave one hold with two permanently different identities, and a later
+        // reconciliation joining the two on this value would find nothing (AAP 0.7.3, 0.7.4).
+        List<LedgerEntryResponse> holdRows =
+                rowsOf(ledger(owner), LedgerEventType.HOLD, created.reservationId());
+        assertThat(holdRows).hasSize(1);
+        assertThat(holdRows.get(0).orderReference()).isEqualTo(orderReference);
 
         // The reference exactly as the response handed it back: the same request, so the original body comes
         // back. A reference altered on its way into the column would hash to something else and be refused.
@@ -424,19 +412,11 @@ class ReservationLifecycleIT extends PostgresTestSupport {
         assertThat(settlement.availableAfter()).isEqualByComparingTo(new BigDecimal("900.00"));
         assertThat(settlement.reservedAfter()).isEqualByComparingTo(ZERO);
 
-        /*
-         * The primary half of the ordering contract, asserted on the only transition in the module that
-         * writes two rows at once. ledger_entry.entry_id is GENERATED ALWAYS AS IDENTITY and the rows are
-         * appended in the order the state machine named them - SETTLEMENT then RELEASE - so the RELEASE holds
-         * the greater identity and a recorded_at at or after the SETTLEMENT's, never before it. Under
-         * "recordedAt DESC, entryId DESC" (AAP 0.6.2) the RELEASE therefore comes back first, and these are
-         * the two newest rows on this owner because nothing has touched it since. Filtering by event type
-         * alone, as this test once did, would have passed under any ordering at all.
-         *
-         * recorded_at is stamped per row at microsecond precision, so these two usually differ and this test
-         * alone cannot show that the secondary entryId ordering exists. That half is proved deterministically
-         * by theLedgerQueryBreaksARecordedAtTieOnTheEntryIdentity below.
-         */
+        // The primary half of the ordering contract, on the only transition that writes two rows at once:
+        // entry_id is GENERATED ALWAYS AS IDENTITY and the rows are appended as the state machine named them -
+        // SETTLEMENT then RELEASE - so under "recordedAt DESC, entryId DESC" (AAP 0.6.2) the RELEASE comes back
+        // first. recorded_at is stamped per row, so these two usually differ and the secondary entryId ordering
+        // is proved separately by theLedgerQueryBreaksARecordedAtTieOnTheEntryIdentity below.
         assertThat(settlement.entryId()).isNotNull();
         assertThat(release.entryId()).isNotNull();
         assertThat(release.entryId()).isGreaterThan(settlement.entryId());
@@ -449,15 +429,10 @@ class ReservationLifecycleIT extends PostgresTestSupport {
 
     @Test
     void theLedgerQueryBreaksARecordedAtTieOnTheEntryIdentity() throws Exception {
-        /*
-         * The secondary half of "recordedAt DESC, entryId DESC", which no transition can exercise on its own:
-         * LedgerEntry stamps recorded_at per row, so even the two rows of one partial settlement land
-         * microseconds apart and sort correctly on the timestamp alone - a query that had lost its entryId
-         * tie-break would still answer them in the right order. An exact tie is therefore arranged here, and
-         * it has to be arranged at INSERT time because ledger_entry refuses UPDATE (LedgerImmutabilityIT
-         * asserts that guard). The identities stay generated, so the greater one belongs to the row inserted
-         * second, and the assertion fails the moment the secondary ordering is dropped or reversed.
-         */
+        // The secondary half of "recordedAt DESC, entryId DESC", which no transition can exercise on its own:
+        // recorded_at is stamped per row, so even one partial settlement's two rows land microseconds apart and
+        // sort correctly without the tie-break. The tie is therefore arranged at INSERT time - ledger_entry
+        // refuses UPDATE - with generated identities, so the greater one belongs to the row inserted second.
         String owner = "TIEBREAK1";
         OffsetDateTime tie = OffsetDateTime.parse("2026-03-01T12:00:00Z");
         Long settlementId = insertLedgerRow(owner, tie, LedgerEventType.SETTLEMENT, "100.00");
@@ -564,18 +539,12 @@ class ReservationLifecycleIT extends PostgresTestSupport {
 
     @Test
     void aLapsedHoldIsExpiredAndCommittedByTheRequestThatTouchesIt() throws Exception {
-        /*
-         * The lazy-expiry path, deterministically rather than as the coin-flip half of the sweep-versus-settle
-         * race below. A hold created already overdue - the hold error set defines no code for a past expiry,
-         * so it is accepted as handed in - is expired by the very request that touches it, inside the one
-         * account-locking transaction that request takes. The settle is then refused AFTER that transaction
-         * commits, which is the whole reason the refusal is raised outside it: the EXPIRY row every transition
-         * owes the audit trail survives the 409 instead of being rolled back with it. A release reports the
-         * expiry as its own answer, because an expiry has already moved the money where a release would.
-         *
-         * No sweep interferes: application-test.yml moves the interval out to PT1H, so the only pass in a test
-         * JVM is the one at context start-up, long before these two holds exist.
-         */
+        // The lazy-expiry path, deterministically rather than as the coin-flip half of the race below. A hold
+        // created already overdue is expired by the very request that touches it, inside that request's
+        // account-locking transaction; the settle is refused only after that transaction commits, which is why
+        // the refusal is raised outside it - the EXPIRY row every transition owes the audit trail survives the
+        // 409 instead of being rolled back with it. A release reports the expiry as its own answer, because an
+        // expiry has already moved the money where a release would.
         String settleOwner = "LAPSESETTLE";
         ReservationResponse lapsedForSettle = openAccountAndHold(settleOwner, "IDEM-LAPSE-SETTLE",
                 "ORD-LAPSE-SETTLE", "250.00", OffsetDateTime.now(ZoneOffset.UTC).minusMinutes(1));
@@ -624,15 +593,11 @@ class ReservationLifecycleIT extends PostgresTestSupport {
 
     @Test
     void terminalReservationsStillAnswerAfterTheirAccountIsDeleted() throws Exception {
-        /*
-         * A retail DELETE is refused with 409 RESERVATIONS_OUTSTANDING while any hold is HELD, so settling or
-         * releasing first and then deleting is the only shape in which a reservation can outlive its account
-         * - and cash_reservation carries no foreign key precisely so that the row survives as the audit
-         * record (AAP 0.11.1). A retrying caller must therefore still be answered from the reservation: its
-         * settle or release moves no money, so the account's absence is not its concern and must not become
-         * its error. Taking the account lock first, as an earlier shape did, answered every one of these
-         * calls with a 409 about the deleted account instead of the state the reservation is in.
-         */
+        // A retail DELETE is refused with 409 RESERVATIONS_OUTSTANDING while any hold is HELD, so settling or
+        // releasing and then deleting is the only shape in which a reservation outlives its account - and
+        // cash_reservation carries no foreign key so the row survives as the audit record (AAP 0.11.1). A
+        // retrying caller is therefore answered from the reservation's own state, never from the account lock:
+        // its settle or release moves no money, so the account's absence must not become its error.
         String settledOwner = "GONESETTLED";
         ReservationResponse settledHold = openAccountAndHold(settledOwner, "IDEM-GONE-SETTLED",
                 "ORD-GONE-SETTLED", "250.00", FIXED_EXPIRY);
@@ -686,14 +651,10 @@ class ReservationLifecycleIT extends PostgresTestSupport {
         String owner = "CEILING1";
         openAccount(owner);
 
-        /*
-         * 50,000,000.00 is past the NUMERIC(9,2) ceiling of 9,999,999.99, so the money type cannot represent
-         * it as a balance - but that is the service's constraint, not the caller's condition. What the caller
-         * asked for is more than the account can cover, and INSUFFICIENT_FUNDS is the only 422 the hold
-         * contract declares (AAP 0.6.2); AMOUNT_OUT_OF_RANGE, which the money type raises on its own, is in
-         * neither endpoint's error set. No account can hold more than the ceiling, so the comparison cannot
-         * be wrong.
-         */
+        // 50,000,000.00 is past the NUMERIC(9,2) ceiling of 9,999,999.99, but that is the service's constraint,
+        // not the caller's condition: what the caller asked for is more than the account can cover, and
+        // INSUFFICIENT_FUNDS is the only 422 the hold contract declares (AAP 0.6.2) - AMOUNT_OUT_OF_RANGE, which
+        // the money type raises on its own, is in neither endpoint's error set.
         ResponseEntity<String> overCeilingHold =
                 postHold(owner, "IDEM-CEILING-1", holdBody("ORD-CEILING-1", "50000000.00", FIXED_EXPIRY));
         assertThat(overCeilingHold.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
@@ -901,13 +862,10 @@ class ReservationLifecycleIT extends PostgresTestSupport {
         return objectMapper.readValue(response.getBody(), new TypeReference<List<LedgerEntryResponse>>() { });
     }
 
-    /*
-     * The one write in this class that bypasses the service, and the only way to produce two ledger rows
-     * sharing an instant: LedgerEntry stamps recorded_at itself, and ledger_entry forbids UPDATE, so neither
-     * the write path nor a later correction can create the tie. INSERT is the single mutation the immutability
-     * trigger permits by design. entry_id is omitted so the identity column still generates it, and the three
-     * nullable columns are omitted rather than bound as nulls.
-     */
+    // The one write in this class that bypasses the service, and the only way to produce two ledger rows sharing
+    // an instant: LedgerEntry stamps recorded_at itself and ledger_entry forbids UPDATE, so INSERT - the single
+    // mutation the immutability trigger permits - is the only place a tie can be arranged. entry_id is omitted so
+    // the identity column still generates it.
     private Long insertLedgerRow(String owner, OffsetDateTime recordedAt, LedgerEventType eventType,
             String amount) {
 
@@ -924,19 +882,11 @@ class ReservationLifecycleIT extends PostgresTestSupport {
         return count == null ? 0 : count;
     }
 
-    /*
-     * WHY THE WHOLE RESPONSE IS COMPARED RATHER THAN A FEW FIELDS OF IT. A replay owes the caller the answer
-     * its original call received (AAP 0.6.2, 0.7.3), so every component of that payload is part of the
-     * promise: an assertion on reservationId, amount and state alone stays green while owner, orderReference,
-     * settledAmount, currency or any of the three timestamps changes underneath it. The parsed records are
-     * compared first because a failure then names the component; the raw text follows because it is what the
-     * caller actually receives and it catches a rendering difference the parse would smooth over - an expiry
-     * or a created_at returned at nanosecond precision by the original call and at the microsecond resolution
-     * TIMESTAMPTZ keeps by the replay.
-     *
-     * The state and settled-amount assertions are what make this usable after a terminal transition: the body
-     * owed to a retry is the created hold, HELD with nothing settled, not the reservation as it stands now.
-     */
+    // The whole response is compared because a replay owes the caller the answer its original call received
+    // (AAP 0.6.2, 0.7.3): an assertion on a few components stays green while the others change underneath it.
+    // The parsed records go first because a failure then names the component, and the raw text follows because
+    // it catches a rendering difference the parse would smooth over - a timestamp returned at nanosecond
+    // precision by the original call and at the microsecond resolution TIMESTAMPTZ keeps by the replay.
     private void assertReplayedFrom(ResponseEntity<String> first, ResponseEntity<String> replay)
             throws Exception {
 
@@ -1032,12 +982,9 @@ class ReservationLifecycleIT extends PostgresTestSupport {
                 .toList();
     }
 
-    /*
-     * The list-wide half of the ledger ordering contract, asserted in the shape AuditImmediacyIT uses:
-     * recordedAt descending, with the generated entry identity breaking a tie. The conditional is not a
-     * loophole - theLedgerQueryBreaksARecordedAtTieOnTheEntryIdentity arranges a genuine tie and asserts the
-     * identity order unconditionally, so this helper is what carries that check across a mixed list.
-     */
+    // The list-wide half of the ledger ordering contract. The conditional is not a loophole:
+    // theLedgerQueryBreaksARecordedAtTieOnTheEntryIdentity arranges a genuine tie and asserts the identity order
+    // unconditionally, so this helper carries that check across a mixed list.
     private static void assertNewestFirst(List<LedgerEntryResponse> rows) {
         for (int index = 1; index < rows.size(); index++) {
             LedgerEntryResponse newer = rows.get(index - 1);

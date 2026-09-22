@@ -1,21 +1,6 @@
-/*
-       Copyright 2025 Kyndryl, All Rights Reserved
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
- */
-
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.institutional;
 
+import java.math.BigDecimal;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeParseException;
 import java.util.List;
@@ -38,28 +23,22 @@ import org.springframework.web.bind.annotation.RestController;
 
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.audit.LedgerEntryResponse;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.audit.LedgerService;
+import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.domain.Money;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.domain.OwnerNormalizer;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.error.CashAccountErrorCode;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.error.CashAccountException;
 
-/*
- * WHY THE /cash-account PREFIX SITS ON THIS MAPPING RATHER THAN IN A SERVLET CONTEXT PATH. The deployment
- * probes /actuator/startup, /actuator/health/readiness and /actuator/health/liveness at the ROOT of port 8080
- * [infra/stocktrader-operator/helm-charts/stocktrader/templates/cash-account.yaml:L204-L222] while publishing
- * the service URL with the /cash-account suffix [.../values.yaml:L146]. A server.servlet.context-path of
- * /cash-account would move the probe paths under it and every pod would fail its startup probe, so the prefix
- * is carried by the controllers instead - here /cash-account/institutional, which config/SecurityConfig claims
- * as its own matcher ahead of the retail rules so that "institutional" is never read as an owner name.
+/**
+ * The institutional hold, settlement, release and audit-query surface of the cash ledger, carrying the
+ * {@code /cash-account} prefix on its own mapping because a servlet context path would move the chart's
+ * root-level actuator probes under it.
  */
-/** The institutional hold, settlement, release and audit-query surface of the cash ledger. */
 @RestController
 @RequestMapping(path = "/cash-account/institutional", produces = MediaType.APPLICATION_JSON_VALUE)
 public class ReservationController {
 
-    /** The idempotency header a hold must carry; public so the integration tests spell it once. */
     public static final String IDEMPOTENCY_KEY_HEADER = "Idempotency-Key";
 
-    /** The header that marks a hold response as a replay of an earlier, identical call. */
     public static final String IDEMPOTENT_REPLAYED_HEADER = "Idempotent-Replayed";
 
     private static final String REPLAYED_HEADER_VALUE = "true";
@@ -68,29 +47,17 @@ public class ReservationController {
     private final LedgerService ledger;
 
     /**
+     * Container constructor.
+     *
      * @param reservations the transactional owner of holds, settlements, releases and expiry
-     * @param ledger the audit query surface; injected directly because the ledger query, its {@code 1..1000}
-     *     bound, its default page size and its ordering all belong to the audit package
+     * @param ledger the audit query surface, injected directly because its bound, default page size and
+     *     ordering belong to the audit package
      */
     public ReservationController(ReservationService reservations, LedgerService ledger) {
         this.reservations = Objects.requireNonNull(reservations, "reservations");
         this.ledger = Objects.requireNonNull(ledger, "ledger");
     }
 
-    /*
-     * WHY A FIRST WRITE ANSWERS 201 AND A REPLAY ANSWERS 200 WITH Idempotent-Replayed: true. The two are
-     * different facts about the world and a caller retrying after a timeout has to be able to tell them apart:
-     * 201 means this call created the hold, 200 with the header means an earlier identical call already did and
-     * nothing moved this time. The replay body is the stored reservation verbatim - the same reservationId,
-     * amount and state the first caller received - because an answer derived afresh could differ from what was
-     * already acknowledged, which is precisely what the key exists to prevent (AAP 0.7.3).
-     *
-     * WHY A MANDATORY HEADER IS READ WITH required = false. Spring's own missing-header failure is a
-     * MissingRequestHeaderException, which would surface as a code outside the closed error set AAP 0.6.2 fixes
-     * for this endpoint. Letting the header arrive as null hands the decision to ReservationService, which
-     * rejects it with 400 IDEMPOTENCY_KEY_REQUIRED - the code the contract names - and which also owns the
-     * blank and over-length checks, so none of that is duplicated here.
-     */
     /**
      * Places a hold on the owner's available funds.
      *
@@ -105,12 +72,19 @@ public class ReservationController {
      */
     @PostMapping(path = "/accounts/{owner}/holds", consumes = MediaType.APPLICATION_JSON_VALUE)
     public ResponseEntity<ReservationResponse> hold(@PathVariable("owner") String owner,
+            // The header is mandatory, but required = false on purpose: Spring's own
+            // MissingRequestHeaderException would answer outside the closed error set of AAP 0.6.2, so a null
+            // key reaches ReservationService, which owns IDEMPOTENCY_KEY_REQUIRED and the length check.
             @RequestHeader(name = IDEMPOTENCY_KEY_HEADER, required = false) String idempotencyKey,
             @Valid @RequestBody HoldRequest request) {
 
-        ReservationService.HoldOutcome outcome =
-                reservations.hold(OwnerNormalizer.normalize(owner), idempotencyKey, request);
+        String normalizedOwner = OwnerNormalizer.normalize(owner);
+        boundAmount(request == null ? null : request.amount());
 
+        ReservationService.HoldOutcome outcome = reservations.hold(normalizedOwner, idempotencyKey, request);
+
+        // 200 with the header rather than 201: an earlier identical call created the hold and nothing moved
+        // this time, and the body is that call's stored answer, which is what the key exists to guarantee.
         if (outcome.replayed()) {
             return ResponseEntity.ok()
                     .header(IDEMPOTENT_REPLAYED_HEADER, REPLAYED_HEADER_VALUE)
@@ -132,7 +106,9 @@ public class ReservationController {
     @PostMapping("/reservations/{reservationId}/settle")
     public ReservationResponse settle(@PathVariable("reservationId") String reservationId,
             @RequestBody(required = false) SettleRequest request) {
-        return reservations.settle(parseReservationId(reservationId), request);
+        UUID reservation = parseReservationId(reservationId);
+        boundAmount(request == null ? null : request.amount());
+        return reservations.settle(reservation, request);
     }
 
     /**
@@ -192,17 +168,25 @@ public class ReservationController {
         return ledger.findLedger(OwnerNormalizer.normalize(owner), parseSince(since), parseLimit(limit));
     }
 
-    /*
-     * WHY reservationId, since AND limit ARE PARSED HERE INSTEAD OF BEING DECLARED AS UUID, OffsetDateTime AND
-     * Integer. Typed path variables and request parameters fail conversion with a
-     * MethodArgumentTypeMismatchException, which error/ApiExceptionHandler can only resolve by inspecting the
-     * PARAMETER NAME - a heuristic that yields INVALID_AMOUNT or INVALID_QUERY. Neither belongs to the closed
-     * error set AAP 0.6.2 fixes for the four reservation paths, and an unparsable identifier there is a 404
-     * RESERVATION_NOT_FOUND: no such reservation can exist, whatever the caller meant. Parsing the raw strings
-     * keeps every status this controller can produce inside the contract's sets and independent of that
-     * heuristic. The range check on limit is deliberately NOT repeated - audit/LedgerService is the single
-     * authority on 1..1000 and on the default page size.
-     */
+    // The amount's size is judged here and not left to ReservationService: "amount":1e1000000000 is twelve bytes
+    // of JSON that Jackson parses into a BigDecimal for nothing, and both service entry points scale the caller's
+    // raw value before any comparison can reject it (requireHoldAmount, requireSettleAmount and the idempotency
+    // hash), so the only place ahead of that expansion is where the body has just been bound. Bean Validation
+    // cannot stand in: HoldRequest's @DecimalMin is a floor, and a floor admits every large value. A null amount
+    // passes through untouched because for settle it is the documented full settlement and for a hold it is the
+    // service's own 400 INVALID_AMOUNT carrying the owner. The owner and identifier are still resolved first, so
+    // an invalid owner stays 400 INVALID_OWNER and an unparsable identifier 404 RESERVATION_NOT_FOUND; the guard
+    // answers 400 INVALID_AMOUNT, a code both closed error sets of AAP 0.6.2 contain.
+    private static void boundAmount(BigDecimal amount) {
+        if (amount != null) {
+            Money.requireWithinInputBounds(amount);
+        }
+    }
+
+    // Raw strings rather than UUID, OffsetDateTime and Integer parameters: a typed conversion failure raises
+    // MethodArgumentTypeMismatchException, which error/ApiExceptionHandler can only map by guessing from the
+    // parameter name, and the codes below are the ones AAP 0.6.2 fixes for these paths - an unparsable
+    // identifier is a 404, because no such reservation can exist whatever the caller meant.
     private UUID parseReservationId(String raw) {
         try {
             return UUID.fromString(raw);
@@ -224,6 +208,7 @@ public class ReservationController {
         }
     }
 
+    // Shape only: audit/LedgerService is the single authority on the 1..1000 bound and the default page size.
     private Integer parseLimit(String raw) {
         if (raw == null || raw.isBlank()) {
             return null;

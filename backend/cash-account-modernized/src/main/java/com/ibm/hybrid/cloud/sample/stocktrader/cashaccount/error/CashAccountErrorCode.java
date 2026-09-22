@@ -1,36 +1,13 @@
-/*
-       Copyright 2025 Kyndryl, All Rights Reserved
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
- */
-
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.error;
 
 import org.springframework.http.HttpStatus;
 
-// A closed code-to-status taxonomy exists because the legacy program had a single status channel and it
-// could not distinguish conditions: WS-RETCODE was cleared to spaces
-// (backend/cash-account-cobol/COBOL/CASH00.cbl:L78) and then received the LAST executed SQL statement's
-// SQLCODE through "MOVE SQLCODE TO WS-RETCODE" (CASH00.cbl:L104). That numeric-to-alphanumeric MOVE into
-// an X(10) field dropped the sign, so -803 and +803 both reached the caller as 000000803, and taking only
-// the last statement's code masked an earlier failure in the same paragraph. Binding every condition to
-// exactly one status here - and only here - is what makes each one individually observable; no controller,
-// service or handler in this module chooses a status of its own.
-/** Closed set of error conditions this service reports, each bound to exactly one HTTP status. */
+/** Closed set of error conditions this service reports, each bound here and only here to one HTTP status. */
 public enum CashAccountErrorCode {
 
-    // Separate statuses for what the legacy return field rendered identically: SQLCODE 100 from the
-    // Q/U/X/C/D SELECTs, and -803 from the A INSERT (AAP 0.12.3).
+    // Distinct statuses for what the legacy return field rendered identically: SQLCODE 100 from the
+    // Q/U/X/C/D SELECTs and -803 from the A INSERT both reached the caller as unsigned digits in an X(10)
+    // field [backend/cash-account-cobol/COBOL/CASH00.cbl:L104] (AAP 0.12.3).
     ACCOUNT_NOT_FOUND(HttpStatus.NOT_FOUND, "Cash account not found."),
 
     ACCOUNT_ALREADY_EXISTS(HttpStatus.CONFLICT, "Cash account already exists."),
@@ -44,11 +21,10 @@ public enum CashAccountErrorCode {
 
     CURRENCY_MISMATCH(HttpStatus.BAD_REQUEST, "Hold currency must equal the account currency."),
 
-    // Deliberate deviations, not parity gaps: WS-CALC is "pic 9(7)V99"
-    // (backend/cash-account-cobol/COBOL/CASH00.cbl:L17) - unsigned, nine digits - and the credit/debit
-    // COMPUTE statements carry neither ROUNDED nor ON SIZE ERROR (CASH00.cbl:L222, L256), so a negative
-    // result was committed as its absolute value and a result of 10,000,000.00 or more silently lost its
-    // high-order digits. Both are now rejected with the balance left unchanged.
+    // Deliberate deviations, not parity gaps: the unsigned "pic 9(7)V99" WS-CALC
+    // [backend/cash-account-cobol/COBOL/CASH00.cbl:L17] and COMPUTE statements without ON SIZE ERROR
+    // [CASH00.cbl:L222, L256] committed a negative result as its absolute value and dropped the high-order
+    // digits of a result at or above 10,000,000.00. Both are rejected here, balance unchanged.
     INSUFFICIENT_FUNDS(HttpStatus.UNPROCESSABLE_ENTITY, "Available balance is insufficient for this operation."),
 
     AMOUNT_OUT_OF_RANGE(HttpStatus.UNPROCESSABLE_ENTITY,
@@ -66,13 +42,10 @@ public enum CashAccountErrorCode {
 
     RESERVATIONS_OUTSTANDING(HttpStatus.CONFLICT, "The account has one or more held reservations."),
 
-    // Deliberate deviation: with no STOCKTRD.FRANKFURT1 row for the account's currency the inner SELECT
-    // set SQLCODE 100, but the UPDATE that followed it reset SQLCODE to 0
-    // (backend/cash-account-cobol/COBOL/CASH00.cbl:L214-L231 for credit, L248-L264 for debit), so the
-    // program committed arithmetic over an uninitialized RATES host variable
-    // (backend/cash-account-cobol/COBOL/DCLFRANK.cpy:L22 declares it with no VALUE clause) and still
-    // reported success. Failing the request leaves the balance unchanged and writes no ledger row.
-    // Retry-After is populated because the cause is a transient upstream lookup, not a caller error.
+    // Deliberate deviation: a missing STOCKTRD.FRANKFURT1 rate row set SQLCODE 100, which the following
+    // UPDATE reset to 0 [backend/cash-account-cobol/COBOL/CASH00.cbl:L214-L231 credit, L248-L264 debit], so
+    // the program committed arithmetic over an uninitialized RATES host variable [DCLFRANK.cpy:L22] and
+    // reported success. Retry-After is set because the cause is a transient upstream lookup, not the caller.
     EXCHANGE_RATE_UNAVAILABLE(HttpStatus.SERVICE_UNAVAILABLE, 5,
             "Exchange rate is unavailable; the balance was not changed."),
 
@@ -80,15 +53,23 @@ public enum CashAccountErrorCode {
     // reached the caller as unsigned digits indistinguishable from a validation failure (AAP 0.12.3).
     DATASTORE_UNAVAILABLE(HttpStatus.SERVICE_UNAVAILABLE, 5, "The datastore is temporarily unavailable."),
 
-    // Deliberate deviation - fail closed. "EVALUATE WS-REQ"
-    // (backend/cash-account-cobol/COBOL/CASH00.cbl:L89-L102) recognizes only A/Q/U/X/C/D and has no
-    // WHEN OTHER, so an unknown request code ran no SQL, left SQLCODE untouched and therefore
-    // success-looking, echoed the caller's own submitted amount back as the balance (CASH00.cbl:L104-L108)
-    // and still wrote a history record (CASH00.cbl:L111-L131). Rejecting an unmapped path or verb is
-    // intentional behaviour, not a parity gap.
+    // Deliberate deviation, fail closed: "EVALUATE WS-REQ"
+    // [backend/cash-account-cobol/COBOL/CASH00.cbl:L89-L102] has no WHEN OTHER, so an unknown request code
+    // was answered success-looking. error/ApiExceptionHandler states the full rationale at the mapping.
     UNSUPPORTED_PATH(HttpStatus.NOT_FOUND, "No such resource."),
 
     UNSUPPORTED_METHOD(HttpStatus.METHOD_NOT_ALLOWED, "Method not supported for this resource."),
+
+    // The one condition in this enum with no legacy counterpart and no entry in the AAP 0.6.2 error table: a
+    // request body larger than any payload this service defines. It exists because a 413 cannot be reported
+    // without it. Every other spare failure is mapped ONTO a constant that already exists, but the alternatives
+    // here both break the invariant this enum is for - answering 413 while carrying a 400's code would make the
+    // code-to-status binding untrue on the wire, and answering 400 INVALID_AMOUNT would tell a caller its amount
+    // was wrong when its body was never parsed. The legacy program had no analogue to reuse: a COMMAREA is a
+    // fixed-length structure, so an oversized request was unrepresentable rather than rejected.
+    // config/RequestBodySizeLimitFilter raises it, error/RequestBodyTooLargeException carries it out of a
+    // mid-read stream, and error/FailClosedIT asserts both framings of it.
+    REQUEST_TOO_LARGE(HttpStatus.PAYLOAD_TOO_LARGE, "Request body exceeds the permitted size."),
 
     INVALID_QUERY(HttpStatus.BAD_REQUEST, "One or more query parameters are invalid."),
 
@@ -104,8 +85,8 @@ public enum CashAccountErrorCode {
     INTERNAL(HttpStatus.INTERNAL_SERVER_ERROR, "An unexpected internal error occurred.");
 
     private final HttpStatus status;
-    // Null where the condition is not worth retrying, so the absence of a Retry-After header is carried by
-    // the taxonomy itself rather than decided again by each renderer.
+    // Null where the condition is not worth retrying, so whether a Retry-After header appears is fixed by the
+    // taxonomy rather than decided again by each renderer.
     private final Integer retryAfterSeconds;
     private final String defaultMessage;
 
@@ -135,15 +116,11 @@ public enum CashAccountErrorCode {
         return defaultMessage;
     }
 
-    // The constant's own name is the wire code: operators and tests match on a stable identifier, so no
-    // separate string is stored that could drift from it.
+    // The constant's own name is the wire code, so no separate string is stored that could drift from it.
     public String code() {
         return name();
     }
 
-    // JavaBean aliases of the four accessors above. The renderers of this payload shape - the exception
-    // handler and the security filter-chain entry point and access-denied handler - are separate classes,
-    // and the aliases mean none of them has to be edited over an accessor-naming preference.
     public HttpStatus getStatus() {
         return status;
     }

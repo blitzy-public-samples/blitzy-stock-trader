@@ -1,19 +1,3 @@
-/*
-       Copyright 2025 Kyndryl, All Rights Reserved
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
- */
-
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.config;
 
 import java.io.File;
@@ -22,6 +6,12 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermissions;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.atomic.AtomicReference;
 
 import jakarta.annotation.PostConstruct;
@@ -34,28 +24,15 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.env.Environment;
 
-// Two responsibilities, both of which end in a refusal to start rather than in a service that runs half-working.
-//
-// PostgreSQL only. The chart's database.kind is one release-global value shared with backend/portfolio
-// [infra/stocktrader-operator/helm-charts/stocktrader/values.yaml:L74-L81] and is still db2 in the repository, so a
-// service that quietly accepted whatever arrived would be a service running against a store this module was never
-// written for: schema/cash-account-schema.sql, its ledger_entry_immutable trigger and every integration test are
-// written for a single dialect precisely so none of them has to be matrixed across two. Moving the release to
-// PostgreSQL is a signed-off prerequisite in docs/operational-runbook.md - a values change applied by the platform
-// operator, never a chart template edit and never something this code adapts to. Refusing an unrecognized value is
-// the same fail-closed principle that replaces the legacy dispatcher's missing WHEN OTHER, where an unknown request
-// code fell through to a success-looking return code [backend/cash-account-cobol/COBOL/CASH00.cbl:L89-L102].
-//
-// URL assembly lives here rather than in application.yml because no static placeholder can express it: JDBC_SSL=true
-// has to add either an sslrootcert file or an sslfactory class and never both, and the certificate it points at has
-// to be written before the first connection. The inputs are the very variables the chart already injects
-// [infra/stocktrader-operator/helm-charts/stocktrader/templates/cash-account.yaml:L84-L119], which is what keeps
-// cutover a values change with no template edit and no new mechanism beyond the one backend/portfolio already uses.
 /** Fail-closed datasource configuration: PostgreSQL or no start-up, plus the JDBC URL the chart's variables imply. */
 @Configuration
 public class DataSourceGuardConfig {
 
-    /** The only relational dialect this service is built for. */
+    // PostgreSQL only, deliberately: the chart's database.kind is one release-global value shared with
+    // backend/portfolio [infra/stocktrader-operator/helm-charts/stocktrader/values.yaml:L74-L81] and is still db2,
+    // while schema/cash-account-schema.sql, its ledger_entry_immutable trigger and every *IT are written for a
+    // single dialect. Moving the release to PostgreSQL is a values change signed off as Step 0 of
+    // docs/operational-runbook.md, never a chart template edit and never something this code adapts to.
     public static final String SUPPORTED_JDBC_KIND = "postgres";
 
     /** pgJDBC factory that leaves server-certificate trust to the JVM's own {@code cacerts}. */
@@ -65,6 +42,13 @@ public class DataSourceGuardConfig {
     private static final String TLS_PARAMETERS = "ssl=true&sslmode=verify-ca";
     private static final String URL_BREAKING_CHARACTERS = "/?&# \t\r\n";
     private static final String TRUST_STORE_VARIABLE = "cert_defaultTrustStore";
+    private static final String DEFAULT_POSTGRES_PORT = "5432";
+
+    // pgJDBC's own spellings, matched case-insensitively and listed in the rejection message; see keepableParameters
+    // for why this is an allowlist rather than a list of parameters to strip.
+    private static final Set<String> KEEPABLE_URL_PARAMETERS = caseInsensitiveSet("ApplicationName",
+            "assumeMinServerVersion", "connectTimeout", "currentSchema", "defaultRowFetchSize", "loggerFile",
+            "loggerLevel", "loginTimeout", "reWriteBatchedInserts", "socketTimeout", "tcpKeepAlive");
     private static final Logger LOGGER = LoggerFactory.getLogger(DataSourceGuardConfig.class);
 
     private final CashAccountProperties properties;
@@ -104,57 +88,238 @@ public class DataSourceGuardConfig {
         return SUPPORTED_JDBC_KIND;
     }
 
-    // Do not remove this condition, and do not turn this into a DataSource bean. Spring Boot's own
-    // PropertiesJdbcConnectionDetails carries the same @ConditionalOnMissingBean(JdbcConnectionDetails.class), so in
-    // a deployed run this bean registers first and the properties-based fallback stands down; under @SpringBootTest
-    // the Testcontainers @ServiceConnection of support/PostgresTestSupport contributes its own JdbcConnectionDetails
-    // before the context refreshes, and without this condition ours would win and every *IT in the module would
-    // dial the chart's JDBC_HOST instead of its own PostgreSQL container. Contributing connection details rather
-    // than a DataSource also leaves spring.datasource.hikari.* binding intact, which is what lets the Operational
-    // Runbook's rehearsal step pass --spring.datasource.hikari.schema=cash_account_rehearsal and keep the
-    // production tables untouched - a schema pinned here would silently defeat that.
+    // The condition is load-bearing: under @SpringBootTest the Testcontainers @ServiceConnection of
+    // support/PostgresTestSupport contributes its own JdbcConnectionDetails, and without it ours would win and
+    // every *IT would dial the chart's JDBC_HOST instead of its container. Contributing connection details rather
+    // than a DataSource also leaves spring.datasource.hikari.* binding intact, which is what lets the runbook's
+    // rehearsal pass --spring.datasource.hikari.schema=cash_account_rehearsal.
     @Bean
     @ConditionalOnMissingBean(JdbcConnectionDetails.class)
     JdbcConnectionDetails cashAccountJdbcConnectionDetails() {
         // Credentials are relayed from spring.datasource.username/password, which application.yml binds from the
-        // chart secret's database.id/database.password [.../templates/cash-account.yaml:L110-L119]; they are never
-        // folded into the URL, where they would reach every log line and stack trace that quotes it.
+        // chart secret's database.id/database.password
+        // [infra/stocktrader-operator/helm-charts/stocktrader/templates/cash-account.yaml:L110-L119]; they are
+        // never folded into the URL, where they would reach every log line and stack trace that quotes it.
         return new AssembledJdbcConnectionDetails(resolveJdbcUrl(),
                 emptyToNull(environment.getProperty("spring.datasource.username")),
                 emptyToNull(environment.getProperty("spring.datasource.password")));
     }
 
     /**
-     * Resolves the JDBC URL from the deployment's own variables.
+     * Resolves the JDBC URL of the cash ledger's own database.
      *
-     * <p>An explicitly configured {@code spring.datasource.url} wins. Nothing in this module sets one -
-     * {@code application.yml} carries credentials only - so a deployment always reaches the assembly below, while a
-     * hand-started run or a test that points the datasource somewhere itself stays in control of where it points.
+     * <p>The chart's {@code JDBC_HOST}, {@code JDBC_PORT} and {@code JDBC_DB} are the source of the target, and
+     * {@code JDBC_SSL} with {@code cert_defaultTrustStore} decide the TLS parameters in every case. A
+     * {@code spring.datasource.url} arriving from anywhere else is not honoured as a connection: it is refused while
+     * those chart variables are present and whenever TLS is demanded, and otherwise reduced to a host, a port, a
+     * database and a set of accepted parameters by {@link #normalizedConfiguredTarget}.
      *
-     * @return the URL {@link #buildJdbcUrl} produces for the configured host, port, database and TLS mode
-     * @throws IllegalStateException when a required connection variable is missing, blank or malformed
+     * @return the URL {@link #buildJdbcUrl} produces for the resolved host, port, database and TLS mode
+     * @throws IllegalStateException when a required connection variable is missing, blank or malformed, and when a
+     *         configured {@code spring.datasource.url} would change the dialect, the credentials or the TLS mode
      */
     public String resolveJdbcUrl() {
-        String configured = environment.getProperty("spring.datasource.url");
-        if (hasText(configured)) {
-            return configured.trim();
-        }
-        String host = configuredValue("cashaccount.jdbc.host", "JDBC_HOST");
-        String port = configuredValue("cashaccount.jdbc.port", "JDBC_PORT");
-        String database = configuredValue("cashaccount.jdbc.database", "JDBC_DB");
         boolean ssl = sslEnabled(configuredValue("cashaccount.jdbc.ssl", "JDBC_SSL"));
-        String certificatePath = null;
-        if (ssl) {
-            String pem = resolveTrustStorePem();
-            if (pem != null) {
-                certificatePath = stageTrustStore(pem).toString();
-            }
-        }
-        String url = buildJdbcUrl(host, port, database, ssl, certificatePath);
-        LOGGER.info("Cash ledger datasource: {} at {}:{}/{}, TLS {}", SUPPORTED_JDBC_KIND, host, port, database,
+        String configured = environment.getProperty("spring.datasource.url");
+        ConnectionTarget target = hasText(configured)
+                ? normalizedConfiguredTarget(configured.trim(), ssl)
+                : chartTarget();
+        // Staged after the target is settled, so a refused URL never leaves a certificate file behind.
+        String certificatePath = ssl ? stagedTrustStorePath() : null;
+        String url = target.toUrl(ssl, certificatePath);
+        LOGGER.info("Cash ledger datasource: {} at {}:{}/{} from {}, TLS {}", SUPPORTED_JDBC_KIND, target.host(),
+                target.port(), target.database(), target.origin(),
                 ssl ? (certificatePath == null ? "verify-ca against the JVM trust store"
                         : "verify-ca against the injected CA certificate") : "disabled");
         return url;
+    }
+
+    // Assembled here rather than by a placeholder in application.yml because no static one expresses this
+    // branch: JDBC_SSL=true appends either an sslrootcert file or an sslfactory class and never both, and the
+    // certificate it points at has to be staged before the first connection. The inputs are the variables the
+    // chart already injects [.../templates/cash-account.yaml:L84-L119], so cutover needs no template edit.
+    private ConnectionTarget chartTarget() {
+        return new ConnectionTarget(configuredValue("cashaccount.jdbc.host", "JDBC_HOST"),
+                configuredValue("cashaccount.jdbc.port", "JDBC_PORT"),
+                configuredValue("cashaccount.jdbc.database", "JDBC_DB"),
+                List.of(), "the chart's JDBC_HOST/JDBC_PORT/JDBC_DB");
+    }
+
+    private String stagedTrustStorePath() {
+        String pem = resolveTrustStorePem();
+        return (pem == null) ? null : stageTrustStore(pem).toString();
+    }
+
+    // Why a supplied spring.datasource.url is never honoured as written: it is the one input that carries a whole
+    // connection - dialect, host, credentials and TLS mode - so returning it verbatim would let SPRING_DATASOURCE_URL
+    // in the pod's environment, or a stray property in any source Spring reads, replace ssl=true&sslmode=verify-ca
+    // with sslmode=disable, swap LibPQFactory for NonValidatingFactory, fold user and password into the URL where
+    // every log line and stack trace that quotes it would carry them, or point this ledger at another server
+    // entirely. The JDBC_KIND guard above cannot see any of that: it inspects the dialect and nothing else.
+    //
+    // The chart injects JDBC_HOST and JDBC_DB from non-optional configMap keys
+    // [infra/stocktrader-operator/helm-charts/stocktrader/templates/cash-account.yaml:L89-L103], so in a deployment
+    // the first refusal below is the branch that fires and the URL cannot repoint anything; the second refuses it
+    // wherever TLS is demanded at all. What remains is the runs that carry neither - a hand-started process, and the
+    // second application context of audit/LedgerImmutabilityIT - which legitimately name their own database and
+    // there decide nothing else: host, port and database are taken, and every other part of the URL has to be
+    // absent or explicitly accepted rather than merely harmless.
+    //
+    // No message below quotes the URL or a parameter value, because either may be the password it was refused for.
+    private ConnectionTarget normalizedConfiguredTarget(String configured, boolean ssl) {
+        String chartHost = configuredValue("cashaccount.jdbc.host", "JDBC_HOST");
+        String chartDatabase = configuredValue("cashaccount.jdbc.database", "JDBC_DB");
+        if (hasText(chartHost) || hasText(chartDatabase)) {
+            throw new IllegalStateException("Refusing to start: spring.datasource.url is set while this deployment's"
+                    + " own connection variables are present (JDBC_HOST / cashaccount.jdbc.host and JDBC_DB /"
+                    + " cashaccount.jdbc.database). Two sources cannot both say where the cash ledger lives, and the"
+                    + " chart's variables are the only accepted one - they are what makes the URL PostgreSQL, and"
+                    + " what keeps ssl=true&sslmode=verify-ca on it. Remove spring.datasource.url, and change"
+                    + " database.host/port/db in the release values instead.");
+        }
+        // sslmode=verify-ca is the estate's parity setting (0.6.1), and it validates the server's certificate CHAIN
+        // without checking that the certificate belongs to the host being dialled - that is what verify-full adds.
+        // So under TLS the host is itself a trust decision: a URL naming its own host could reach a different server
+        // presenting any certificate the same CA ever signed, and the connection would still verify. Where TLS is
+        // demanded, the host therefore comes from the chart's variables alone.
+        if (ssl) {
+            throw new IllegalStateException("Refusing to start: spring.datasource.url is set while JDBC_SSL (property"
+                    + " cashaccount.jdbc.ssl) asks for TLS. sslmode=verify-ca verifies the server's certificate chain"
+                    + " but not its hostname, so a URL that names its own host could reach a different server holding"
+                    + " any certificate the same CA signed. Remove spring.datasource.url and supply JDBC_HOST,"
+                    + " JDBC_PORT and JDBC_DB, which is what the chart injects.");
+        }
+        return parseConfiguredUrl(configured);
+    }
+
+    private static ConnectionTarget parseConfiguredUrl(String configured) {
+        for (int index = 0; index < configured.length(); index++) {
+            char character = configured.charAt(index);
+            if (character <= ' ' || character == '#') {
+                throw rejectConfiguredUrl("it contains a space, a control character or '#'");
+            }
+        }
+        if (!configured.regionMatches(true, 0, JDBC_URL_SCHEME, 0, JDBC_URL_SCHEME.length())) {
+            throw rejectConfiguredUrl("it does not begin with '" + JDBC_URL_SCHEME + "'");
+        }
+        String remainder = configured.substring(JDBC_URL_SCHEME.length());
+        int queryStart = remainder.indexOf('?');
+        String addressed = (queryStart < 0) ? remainder : remainder.substring(0, queryStart);
+        int databaseStart = addressed.indexOf('/');
+        if (databaseStart <= 0 || databaseStart == addressed.length() - 1
+                || addressed.indexOf('/', databaseStart + 1) >= 0) {
+            throw rejectConfiguredUrl("it does not have the shape '" + JDBC_URL_SCHEME + "<host>[:<port>]/<database>'");
+        }
+        String authority = addressed.substring(0, databaseStart);
+        String database = addressed.substring(databaseStart + 1);
+        if (authority.indexOf('@') >= 0) {
+            throw rejectConfiguredUrl("its host carries user information, so the URL embeds credentials; supply them"
+                    + " as JDBC_ID and JDBC_PASSWORD, which reach spring.datasource.username/password and no URL");
+        }
+        if (authority.indexOf(',') >= 0) {
+            throw rejectConfiguredUrl("it names more than one host, and this service connects to exactly the one"
+                    + " database its schema and ledger live in");
+        }
+        return new ConnectionTarget(hostOf(authority), portOf(authority), database,
+                keepableParameters(queryStart < 0 ? "" : remainder.substring(queryStart + 1)),
+                "the configured spring.datasource.url, normalized");
+    }
+
+    private static String hostOf(String authority) {
+        if (authority.startsWith("[")) {
+            int close = authority.indexOf(']');
+            if (close < 0) {
+                throw rejectConfiguredUrl("its bracketed host address is not closed");
+            }
+            return authority.substring(0, close + 1);
+        }
+        int colon = authority.indexOf(':');
+        return (colon < 0) ? authority : authority.substring(0, colon);
+    }
+
+    // An absent port resolves to PostgreSQL's own listening port, which is both pgJDBC's default for a URL that omits
+    // it and application.yml's default for JDBC_PORT, so normalizing it away changes nothing about where a run
+    // connects.
+    private static String portOf(String authority) {
+        String remainder = authority.startsWith("[")
+                ? authority.substring(authority.indexOf(']') + 1)
+                : (authority.indexOf(':') < 0 ? "" : authority.substring(authority.indexOf(':')));
+        if (remainder.isEmpty()) {
+            return DEFAULT_POSTGRES_PORT;
+        }
+        if (remainder.charAt(0) != ':') {
+            throw rejectConfiguredUrl("its host and port are not separated by a single ':'");
+        }
+        String port = remainder.substring(1);
+        if (port.isEmpty()) {
+            throw rejectConfiguredUrl("it carries a ':' with no port after the host");
+        }
+        return port;
+    }
+
+    // An allowlist rather than a list of parameters to strip, because pgJDBC's parameter set already contains
+    // sslmode, sslfactory, sslrootcert, socketFactory, gssEncMode, targetServerType, loadBalanceHosts and options,
+    // and grows: a denylist is a check that silently stops being complete, while an unrecognized name refused by
+    // name costs one documented entry to admit. The parameters kept here decide logging, timeouts, fetch batching
+    // and the search path - never the credentials, the transport, the certificate trust or which server is reached.
+    private static List<String> keepableParameters(String query) {
+        if (query.isEmpty()) {
+            return List.of();
+        }
+        List<String> kept = new ArrayList<>();
+        for (String parameter : query.split("&")) {
+            if (parameter.isEmpty()) {
+                continue;
+            }
+            int assignment = parameter.indexOf('=');
+            String name = (assignment < 0) ? parameter : parameter.substring(0, assignment);
+            if ("user".equalsIgnoreCase(name) || "password".equalsIgnoreCase(name)) {
+                throw rejectConfiguredUrl("it carries the connection parameter '" + name + "', so the URL embeds"
+                        + " credentials; supply them as JDBC_ID and JDBC_PASSWORD, which reach"
+                        + " spring.datasource.username/password and no URL");
+            }
+            if (name.regionMatches(true, 0, "ssl", 0, 3)) {
+                throw rejectConfiguredUrl("it sets the TLS parameter '" + name + "', which only JDBC_SSL and"
+                        + " cert_defaultTrustStore may decide: this service always connects with"
+                        + " ssl=true&sslmode=verify-ca once JDBC_SSL is true, against the injected CA certificate"
+                        + " when one is supplied and against the JVM trust store otherwise");
+            }
+            if (!KEEPABLE_URL_PARAMETERS.contains(name)) {
+                throw rejectConfiguredUrl("it carries the connection parameter '" + name + "', which is not one of"
+                        + " the parameters this service accepts on a supplied URL ("
+                        + String.join(", ", KEEPABLE_URL_PARAMETERS) + ")");
+            }
+            kept.add(parameter);
+        }
+        return List.copyOf(kept);
+    }
+
+    private static Set<String> caseInsensitiveSet(String... values) {
+        Set<String> names = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
+        names.addAll(Arrays.asList(values));
+        return Collections.unmodifiableSet(names);
+    }
+
+    private static IllegalStateException rejectConfiguredUrl(String reason) {
+        return new IllegalStateException("Refusing the configured spring.datasource.url: " + reason + ". This service"
+                + " assembles its own URL - jdbc:postgresql://<host>:<port>/<database> from JDBC_HOST, JDBC_PORT and"
+                + " JDBC_DB, with the TLS parameters JDBC_SSL and cert_defaultTrustStore imply - so a supplied URL is"
+                + " read as a host, a port, a database and a set of accepted parameters only, never as a way to"
+                + " change the dialect, the credentials or the TLS mode.");
+    }
+
+    // Where a run connects and with which non-security parameters; the TLS parameters are never part of it, so they
+    // cannot arrive with the target.
+    private record ConnectionTarget(String host, String port, String database, List<String> parameters,
+            String origin) {
+
+        String toUrl(boolean ssl, String sslRootCertPath) {
+            String url = buildJdbcUrl(host, port, database, ssl, sslRootCertPath);
+            if (parameters.isEmpty()) {
+                return url;
+            }
+            return url + (url.indexOf('?') < 0 ? '?' : '&') + String.join("&", parameters);
+        }
     }
 
     private String configuredValue(String property, String variable) {
@@ -166,16 +331,13 @@ public class DataSourceGuardConfig {
         return hasText(value) ? value : null;
     }
 
-    // The TLS parameter set mirrors the datasource portfolio already runs against the same estate - ssl,
-    // sslMode=verify-ca and sslfactory=org.postgresql.ssl.DefaultJavaSSLFactory
-    // [backend/portfolio/src/main/liberty/config/includes/postgres.xml:L9-L11] - with Liberty's cert_* truststore
-    // import convention replaced by an sslrootcert file, because the chart delivers cert_defaultTrustStore as the
-    // PEM certificate TEXT of configMap key ssl.certs
+    // The TLS parameter set mirrors the datasource portfolio already runs against this estate
+    // [backend/portfolio/src/main/liberty/config/includes/postgres.xml:L9-L11], with Liberty's cert_* truststore
+    // import replaced by an sslrootcert file because the chart delivers cert_defaultTrustStore as PEM TEXT
     // [infra/stocktrader-operator/helm-charts/stocktrader/templates/config.yaml:L92-L93] while pgJDBC's parameter
-    // takes a path. The two TLS branches are mutually exclusive by construction: DefaultJavaSSLFactory bypasses
-    // LibPQFactory, so emitting sslrootcert beside it would be dead configuration that trusts the JVM's cacerts
-    // while appearing to pin the certificate the operator supplied. Liberty's sslMode attribute and pgJDBC's
-    // sslmode URL parameter differ only in case and both are correct where they stand - neither is a typo to fix.
+    // takes a path. The two branches are mutually exclusive by construction - DefaultJavaSSLFactory bypasses
+    // LibPQFactory, so an sslrootcert beside it would trust the JVM cacerts while appearing to pin the operator's
+    // certificate. Liberty's sslMode attribute and pgJDBC's sslmode parameter differ only in case; neither is a typo.
     /**
      * Assembles the PostgreSQL JDBC URL. Pure: the inputs are the whole input, so both TLS shapes are reachable
      * without an {@code Environment}, a container or a Spring context.
@@ -209,14 +371,12 @@ public class DataSourceGuardConfig {
         return url.toString();
     }
 
-    // Absence means off - that and only that reproduces <variable name="JDBC_SSL" defaultValue="false"/>
-    // [backend/portfolio/src/main/liberty/config/includes/postgres.xml:L2] and the chart's own database.ssl default
-    // [infra/stocktrader-operator/helm-charts/stocktrader/values.yaml:L81], which is what a local run relies on. A
-    // value that IS present and is neither true nor false is refused instead, because reading JDBC_SSL=ture as
-    // false would drop ssl=true&sslmode=verify-ca from the URL and the ledger's own database connection would lose
-    // server-certificate verification with nothing in the log to say so. That is the legacy dispatcher's
-    // silent-success failure mode - an unrecognized input falling through to a code that looks like it worked
-    // [backend/cash-account-cobol/COBOL/CASH00.cbl:L89-L102] - and this module is fail-closed by design (0.6.5).
+    // Absence means off, reproducing portfolio's <variable name="JDBC_SSL" defaultValue="false"/>
+    // [backend/portfolio/src/main/liberty/config/includes/postgres.xml:L2] and the chart's database.ssl default
+    // [infra/stocktrader-operator/helm-charts/stocktrader/values.yaml:L81]. A present value that is neither true
+    // nor false is refused instead: reading JDBC_SSL=ture as false would drop ssl=true&sslmode=verify-ca and lose
+    // server-certificate verification silently, which is the legacy dispatcher's fall-through failure mode
+    // [backend/cash-account-cobol/COBOL/CASH00.cbl:L89-L102] that this module is fail-closed against (AAP 0.6.5).
     /**
      * Parses the TLS flag strictly.
      *
@@ -258,11 +418,10 @@ public class DataSourceGuardConfig {
         return hasText(pem) ? pem : null;
     }
 
-    // One small file, written once per application start. The pod requests 32Mi of ephemeral storage against a
-    // 256Mi limit [.../templates/cash-account.yaml:L224-L232], so staging the certificate per connection - or on
-    // every call of this method - would accumulate inside that budget until the kubelet evicted the pod. The file
-    // is the trust anchor of the ledger's own database connection, which is why it is owner-only and why neither it
-    // nor its content is ever logged.
+    // One small file, written once per application start: the pod requests 32Mi of ephemeral storage against a
+    // 256Mi limit [.../templates/cash-account.yaml:L224-L232], so staging per connection would accumulate inside
+    // that budget until the kubelet evicted the pod. It is the trust anchor of the ledger's own database
+    // connection, hence owner-only, and neither it nor its content is ever logged.
     private Path stageTrustStore(String pem) {
         Path staged = trustStoreFile.get();
         if (staged != null) {

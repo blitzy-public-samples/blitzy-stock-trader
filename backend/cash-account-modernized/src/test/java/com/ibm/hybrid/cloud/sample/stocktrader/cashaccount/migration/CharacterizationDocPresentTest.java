@@ -1,19 +1,3 @@
-/*
-       Copyright 2025 Kyndryl, All Rights Reserved
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
- */
-
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.migration;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -30,63 +14,35 @@ import java.util.ArrayList;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 
-/*
- * Why this class exists: the migration concern is built in a fixed order - characterization document,
- * then LegacyCharacterization's constants, then LegacyBalanceCalculator, then ReconciliationService
- * and ShadowComparator - and an ordering nobody can observe is an ordering nobody keeps. This is the
- * observable half of that checkpoint: reconciliation arithmetic is only trustworthy while the
- * document it was derived from is present and still cites the exact COBOL lines it was derived from.
- *
- * Why these six strings are the citation set: CASH00.cbl L221 ("MOVE WS-BALANCE TO BALANC-RATE") and
- * L222 ("COMPUTE WS-CALC = BALANCE + (RATES * BALANC-RATE)") - with L255/L256 the debit mirror - are
- * where the caller's COMMAREA amount, and not the rate table's own column, becomes the multiplicand;
- * FRANKFURT1.AMOUNT is the column that looks like the multiplicand and is referenced by no COMPUTE or
- * MOVE in the program; RoundingMode.DOWN is the Java expression of the single final truncation of
- * "WS-CALC PIC 9(7)V99" (L17), which carries neither ROUNDED nor ON SIZE ERROR. Lose any one of those
- * citations and the document no longer evidences the formula the tooling implements.
- *
- * Why the section-1 headings are asserted beside the citations: the document declares those headings
- * load-bearing because LegacyCharacterization's Javadoc quotes one of them per constant, and a claim
- * that nothing checks is a claim that decays - a rename or a merge would leave every one of those
- * references pointing at a section that no longer exists, silently and only for a later reader.
- *
- * Why the filesystem rather than the classpath: docs/ is not a resource root, so
- * getResource("/docs/legacy-characterization.md") is always null and the document has to be resolved
- * from the module directory. Why this fails and never skips: a missing or uncited document is exactly
- * the condition the checkpoint exists to catch, so nothing here is conditional on an assumption and
- * nothing here may be disabled.
- *
- * Why the guard is package-visible and side-effect free: the sibling reconciliation integration tests
- * call requireCharacterizationDocument() from their @BeforeAll drift guards, so that one signature is a
- * contract inside this package - it may be extended, never narrowed, renamed or moved to a helper class
- * of its own. The two resolution helpers beside it share that visibility rather than hiding behind it,
- * so a later guard in this package resolves the document by this search order instead of a second copy
- * of it.
- */
-
 /** Asserts the characterization document exists and still carries its citations and section headings. */
 class CharacterizationDocPresentTest {
 
-    /** Module-relative location of the document; written by another module file, never by this test. */
+    /**
+     * Module-relative, because docs/ is not a resource root: getResource("/docs/legacy-characterization.md") is
+     * always null, so the document is resolved from the module directory. Written by another module file, never
+     * by this test.
+     */
     private static final String DOCUMENT_PATH = "docs/legacy-characterization.md";
 
     /** The file whose presence marks a candidate directory as this module's base directory. */
     private static final String MODULE_MARKER = "pom.xml";
 
     /**
-     * Citations of the characterized credit/debit arithmetic that the document must carry. Stated once
-     * here so the set has a single definition and the failing assertion can name every member of it.
+     * Citations of the characterized credit/debit arithmetic the document must carry, stated once so the set has
+     * a single definition and the failing assertion can name every member. They make AAP 0.10.1's ordering
+     * checkpoint observable: reconciliation arithmetic is trustworthy only while the document it derives from
+     * still cites CASH00.cbl L221-L222 and the debit mirror L255-L256, where the caller's COMMAREA amount - and
+     * not the rate table's own FRANKFURT1.AMOUNT, referenced by no COMPUTE or MOVE in the program - becomes the
+     * multiplicand, plus RoundingMode.DOWN for the single final truncation of WS-CALC PIC 9(7)V99 (L17).
      */
     private static final List<String> REQUIRED_CITATIONS =
             List.of("L221", "L222", "L255", "L256", "FRANKFURT1.AMOUNT", "RoundingMode.DOWN");
 
     /**
-     * The section-1 subsection headings {@code LegacyCharacterization}'s Javadoc quotes, one per
-     * constant, written exactly as the document writes them - leading {@code ###} and inline code
-     * backticks included - so a renamed, reworded or merged heading fails rather than orphaning a
-     * reference nothing checks. The em dashes of 1.5 and 1.6 are the compiler escape {@code \u005Cu2014}
-     * rather than the literal character, so the comparison is an exact match under any source encoding
-     * this file is compiled with.
+     * The section-1 subsection headings {@code LegacyCharacterization}'s Javadoc quotes, one per constant,
+     * written exactly as the document writes them so a renamed, reworded or merged heading fails here rather
+     * than orphaning a reference nothing checks. The em dashes are the compiler escape {@code \u005Cu2014}, so
+     * the comparison is exact under any source encoding this file is compiled with.
      */
     private static final List<String> REQUIRED_SECTION_HEADINGS = List.of(
             "### 1.3 Constant: decimal scale 2",
@@ -96,11 +52,10 @@ class CharacterizationDocPresentTest {
             "### 1.7 Constant: rate key length 5");
 
     /**
-     * System properties that may carry the module directory, in the order they are trusted: the pom
-     * sets {@code cashaccount.module.basedir} on Surefire and Failsafe alike, so it is authoritative
-     * when present; {@code project.basedir} covers a runner configured with Maven's conventional
-     * name; {@code user.dir} is Maven's own working directory for a forked test JVM and is what
-     * covers Failsafe or a bare JUnit launcher if neither of the first two is set.
+     * System properties that may carry the module directory, in the order they are trusted: the pom sets
+     * {@code cashaccount.module.basedir} on Surefire and Failsafe alike, so it is authoritative when present;
+     * {@code project.basedir} covers a runner configured with Maven's conventional name; {@code user.dir} is
+     * Maven's working directory for a forked test JVM, covering a bare JUnit launcher.
      */
     private static final List<String> BASE_DIRECTORY_PROPERTIES =
             List.of("cashaccount.module.basedir", "project.basedir", "user.dir");
@@ -122,8 +77,8 @@ class CharacterizationDocPresentTest {
             }
         }
 
-        // Last resort: the test class was loaded from <module>/target/test-classes, so the module
-        // directory is two parents up from the code-source location.
+        // Last resort: the test class is loaded from <module>/target/test-classes, so the module directory is
+        // two parents up from the code-source location.
         Path fromCodeSource = codeSourceModuleDirectory();
         tried.add("code source=%s".formatted(fromCodeSource == null ? "<unresolvable>" : fromCodeSource));
         if (fromCodeSource != null && holdsModuleDescriptor(fromCodeSource)) {
@@ -136,7 +91,7 @@ class CharacterizationDocPresentTest {
     }
 
     /**
-     * Location of the legacy characterization document.
+     * Resolves the document under the module base directory rather than the classpath.
      *
      * @return the absolute path the document is expected at, whether or not it exists
      */
@@ -145,10 +100,10 @@ class CharacterizationDocPresentTest {
     }
 
     /**
-     * Asserts the legacy characterization document is present, readable and still carries the
-     * section-1 headings the constants quote, and returns its content. This is the guard the sibling
-     * reconciliation integration tests call, so the heading check lives here rather than only in the
-     * test method below: a renamed heading then fails those classes too.
+     * Asserts the legacy characterization document is present, readable and still carries the section-1 headings
+     * the constants quote. The sibling reconciliation integration tests call this from their {@code @BeforeAll}
+     * drift guards, so the signature is a contract inside this package and the heading check lives here rather
+     * than only in the test method below: a renamed heading then fails those classes too.
      *
      * @return the document's UTF-8 content, never blank
      */
@@ -179,8 +134,9 @@ class CharacterizationDocPresentTest {
     }
 
     /**
-     * Reads the document, asserting only that it is present, readable and non-blank, so a missing
-     * citation or a renamed heading fails its own test and not this precondition.
+     * Reads the document, asserting only that it is present, readable and non-blank, so a missing citation or a
+     * renamed heading fails its own test and not this precondition. It fails and never skips: a missing or
+     * uncited document is the condition the checkpoint exists to catch.
      *
      * @return the document's UTF-8 content, never blank
      */
@@ -241,8 +197,8 @@ class CharacterizationDocPresentTest {
             return moduleDirectory == null ? null : moduleDirectory.toAbsolutePath().normalize();
         } catch (URISyntaxException | IllegalArgumentException | FileSystemNotFoundException
                 | SecurityException e) {
-            // A non-file code source (jar URL, custom class loader) simply cannot answer this
-            // question; the failure message of moduleBaseDirectory() reports it as unresolvable.
+            // A non-file code source (jar URL, custom class loader) cannot answer this question; the failure
+            // message of moduleBaseDirectory() reports it as unresolvable.
             return null;
         }
     }

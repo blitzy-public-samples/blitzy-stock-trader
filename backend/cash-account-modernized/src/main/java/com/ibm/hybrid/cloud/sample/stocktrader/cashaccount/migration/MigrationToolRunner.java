@@ -1,19 +1,3 @@
-/*
-       Copyright 2025 Kyndryl, All Rights Reserved
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
- */
-
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.migration;
 
 import java.io.IOException;
@@ -38,13 +22,17 @@ import java.util.regex.Pattern;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Value;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
 import org.springframework.boot.SpringApplication;
+import org.springframework.boot.context.properties.bind.Bindable;
+import org.springframework.boot.context.properties.bind.Binder;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Component;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.error.CashAccountErrorCode;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.error.CashAccountException;
@@ -56,34 +44,16 @@ import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.migration.shadow.Shad
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.persistence.MigrationReconciliationRepository;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.persistence.MigrationRunRepository;
 
-/*
- * NO PATH TO THE LIVE MAINFRAME EXISTS HERE, AND NONE MAY BE ADDED (AAP 0.3.2). This class reaches exactly
- * two things: ordinary files beneath the directory named by tool.input, and the configured PostgreSQL
- * datasource. It opens no connection to DB2 for z/OS, names no VSAM cluster, data-set name, z/OS host or
- * credential, reads no deployment value and writes none - not cashAccount.enabled, not cashAccount.url, not
- * database.kind, not broker's CASH_ACCOUNT_URL, not the StockTrader custom resource - and it retires,
- * exports-for-retention or deletes no CICS, DB2 or VSAM asset.
- *
- * The reason is that this deliverable builds the migration mechanism and is verified against the synthetic
- * fixtures alone. Bulk migration against the real exports, the live dual-run, the cutover and the
- * decommission are steps of docs/operational-runbook.md, which this module documents and never executes;
- * the prohibition holds regardless of what access the executing environment happens to have, so the only
- * durable form of it is a class that has no such capability to misuse.
- */
 /** Executes one migration-tooling command per invocation and turns its outcome into a process exit code. */
-// @Profile("tool") is load-bearing twice over. It keeps this bean out of the default (web) profile, so a
-// deployed pod cannot run a migration command however it is invoked; and it is what makes the System.exit in
-// run(...) safe, because the bean cannot exist in a context that is serving traffic.
 @Component
 @Profile("tool")
 public class MigrationToolRunner implements ApplicationRunner {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(MigrationToolRunner.class);
 
-    // The exit code is an evidence artifact, not a convenience: runbook Step 1 records it beside the
-    // migration_run and migration_reconciliation rows and the export checksums, and a gate reads both. A
-    // wrong code is a wrong sign-off, which is why 2 is reserved for "the run completed and recorded
-    // variances" and can never stand in for an error.
+    // The exit code is an evidence artifact: runbook Step 1 records it beside the migration_run and
+    // migration_reconciliation rows, and a gate reads both, so a wrong code is a wrong sign-off. 2 is
+    // reserved for "the run completed and recorded variances" and never stands in for an error.
     private static final int EXIT_CLEAN = 0;
 
     private static final int EXIT_ERROR = 1;
@@ -99,9 +69,8 @@ public class MigrationToolRunner implements ApplicationRunner {
     private static final List<String> ACCEPTED_COMMANDS =
             List.of(COMMAND_LOAD, COMMAND_RECONCILE, COMMAND_SHADOW_COMPARE);
 
-    // Each property is named once, here, and both the @Value expressions below and the typo guard are built
-    // from these constants. A key spelled differently in the two places would bind silently to a default and
-    // change behaviour without failing anything, which is the one failure mode a CLI contract cannot absorb.
+    // Named once here, so the bindings below and the typo guard are built from one spelling: a key spelled
+    // differently in the two places would bind silently to a default and change behaviour.
     private static final String COMMAND_PROPERTY = "tool.command";
 
     private static final String INPUT_PROPERTY = "tool.input";
@@ -126,6 +95,12 @@ public class MigrationToolRunner implements ApplicationRunner {
 
     private static final String TOOL_PROPERTY_PREFIX = "tool.";
 
+    // The two defaults application-tool.yml ships, held here because the container constructor supplies them and
+    // the file is the authority for why each is what it is.
+    private static final String DEFAULT_RATE_SOURCE = "legacy-table";
+
+    private static final String DEFAULT_LEGACY_TIMEZONE = "UTC";
+
     /** Escape hatch for a checkout whose working directory is neither the module root nor its parent. */
     private static final String CHARACTERIZATION_DOCUMENT_PROPERTY = "cashaccount.characterization-doc";
 
@@ -138,9 +113,8 @@ public class MigrationToolRunner implements ApplicationRunner {
     private static final Pattern CHARACTERIZATION_STATUS_PATTERN =
             Pattern.compile("^Status:\\s*(DRAFT|ACCEPTED)\\s*$", Pattern.CASE_INSENSITIVE);
 
-    // migration_run.source_path is VARCHAR(512) (schema/cash-account-schema.sql). Checked before the row is
-    // opened so an over-long export path is an argument error naming the limit, rather than a constraint
-    // violation on the insert that would look like a database failure.
+    // migration_run.source_path is VARCHAR(512) (schema/cash-account-schema.sql), checked before the row is
+    // opened so an over-long path is an argument error naming the limit rather than an insert failure.
     private static final int SOURCE_PATH_MAX_LENGTH = 512;
 
     private final LegacyLoader loader;
@@ -169,23 +143,80 @@ public class MigrationToolRunner implements ApplicationRunner {
 
     private final Integer historyRecordLength;
 
+    /**
+     * Container constructor, reading the seven {@code tool.*} values off the context's own environment.
+     *
+     * @param loader                the load command's implementation
+     * @param reconciliationService the reconcile command's implementation
+     * @param shadowComparator      the shadow-compare command's implementation
+     * @param runs                  {@code migration_run} rows
+     * @param reconciliations       {@code migration_reconciliation} rows
+     * @param context               the context this runner closes with its exit code, and the source of the
+     *                              {@code tool.*} values, which are bound through {@link Binder}
+     */
+    // BINDER, NEVER @Value, FOR EVERY ONE OF THESE SEVEN. A @Value placeholder is resolved and its RESOLVED TEXT is
+    // then handed to Spring's expression resolver, so any tool.* value written as #{...} - passed on the very
+    // command line an operator types, or sitting in a properties file a migration window inherited - would execute
+    // while this runner was being created, before a single argument had been validated. Binder resolves ${...} and
+    // converts, and evaluates nothing, so every value below reaches validate() as inert text and an unusable one
+    // becomes this class's ordinary argument error. It also removes the last two inline #{null} defaults from the
+    // module: an absent record length is now simply an unbound Integer.
+    @Autowired
+    public MigrationToolRunner(LegacyLoader loader,
+                               ReconciliationService reconciliationService,
+                               ShadowComparator shadowComparator,
+                               MigrationRunRepository runs,
+                               MigrationReconciliationRepository reconciliations,
+                               ConfigurableApplicationContext context) {
+        this(loader,
+                reconciliationService,
+                shadowComparator,
+                runs,
+                reconciliations,
+                context,
+                toolProperty(context, COMMAND_PROPERTY, ""),
+                toolProperty(context, INPUT_PROPERTY, ""),
+                toolProperty(context, BATCH_ID_PROPERTY, ""),
+                toolProperty(context, RATE_SOURCE_PROPERTY, DEFAULT_RATE_SOURCE),
+                toolProperty(context, LEGACY_CHARSET_PROPERTY, LegacyExportFormat.DEFAULT_LEGACY_CHARSET),
+                toolProperty(context, LEGACY_TIMEZONE_PROPERTY, DEFAULT_LEGACY_TIMEZONE),
+                // Left unbound rather than defaulted, so an absent record length stays distinguishable from a
+                // declared one: application-tool.yml gives this key no value at all, because absence is what has
+                // to be rejected for a binary history export.
+                Binder.get(context.getEnvironment())
+                        .bind(HISTORY_RECORD_LENGTH_PROPERTY, Bindable.of(Integer.class))
+                        .orElse(null));
+    }
+
+    /**
+     * Values constructor, for a caller that holds the seven {@code tool.*} values already.
+     *
+     * @param loader                the load command's implementation
+     * @param reconciliationService the reconcile command's implementation
+     * @param shadowComparator      the shadow-compare command's implementation
+     * @param runs                  {@code migration_run} rows
+     * @param reconciliations       {@code migration_reconciliation} rows
+     * @param context               the context this runner closes with its exit code
+     * @param command               {@code --tool.command}
+     * @param input                 {@code --tool.input}
+     * @param batchId               {@code --tool.batch-id}
+     * @param rateSource            {@code --tool.rate-source}
+     * @param legacyCharset         {@code --tool.legacy-charset}
+     * @param legacyTimeZone        {@code --tool.legacy-timezone}
+     * @param historyRecordLength   {@code --tool.history-record-length}, null when the operator declared none
+     */
     public MigrationToolRunner(LegacyLoader loader,
                                ReconciliationService reconciliationService,
                                ShadowComparator shadowComparator,
                                MigrationRunRepository runs,
                                MigrationReconciliationRepository reconciliations,
                                ConfigurableApplicationContext context,
-                               @Value("${" + COMMAND_PROPERTY + ":}") String command,
-                               @Value("${" + INPUT_PROPERTY + ":}") String input,
-                               @Value("${" + BATCH_ID_PROPERTY + ":}") String batchId,
-                               @Value("${" + RATE_SOURCE_PROPERTY + ":legacy-table}") String rateSource,
-                               @Value("${" + LEGACY_CHARSET_PROPERTY + ":"
-                                       + LegacyExportFormat.DEFAULT_LEGACY_CHARSET + "}") String legacyCharset,
-                               @Value("${" + LEGACY_TIMEZONE_PROPERTY + ":UTC}") String legacyTimeZone,
-                               // Nullable on purpose, so an absent record length is distinguishable from a
-                               // declared one: application-tool.yml gives this key no default at all, because
-                               // absence is what has to be rejected for a binary history export.
-                               @Value("${" + HISTORY_RECORD_LENGTH_PROPERTY + ":#{null}}")
+                               String command,
+                               String input,
+                               String batchId,
+                               String rateSource,
+                               String legacyCharset,
+                               String legacyTimeZone,
                                Integer historyRecordLength) {
         this.loader = Objects.requireNonNull(loader, "loader");
         this.reconciliationService = Objects.requireNonNull(reconciliationService, "reconciliationService");
@@ -202,12 +233,7 @@ public class MigrationToolRunner implements ApplicationRunner {
         this.historyRecordLength = historyRecordLength;
     }
 
-    /**
-     * One validated invocation: every {@code tool.*} value the dispatch needs, already parsed.
-     *
-     * <p>Nothing reaches the database until an instance of this exists, which is what makes an argument error
-     * distinguishable from a run that failed: the former leaves no {@code migration_run} row at all.</p>
-     */
+    /** One validated invocation: every {@code tool.*} value the dispatch needs, already parsed. */
     record ToolInvocation(String command,
                           Path input,
                           UUID batchId,
@@ -217,24 +243,36 @@ public class MigrationToolRunner implements ApplicationRunner {
                           Integer historyRecordLength) {
     }
 
+    /**
+     * The verdict a completed invocation committed, together with the three counts recorded beside it.
+     *
+     * <p>Returned out of the run's transaction rather than re-read after it, so the exit code and the log
+     * line report the values that are in the {@code migration_run} row and not a second reading of them.</p>
+     */
+    private record RunVerdict(MigrationRun.Status status,
+                              int legacyRecordCount,
+                              int migratedRecordCount,
+                              int varianceCount) {
+    }
+
     @Override
     public void run(ApplicationArguments arguments) {
         int exitCode = execute(arguments);
 
-        // WHY THE CODE IS FORCED RATHER THAN RETURNED. CashAccountApplication.main calls
-        // SpringApplication.run(args) and does not wrap its result, so an ApplicationRunner that simply
-        // returns leaves the JVM exiting 0 - a run that recorded variances would then report success to the
-        // gate that reads the code. SpringApplication.exit closes the context first, so Hikari, the
-        // persistence unit and every other lifecycle bean shut down cleanly before the code is handed back;
-        // a bare System.exit would cut the process off mid-shutdown. Throwing an ExitCodeGenerator exception
-        // is the other documented route and is deliberately not used: it reports a completed run with
-        // variances as a stack trace, and the variances are already rows.
+        // Forced rather than returned: CashAccountApplication.main does not wrap the result of
+        // SpringApplication.run, so a runner that simply returns leaves the JVM exiting 0 and a run that
+        // recorded variances would report success to the gate. SpringApplication.exit closes the context
+        // first, so Hikari and every other lifecycle bean shut down before the code is handed back, and it
+        // is safe only because @Profile("tool") keeps this bean out of a context serving traffic. An
+        // ExitCodeGenerator exception is the other documented route and is not used: it would report a
+        // completed run with variances as a stack trace, and the variances are already rows.
         System.exit(SpringApplication.exit(context, () -> exitCode));
     }
 
     /**
      * Runs one command and reports the code the process should exit with, without exiting.
      *
+     * @param arguments the command line this invocation was started with
      * @return {@link #EXIT_CLEAN} when the run closed {@code CLEAN}, {@link #EXIT_VARIANCE} when it closed
      *         {@code VARIANCE}, {@link #EXIT_ERROR} for an argument error or any failure
      */
@@ -247,24 +285,22 @@ public class MigrationToolRunner implements ApplicationRunner {
         try {
             invocation = validate(arguments);
         } catch (RuntimeException e) {
-            // AN ARGUMENT ERROR WRITES NO RUN ROW. Nothing was read and nothing was applied, so a row would
-            // assert an invocation that never happened and would then sit in the batch an operator signs off.
-            // The code is 1 and never 2, because 2 means a completed run that recorded variances.
+            // No run row: nothing was read and nothing applied, so a row would assert an invocation that
+            // never happened and would sit in the batch an operator signs off. The code is 1, never 2.
             LOGGER.error("Migration tooling invocation rejected, nothing ran: {}", e.getMessage());
             return EXIT_ERROR;
         }
 
-        // A NEW run_id FOR EVERY INVOCATION, NEVER A REUSED ONE. The identifier is the invocation's identity:
-        // a retry after a FAILED load is a fresh run_id under the same batch_id, and the partial unique index
-        // on ledger_entry (run_id, owner) WHERE event_type = 'MIGRATION_LOAD' guarantees one load event per
-        // owner per run only because the run is new. The batch_id is what ties a reconcile to the load it
-        // judges (AAP 0.6.3).
+        // A new run_id for every invocation, never a reused one: a retry after a FAILED load is a fresh
+        // run_id under the same batch_id, and ledger_entry's partial unique index (run_id, owner) WHERE
+        // event_type = 'MIGRATION_LOAD' guarantees one load event per owner per run only because the run is
+        // new. The batch_id is what ties a reconcile to the load it judges (AAP 0.6.3).
         UUID runId = UUID.randomUUID();
         MigrationRun.Mode mode = modeOf(invocation.command());
         MigrationRun.CharacterizationStatus characterization = characterizationStatus();
 
-        // The canonical token rather than the raw property value, so a captured transcript names the source
-        // that was actually applied: the same canonicalization picked the delegate that prices the replay.
+        // The canonical token rather than the raw property value, so a transcript names the source actually
+        // applied - the same canonicalization picked the delegate that prices the replay.
         LOGGER.info("Migration tooling command '{}' starting: mode={}, run={}, batch={}, input={},"
                         + " characterization={}, {}={}",
                 invocation.command(), mode, runId, invocation.batchId(), invocation.input(),
@@ -273,12 +309,11 @@ public class MigrationToolRunner implements ApplicationRunner {
         MigrationRun run = MigrationRun.start(runId, invocation.batchId(), mode,
                 invocation.input().toString(), characterization);
 
-        // THE RUN ROW IS COMMITTED BEFORE THE COMMAND STARTS, AND THIS CLASS IS NOT @Transactional. A load
-        // applies the whole export in one transaction or none of it (AAP 0.6.3), and audit/LedgerService's
-        // append methods are @Transactional(propagation = MANDATORY), so the loader's own @Transactional must
-        // be the single open transaction the work runs in - an outer transaction here would swallow it and
-        // take the run row down with the rollback. Opening the row outside that boundary is also what leaves
-        // a FAILED row behind when a command dies: the evidence of the attempt survives the loss of its work.
+        // The run row is opened in its own transaction, before the one the command runs in: the row is the
+        // evidence that the attempt happened, so it has to outlive the rollback of the work it describes - a
+        // command that dies then leaves a row to close FAILED, and the retry is a new run_id under the same
+        // batch_id (AAP 0.6.3). This class is still not @Transactional; nothing above or below this line runs
+        // in an ambient transaction except the command itself.
         try {
             runs.save(run);
         } catch (RuntimeException e) {
@@ -286,68 +321,87 @@ public class MigrationToolRunner implements ApplicationRunner {
             return EXIT_ERROR;
         }
 
+        RunVerdict verdict;
         try {
-            dispatch(invocation, run);
+            verdict = runToVerdict(invocation, run);
         } catch (RuntimeException e) {
-            LOGGER.error("Migration tooling command '{}' failed for run {}; recording the run FAILED",
-                    invocation.command(), runId, e);
+            // FAILED is written after the rollback, in a fresh transaction, and the row is never left RUNNING.
+            // The command's transaction has already rolled back by the time this is reached, so the row this
+            // closes is the RUNNING one that committed above - and it must be closed, because a RUNNING row is
+            // unsignable: the runbook step's gate reads status and counts, so the row would sit in the batch
+            // looking like an invocation still in flight and a retry would be indistinguishable from a second
+            // concurrent one. The code stays 1 and never 2, because 2 asserts a completed run whose verdict IS
+            // recorded (AAP 0.6.3).
+            LOGGER.error("Migration tooling command '{}' failed for run {}; its transaction rolled back, so"
+                            + " nothing that shared it was applied. Recording the run FAILED - a retry is a"
+                            + " new run under batch {}",
+                    invocation.command(), runId, invocation.batchId(), e);
             recordFailure(run);
             return EXIT_ERROR;
         }
 
-        // THE ONE AUTHORITY FOR THE NUMBER IS THE PERSISTED ROWS. Read back rather than taken from the count
-        // each command returns, so the exit code and the evidence an operator reviews cannot disagree - a
-        // variance that never reached the database must not move the code, and one that did must. Only
-        // VARIANCE counts: an ACCEPTED_EXCEPTION records an authorized difference, so the seeded
-        // REJECTED_BY_TARGET row must not turn a clean run into a failed one (AAP 0.10.3).
-        int varianceCount;
-        try {
-            varianceCount = Math.toIntExact(
-                    reconciliations.countByRunIdAndStatus(runId, ReconciliationStatus.VARIANCE));
-        } catch (RuntimeException e) {
-            LOGGER.error("Could not read the variance rows of run {}; its verdict cannot be established", runId, e);
-            recordFailure(run);
-            return EXIT_ERROR;
-        }
-
-        MigrationRun.Status finalStatus =
-                varianceCount == 0 ? MigrationRun.Status.CLEAN : MigrationRun.Status.VARIANCE;
-        int legacyRecordCount = run.legacyRecordCount();
-        int migratedRecordCount = run.migratedRecordCount();
-
-        try {
-            run.finish(finalStatus, legacyRecordCount, migratedRecordCount, varianceCount);
-            runs.save(run);
-        } catch (RuntimeException e) {
-            // A RUN THAT CANNOT BE CLOSED IS CLOSED FAILED, NEVER LEFT RUNNING. The work and its findings
-            // committed, but nothing recorded that the invocation ended, and a RUNNING row is unsignable: the
-            // step's gate reads status and counts, so the row would sit in the batch looking like an
-            // invocation still in flight and a retry would be indistinguishable from a second concurrent one.
-            // FAILED with the counts and the evidence-derived variance count is the true statement - the
-            // command ran, its verdict could not be written - and the exit code stays 1 rather than 2, because
-            // 2 asserts a completed run whose verdict IS recorded. The findings stay readable under this
-            // run_id, and the retry is a new run_id under the same batch_id (AAP 0.6.3).
-            LOGGER.error("Run {} completed with {} variance rows but its migration_run row could not be"
-                    + " closed; recording the run FAILED so the step is not left with an open row. The"
-                    + " findings of run {} remain readable and a retry is a new run under batch {}", runId,
-                    varianceCount, runId, invocation.batchId(), e);
-            recordFailure(run);
-            return EXIT_ERROR;
-        }
-
-        int exitCode = varianceCount == 0 ? EXIT_CLEAN : EXIT_VARIANCE;
+        int exitCode = verdict.varianceCount() == 0 ? EXIT_CLEAN : EXIT_VARIANCE;
         LOGGER.info("Migration tooling run {}: mode={}/status={}/legacy={}/migrated={}/variances={}/exit={}",
-                runId, mode, finalStatus, legacyRecordCount, migratedRecordCount, varianceCount, exitCode);
+                runId, mode, verdict.status(), verdict.legacyRecordCount(), verdict.migratedRecordCount(),
+                verdict.varianceCount(), exitCode);
         return exitCode;
     }
 
     /**
-     * Executes the requested command, leaving the run row's verdict, counts and {@code finishedAt} to
-     * {@link #execute(ApplicationArguments)}.
+     * Runs the command and closes its run row in one transaction, reporting the verdict that committed.
+     *
+     * @return the terminal status and the three counts the {@code migration_run} row now carries
+     * @throws RuntimeException when the command, the variance read or the close failed; the transaction has
+     *         been rolled back by then, so nothing that shared it was applied
      */
-    // Parses, sequences and reports - never re-implements. Loading, reconciling and comparing belong to their
-    // services, and each command's returned count is deliberately discarded because execute(...) re-derives
-    // it from the rows themselves.
+    // One transaction for the work and for the verdict that judges it (AAP 0.6.3). "Either every row of the
+    // export is applied and the run row is CLEAN/VARIANCE, or nothing is applied and the run row is FAILED" is
+    // one outcome rather than two that can disagree. With the verdict written in a later transaction, a failure
+    // between the two left the whole load committed under a FAILED row - and an operator reading that row would
+    // conclude, correctly by its own wording and wrongly in fact, that nothing had been applied. The variance
+    // count is read inside the same transaction for the same reason: the number the exit code comes from and the
+    // rows it counts have to be one commit.
+    //
+    // PROGRAMMATIC, NOT @Transactional ON THIS BEAN. This bean is @Profile("tool") and an ApplicationRunner that
+    // closes with System.exit, so no test may obtain it from a context (LoaderIT's header records why the tool
+    // profile is never activated), and an annotation on a bean nothing can take from a context would leave the
+    // boundary that carries this invariant unexercised by every test in the module. A TransactionTemplate is the
+    // same single transaction and is entered identically in production and in the tests that inject a failure
+    // into it. Nothing else here is transactional, so the run row above and the FAILED close below stay outside.
+    //
+    // What joins it: LegacyLoader.load and ReconciliationService.reconcile are @Transactional(REQUIRED), so they
+    // join this transaction and audit/LedgerService's MANDATORY appends find it open; ShadowComparator.compare is
+    // NOT_SUPPORTED, so it suspends this one exactly as it ran with none and its windows still commit one by
+    // one - which is why a lost shadow window leaves its findings readable while a lost load leaves nothing.
+    private RunVerdict runToVerdict(ToolInvocation invocation, MigrationRun run) {
+        TransactionTemplate work = new TransactionTemplate(context.getBean(PlatformTransactionManager.class));
+        return work.execute(status -> {
+            dispatch(invocation, run);
+
+            // The one authority for the number is the persisted rows, read back rather than taken from the
+            // count each command returns, so the exit code and the evidence an operator reviews cannot
+            // disagree - a variance that never reached the database must not move the code, and one that did
+            // must. Only VARIANCE counts: an ACCEPTED_EXCEPTION records an authorized difference, so the seeded
+            // REJECTED_BY_TARGET row must not turn a clean run into a failed one (AAP 0.10.3).
+            int varianceCount = Math.toIntExact(
+                    reconciliations.countByRunIdAndStatus(run.runId(), ReconciliationStatus.VARIANCE));
+            int legacyRecordCount = run.legacyRecordCount();
+            int migratedRecordCount = run.migratedRecordCount();
+            MigrationRun.Status finalStatus =
+                    varianceCount == 0 ? MigrationRun.Status.CLEAN : MigrationRun.Status.VARIANCE;
+
+            run.finish(finalStatus, legacyRecordCount, migratedRecordCount, varianceCount);
+            runs.save(run);
+            return new RunVerdict(finalStatus, legacyRecordCount, migratedRecordCount, varianceCount);
+        });
+    }
+
+    /**
+     * Executes the requested command, leaving the run row's verdict, counts and {@code finishedAt} to
+     * {@link #runToVerdict(ToolInvocation, MigrationRun)}, which closes the row in the same transaction.
+     */
+    // Sequences and reports, never re-implements: each command's returned count is deliberately discarded,
+    // because the transaction that closes the run re-derives it from the persisted rows.
     private void dispatch(ToolInvocation invocation, MigrationRun run) {
         switch (invocation.command()) {
             case COMMAND_LOAD -> {
@@ -356,8 +410,7 @@ public class MigrationToolRunner implements ApplicationRunner {
                         invocation.legacyCharset(),
                         invocation.legacyTimeZone(),
                         invocation.historyRecordLength());
-                // The loader reports its counts instead of writing them, so the row has exactly one closer.
-                // reconcile and shadow-compare set the same two fields on the run themselves.
+                // The loader reports its counts rather than writing them, so the row has one closer.
                 run.setLegacyRecordCount(result.legacyRecordCount());
                 run.setMigratedRecordCount(result.migratedRecordCount());
             }
@@ -380,21 +433,19 @@ public class MigrationToolRunner implements ApplicationRunner {
     private void recordFailure(MigrationRun attempted) {
         UUID runId = attempted.runId();
 
-        // THE FINDINGS DECIDE THE FAILED ROW'S VARIANCE COUNT, NOT THE INSTANCE THAT DIED. What survives a
-        // failure differs by mode, and reading the rows is correct in both. A shadow window suspends any
-        // ambient transaction (ShadowComparator.compare is Propagation.NOT_SUPPORTED), so each of its findings
-        // commits on its own and a window that dies late leaves them in the table while the counts it had not
-        // yet assigned are still zero; closing the row with that zero would tell the operator who signs off
-        // runbook Step 2 that the attempt found nothing, with its findings sitting under the same run_id - the
-        // one reading of the evidence that the evidence itself contradicts (AAP 0.6.5). A load and a reconcile
-        // are each a single transaction (LegacyLoader.load, ReconciliationService.reconcile), so their
-        // findings roll back with the work and the same read then yields zero, which is equally the truth.
+        // The findings decide the FAILED row's variance count, not the instance that died, because what
+        // survives a failure differs by mode. A shadow window suspends any ambient transaction
+        // (ShadowComparator.compare is Propagation.NOT_SUPPORTED), so its findings commit individually and a
+        // window that dies late leaves them in the table with its counts still zero; closing on that zero
+        // would tell the operator the attempt found nothing while its findings sit under the same run_id
+        // (AAP 0.6.5). A load and a reconcile are each one transaction, so their findings roll back with the
+        // work and the same read then yields zero, which is equally the truth.
         Integer varianceCountFromEvidence = persistedVarianceCount(runId);
 
-        // A FRESH READ IN A NEW TRANSACTION. The command's own transaction has rolled back, so the row is what
-        // describes the state that committed; the progress the lost instance reported is then merged in rather
-        // than replacing it, and recordProgress only ever raises a count (a partially reported run is
-        // evidence, a zeroed one is a claim).
+        // A fresh read in a new transaction: the command's own has rolled back, so the persisted row is what
+        // describes the state that committed. The lost instance's progress is merged in rather than replacing
+        // it, and recordProgress only ever raises a count - a partially reported run is evidence, a zeroed
+        // one is a claim.
         try {
             runs.findById(runId).ifPresentOrElse(failed -> {
                 failed.recordProgress(attempted.legacyRecordCount(), attempted.migratedRecordCount());
@@ -412,9 +463,8 @@ public class MigrationToolRunner implements ApplicationRunner {
             }, () -> LOGGER.error("Migration tooling run {} failed and its migration_run row is absent;"
                     + " the attempt has no recorded evidence", runId));
         } catch (RuntimeException e) {
-            // Deliberately swallowed and reported: the caller is already returning EXIT_ERROR, and a
-            // datastore that cannot accept this update is exactly the case where the original failure - which
-            // has been logged with its stack - is the one an operator has to act on.
+            // Swallowed and reported: the caller is already returning EXIT_ERROR, and the original failure,
+            // logged with its stack, is the one an operator has to act on.
             LOGGER.error("Could not record migration tooling run {} as FAILED", runId, e);
         }
     }
@@ -423,10 +473,9 @@ public class MigrationToolRunner implements ApplicationRunner {
      * The number of {@code VARIANCE} rows persisted under {@code runId}, or {@code null} when they cannot be
      * read.
      */
-    // Separated from the close above, and null-returning rather than throwing, because this runs on a path
-    // that is ALREADY handling a failure - including the one case where the same query has just failed. A
-    // second exception here would replace the original, logged failure with a less informative one and would
-    // cost the row its FAILED status as well.
+    // Null-returning rather than throwing, because this runs on a path already handling a failure - the same
+    // query may be the one that just failed. A second exception would replace the original, logged failure
+    // and cost the row its FAILED status as well.
     private Integer persistedVarianceCount(UUID runId) {
         try {
             return Math.toIntExact(
@@ -449,15 +498,15 @@ public class MigrationToolRunner implements ApplicationRunner {
         };
     }
 
-    // ----------------------------------------------------------------------------------------------
-    // Argument validation - every check below runs before a single row is written
-    // ----------------------------------------------------------------------------------------------
-
     /**
      * Validates every {@code tool.*} value and returns them parsed, or raises naming what is wrong.
      *
+     * @param arguments the command line this invocation was started with
+     * @return every {@code tool.*} value, parsed
      * @throws CashAccountException when any value is missing, unrecognized or unusable
      */
+    // Every check here runs before a single row is written, which is what keeps an argument error
+    // distinguishable from a failed run: the former leaves no migration_run row at all.
     private ToolInvocation validate(ApplicationArguments arguments) {
         rejectUnknownToolOptions(arguments);
 
@@ -474,13 +523,9 @@ public class MigrationToolRunner implements ApplicationRunner {
                 requireHistoryRecordLength(requestedCommand, inputDirectory));
     }
 
-    /**
-     * Rejects any {@code tool.}-prefixed command-line option that is not one of the seven declared keys.
-     */
-    // A MISTYPED KEY IS SILENT OTHERWISE. --tool.batchId=... resolves to no property at all, so the run would
-    // proceed on the empty default of tool.batch-id or, worse for a value that has one, on a default the
-    // operator did not choose - behaviour changed with nothing failing. Only tool.* names are inspected, so
-    // Spring's own options (--spring.profiles.active and the rest) are untouched.
+    // A mistyped key is silent otherwise: --tool.batchId=... resolves to no property at all, so the run
+    // would proceed on a default the operator did not choose, behaviour changed with nothing failing. Only
+    // tool.* names are inspected, so Spring's own options are untouched.
     private void rejectUnknownToolOptions(ApplicationArguments arguments) {
         List<String> unknown = arguments.getOptionNames().stream()
                 .filter(name -> name.startsWith(TOOL_PROPERTY_PREFIX))
@@ -498,14 +543,12 @@ public class MigrationToolRunner implements ApplicationRunner {
     private String requireCommand() {
         String requested = trimmedOrEmpty(command);
 
-        // FAIL CLOSED ON AN UNRECOGNIZED COMMAND, which is the deliberate replacement for the legacy
-        // dispatcher's missing catch-all: EVALUATE WS-REQ branched on A/Q/U/X/C/D with no WHEN OTHER
-        // (backend/cash-account-cobol/COBOL/CASH00.cbl:L89-L102), so an unknown code performed no SQL, left
-        // SQLCODE at whatever the SQLCA already held, echoed the caller's own COMMAREA back as the result
-        // (L104-L108) and still wrote a history record (L111-L131) - an unrecognized request that looked
-        // exactly like a successful one. Matched exactly, with only surrounding whitespace tolerated: the
-        // value selects a command that writes to a database, and a lenient match is one more way a mistyped
-        // command can be interpreted as a different one.
+        // Fails closed on an unrecognized command, the deliberate replacement for the legacy dispatcher's
+        // missing catch-all: EVALUATE WS-REQ branched on A/Q/U/X/C/D with no WHEN OTHER
+        // (backend/cash-account-cobol/COBOL/CASH00.cbl:L89-L102), so an unknown code performed no SQL, echoed
+        // the caller's own COMMAREA back (L104-L108) and still wrote a history record (L111-L131) - an
+        // unrecognized request that looked exactly like a successful one. Matched exactly, with only
+        // surrounding whitespace tolerated, because the value selects a command that writes to a database.
         if (!ACCEPTED_COMMANDS.contains(requested)) {
             throw argumentError(COMMAND_PROPERTY + " must be one of " + ACCEPTED_COMMANDS
                     + (requested.isEmpty() ? ", but was not supplied" : ", but was '" + requested + "'"));
@@ -513,6 +556,9 @@ public class MigrationToolRunner implements ApplicationRunner {
         return requested;
     }
 
+    // Files beneath this directory are the only legacy source the tooling reads: no DB2 for z/OS or VSAM
+    // connection, data-set name, host or credential exists in this module and none may be added, because the
+    // mechanism is verified against fixtures and the live migration is a runbook step (AAP 0.3.2).
     private Path requireInputDirectory() {
         String requested = trimmedOrEmpty(input);
         if (requested.isEmpty()) {
@@ -521,22 +567,25 @@ public class MigrationToolRunner implements ApplicationRunner {
                     + " argument can never become a source the tool chose for itself");
         }
 
+        // The trusted real path, never a normalized one: normalize() resolves '..' textually and resolves no
+        // symbolic link at all, so it cannot say what directory a run actually read; toRealPath() inside
+        // LegacyExportFormat.requireInputDirectory can, and its result is the root every child of this input
+        // is then measured against (AAP 0.3.2). The directory and readability rules, and the wording of their
+        // refusals, live there with the containment rules they belong to; this method keeps the property name
+        // and the tool's own argument-error channel around them.
         Path resolved;
         try {
-            resolved = Path.of(requested).toAbsolutePath().normalize();
+            resolved = LegacyExportFormat.requireInputDirectory(Path.of(requested));
         } catch (InvalidPathException e) {
             throw argumentError(INPUT_PROPERTY + " is not a usable path: '" + requested + "' (" + e.getReason()
                     + ")");
+        } catch (IllegalArgumentException refused) {
+            throw argumentError(refused.getMessage());
         }
 
-        if (!Files.isDirectory(resolved)) {
-            throw argumentError(INPUT_PROPERTY + " must name an existing directory, but '" + resolved
-                    + "' is not one");
-        }
-        if (!Files.isReadable(resolved)) {
-            throw argumentError(INPUT_PROPERTY + " directory '" + resolved + "' is not readable by this"
-                    + " process");
-        }
+        // Checked against the real path, because that is the string migration_run.source_path records as the
+        // run's evidence - a shorter symbolic link to a long directory would otherwise pass here and then
+        // overflow the column.
         if (resolved.toString().length() > SOURCE_PATH_MAX_LENGTH) {
             throw argumentError(INPUT_PROPERTY + " resolves to a path of "
                     + resolved.toString().length() + " characters, which migration_run.source_path cannot"
@@ -549,10 +598,9 @@ public class MigrationToolRunner implements ApplicationRunner {
     private UUID requireBatchId() {
         String requested = trimmedOrEmpty(batchId);
 
-        // REQUIRED FOR EVERY COMMAND, load included. Each invocation records its own run_id, so the batch id
-        // is the only thing that ties a reconcile to the load it judges and a retry to the attempt it
-        // replaces (AAP 0.6.3); a generated one would produce a run that reconciles nothing and looks clean
-        // doing it.
+        // Required for every command, load included: each invocation records its own run_id, so the batch id
+        // is the only thing tying a reconcile to the load it judges and a retry to the attempt it replaces
+        // (AAP 0.6.3). A generated one would produce a run that reconciles nothing and looks clean doing it.
         if (requested.isEmpty()) {
             throw argumentError(BATCH_ID_PROPERTY + " is required for every command: it is what ties a"
                     + " reconcile to the load it judges and a retry to the attempt it replaces");
@@ -576,14 +624,11 @@ public class MigrationToolRunner implements ApplicationRunner {
     }
 
     private MigrationRun.RateSource requireRateSource() {
-        // VALIDATED HERE TOO, AND CANONICALIZED ONLY ONCE. MigrationRun.RateSource.of is the single reading of
-        // tool.rate-source in this module: the two classifiers that decide whether a difference may be
-        // attributed to the exchange rate hold the same type, and the delegate that prices the replay is
-        // selected from it, so no part of a run can be operating on a different understanding of the value
-        // than the log line records. Checking it among the arguments is what turns a misspelling into this
-        // class's ordinary argument error with the accepted tokens named, alongside the charset and time-zone
-        // checks; the tool profile's own rate-source bean refuses to start on the same value, so in practice
-        // whichever fires first refuses the same invocation.
+        // Canonicalized exactly once: MigrationRun.RateSource.of is the module's single reading of
+        // tool.rate-source, so the classifiers that may attribute a difference to the rate and the delegate
+        // that prices the replay cannot hold different understandings of it than the log line records.
+        // Checking it here turns a misspelling into this class's ordinary argument error with the accepted
+        // tokens named; the tool profile's rate-source bean refuses to start on the same value.
         try {
             return MigrationRun.RateSource.of(rateSource);
         } catch (IllegalStateException e) {
@@ -594,9 +639,8 @@ public class MigrationToolRunner implements ApplicationRunner {
     private Charset requireLegacyCharset() {
         String requested = trimmedOrEmpty(legacyCharset);
 
-        // A property rather than a constant because the CICS region's exact CCSID is an open item the
-        // mainframe team answers (AAP 0.11.2): a wrong code page corrupts every decoded owner name, so it
-        // has to be correctable inside a migration window rather than by a rebuild.
+        // Configuration rather than a constant because the region's exact CCSID is AAP 0.11.2's open item: a
+        // wrong code page corrupts every decoded owner name, so it must be correctable without a rebuild.
         if (requested.isEmpty()) {
             throw argumentError(LEGACY_CHARSET_PROPERTY + " must name a code page (the documented assumption"
                     + " is " + LegacyExportFormat.DEFAULT_LEGACY_CHARSET + "), but was blank");
@@ -612,9 +656,8 @@ public class MigrationToolRunner implements ApplicationRunner {
     private ZoneId requireLegacyTimeZone() {
         String requested = trimmedOrEmpty(legacyTimeZone);
 
-        // Also an open item (AAP 0.11.2). The history stamps are region local time, so a wrong zone shifts
-        // every derived event_at by a fixed offset while each individual row still looks plausible - which
-        // would make a shadow window's boundaries meaningless.
+        // Also AAP 0.11.2's open item: the history stamps are region local time, so a wrong zone shifts every
+        // derived event_at by a fixed offset while each row still looks plausible.
         if (requested.isEmpty()) {
             throw argumentError(LEGACY_TIMEZONE_PROPERTY + " must name a time zone (the documented assumption"
                     + " is UTC), but was blank");
@@ -628,14 +671,12 @@ public class MigrationToolRunner implements ApplicationRunner {
     }
 
     private Integer requireHistoryRecordLength(String requestedCommand, Path inputDirectory) {
-        // DECLARED, NEVER INFERRED. CASH00 writes 57 bytes (CASH00.cbl:L38-L45, L128) into a cluster defined
-        // RECSZ(100 100) (backend/cash-account-cobol/VSAM/DEFKSDS.jcl:L11), and which of the two a real REPRO
-        // yields is settled by the CICS FILE definition, which is not in this repository and is obtained
-        // during the runbook's migration-rehearsal step (AAP 0.11.2). A guessed length divides a file cleanly
-        // often enough to look correct and then shifts every field of every record by a few bytes.
-        //
-        // A declared value is checked whatever the command, so a wrong one is refused at the first
-        // invocation that carries it rather than at the one that happens to decode a record.
+        // Declared, never inferred: CASH00 writes 57 bytes (CASH00.cbl:L38-L45, L128) into a cluster defined
+        // RECSZ(100 100) (backend/cash-account-cobol/VSAM/DEFKSDS.jcl:L11), and which a real REPRO yields is
+        // settled by the CICS FILE definition obtained in the runbook's migration-rehearsal step (AAP
+        // 0.11.2). A guessed length divides a file cleanly often enough to look correct and then shifts every
+        // field by a few bytes. Checked whatever the command, so a wrong value is refused at the first
+        // invocation carrying it rather than at the one that happens to decode a record.
         if (historyRecordLength != null) {
             try {
                 return LegacyExportFormat.requireAcceptedHistoryRecordLength(historyRecordLength);
@@ -644,17 +685,30 @@ public class MigrationToolRunner implements ApplicationRunner {
             }
         }
 
-        // DEMANDED OF load ALONE, because load is the only command that decodes history: reconcile reads the
-        // account and rate exports, and shadow-compare reads the two captured streams. The runbook's Step 1
-        // runs both commands against the SAME export directory and passes the record length only to the load
-        // (docs/operational-runbook.md, Step 1 step 4), so requiring it of every command would reject the
-        // documented reconcile invocation for a file that invocation never opens.
+        // Demanded of load alone, because load is the only command that decodes history. Runbook Step 1 runs
+        // load and reconcile against the same export directory and passes the record length only to the load,
+        // so requiring it of every command would reject the documented reconcile invocation for a file that
+        // invocation never opens.
         if (!COMMAND_LOAD.equals(requestedCommand)) {
             return null;
         }
 
-        Path binaryHistory = inputDirectory.resolve(LegacyExportFormat.HISTORY_BINARY_FILE);
-        if (Files.isRegularFile(binaryHistory)) {
+        // Resolved through the containment helper and judged through the approved directory itself: a
+        // symbolic link named history.cp037.bin is refused rather than accepted as "a binary history export
+        // is present", so this check can neither be satisfied nor evaded by a link, and a directory
+        // substituted for tool.input cannot answer it at all (AAP 0.3.2).
+        Path binaryHistory;
+        boolean present;
+        try {
+            binaryHistory = LegacyExportFormat.resolveInputFile(inputDirectory,
+                    LegacyExportFormat.HISTORY_BINARY_FILE);
+            present = LegacyExportFormat.isExportFilePresent(
+                    LegacyExportFormat.approveInputDirectory(inputDirectory),
+                    LegacyExportFormat.HISTORY_BINARY_FILE);
+        } catch (IllegalArgumentException refused) {
+            throw argumentError(refused.getMessage());
+        }
+        if (present) {
             throw argumentError(HISTORY_RECORD_LENGTH_PROPERTY + " is mandatory whenever a binary history"
                     + " export is the input, and '" + binaryHistory + "' is present. Declare "
                     + LegacyExportFormat.HISTORY_RECORD_LENGTH + " or "
@@ -669,16 +723,16 @@ public class MigrationToolRunner implements ApplicationRunner {
         return value == null ? "" : value.strip();
     }
 
-    // INVALID_QUERY carries the module's single exception type into a surface that has no HTTP mapping: the
-    // tool profile starts no web application, so the code's status is inert here and only its message is
-    // read. A second exception type for the CLI would buy nothing and split the error model in two.
+    private static String toolProperty(ConfigurableApplicationContext context, String key, String fallback) {
+        return Binder.get(context.getEnvironment()).bind(key, Bindable.of(String.class)).orElse(fallback);
+    }
+
+    // INVALID_QUERY carries the module's single exception type into a surface with no HTTP mapping: the tool
+    // profile starts no web application, so the status is inert and only the message is read. A second
+    // exception type for the CLI would split the error model in two.
     private static CashAccountException argumentError(String message) {
         return CashAccountException.of(CashAccountErrorCode.INVALID_QUERY, message);
     }
-
-    // ----------------------------------------------------------------------------------------------
-    // Characterization status - the runtime half of the AAP 0.10.1 gate
-    // ----------------------------------------------------------------------------------------------
 
     /** Reads the characterization document's acceptance state, defaulting to {@code DRAFT}. */
     private MigrationRun.CharacterizationStatus characterizationStatus() {
@@ -692,11 +746,10 @@ public class MigrationToolRunner implements ApplicationRunner {
             }
         }
 
-        // WHY A MISSING DOCUMENT IS DRAFT AND CAN NEVER BE ACCEPTED. Runbook Step 1's sign-off criterion
-        // includes characterization_status = 'ACCEPTED', so the absence of the baseline must be unable to
-        // satisfy it: defaulting the other way would let a run with no characterization at all be signed off
-        // against a real export. DRAFT still runs freely against the synthetic fixtures, which is the whole
-        // point - the reconciliation results are only as trustworthy as the baseline they are judged against.
+        // A missing document is DRAFT and can never be ACCEPTED: runbook Step 1's sign-off criterion includes
+        // characterization_status = 'ACCEPTED', so the absence of the baseline must be unable to satisfy it,
+        // where defaulting the other way would let a run with no characterization be signed off against a
+        // real export. DRAFT still runs freely against the fixtures.
         LOGGER.warn("No characterization document with a recognizable 'Status: DRAFT|ACCEPTED' line was found"
                 + " (tried {}); this run records characterization_status {}. Set -D"
                 + CHARACTERIZATION_DOCUMENT_PROPERTY + "=<path> when the document is elsewhere",
@@ -719,8 +772,7 @@ public class MigrationToolRunner implements ApplicationRunner {
             }
         }
 
-        // The module root first, then its parent, which covers a JVM started one directory above it. The
-        // document is under docs/ and not in src/main/resources, so it is never a classpath resource.
+        // The module root first, then its parent, which covers a JVM started one directory above it.
         candidates.add(Path.of(CHARACTERIZATION_DOCUMENT_PATH));
         candidates.add(Path.of(PARENT_DIRECTORY, CHARACTERIZATION_DOCUMENT_PATH));
         return List.copyOf(candidates);

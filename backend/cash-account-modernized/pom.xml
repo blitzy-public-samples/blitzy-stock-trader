@@ -1,21 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
 
-<!--
-       Copyright 2025 Kyndryl, All Rights Reserved
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
--->
-
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
@@ -52,9 +36,44 @@
         <java.version>21</java.version>
         <maven.compiler.release>21</maven.compiler.release>
 
-        <!-- Versions the Spring Boot BOM does not manage. Declared once each so an audit reads one
-             value per coordinate; every other version in this file comes from the BOM deliberately. -->
-        <postgresql.version>42.7.7</postgresql.version>
+        <!-- The next three are deliberate OVERRIDES of versions the Spring Boot BOM does manage, and each one
+             exists for a single reason: the version 3.3.13 manages is affected by the CVE named against it and
+             the mandated 3.3 line ships no newer parent to inherit the fix from. They are the only overrides
+             in this file, one property per coordinate set, each with its own advisory: everywhere else the BOM
+             remains this module's single version authority, and these three are that rule's stated exceptions
+             rather than a second authority beside it. -->
+        <!-- CVE-2026-42198: in pgJDBC 42.2.0 up to but excluding 42.7.11 the SERVER dictates the
+             SCRAM-SHA-256 PBKDF2 iteration count, so an impersonated or compromised database can force
+             unbounded client-side CPU work at login, which loginTimeout does not bound. 42.7.11 adds the
+             scramMaxIterations cap (default 100000) and is the fixed floor; 42.7.13 is the current 42.7.x and
+             additionally fails closed on a SCRAM channel-binding downgrade. No scramMaxIterations is added to
+             the assembled JDBC URL: the driver's own default already caps it. -->
+        <postgresql.version>42.7.13</postgresql.version>
+        <!-- CVE-2025-61795: Tomcat 10.1.0-M1 through 10.1.46 delays cleanup of multipart upload temp files on
+             an error path, so repeated failed uploads exhaust disk; fixed in 10.1.47, and 10.1.60 is the
+             latest 10.1.x so it carries every later 10.1 fix as well. This is the parent's own version
+             property, so the whole org.apache.tomcat.embed:* set moves together rather than one artifact
+             being lifted out of its release. spring.servlet.multipart.enabled=false in application.yml
+             removes the affected code path as defence in depth beside this bump, not instead of it. -->
+        <tomcat.version>10.1.60</tomcat.version>
+        <!-- CVE-2026-40984: crafted HTTP requests against Micrometer's HTTP-server instrumentations cause a
+             denial of service in 1.13.0-1.13.18 (the BOM-managed 1.13.15 is inside that range), 1.14.0-1.14.15,
+             1.15.0-1.15.11, 1.16.0-1.16.5 and <=1.9.17. The only fixed versions are 1.15.12 and 1.16.6, so no
+             1.13.x or 1.14.x remediates anything and staying on the BOM line is not an option; 1.15.12 is the
+             lowest fixed version. The advisory's other remedy - disabling HTTP server instrumentation - is
+             deliberately NOT taken: the Operational Runbook's Step 3 cutover rollback criterion is a 5xx ratio
+             over http_server_requests_seconds_count scraped from this service (AAP 0.3.3), so disabling the
+             instrumentation would delete the metric that decides a rollback. This property drives the parent's
+             micrometer-bom import, so micrometer-core, -observation, -commons and -registry-prometheus move
+             together. -->
+        <micrometer.version>1.15.12</micrometer.version>
+
+        <!-- Everything below is a coordinate the BOM does not manage, with one stated exception: jakarta.ws.rs
+             below restates the BOM's own 3.1.0 (spring-boot-dependencies-3.3.13 jakarta-ws-rs.version) rather
+             than overriding it, so the API level the copied broker client compiles against is auditable beside
+             the rest of that stack. Declared once each so an audit reads one value per coordinate; apart from
+             the parent coordinate itself and the spring-boot-maven-plugin pin that repeats it, every version in
+             this file that appears nowhere in this block comes from the BOM deliberately. -->
         <microprofile.rest.client.version>4.0</microprofile.rest.client.version>
         <jakarta.ws.rs.version>3.1.0</jakarta.ws.rs.version>
         <jakarta.cdi.version>4.1.0</jakarta.cdi.version>
@@ -115,10 +134,11 @@
             <groupId>io.micrometer</groupId>
             <artifactId>micrometer-registry-prometheus</artifactId>
         </dependency>
-        <!-- 42.7.7 equals the BOM-managed version and matches backend/portfolio/pom.xml:L113-L118
-             exactly; it is pinned here only so that parity is auditable in one place. The scope
-             deliberately differs from portfolio's "provided": Liberty supplies the driver from
-             /config/prereqs, whereas a Spring Boot executable jar must carry it. -->
+        <!-- The pin deliberately OVERRIDES the BOM-managed 42.7.7, and therefore no longer matches
+             backend/portfolio/pom.xml:L113-L118: 42.7.7 is affected by CVE-2026-42198, fixed in 42.7.11 (see
+             postgresql.version above). The scope deliberately differs from portfolio's "provided" as well:
+             Liberty supplies the driver from /config/prereqs, whereas a Spring Boot executable jar must
+             carry it. -->
         <dependency>
             <groupId>org.postgresql</groupId>
             <artifactId>postgresql</artifactId>
@@ -145,8 +165,6 @@
                 </exclusion>
             </exclusions>
         </dependency>
-        <!-- Role-enforcement assertions run against the real filter chain; this supplies the request
-             post-processors for that, and adds no mocking framework. -->
         <dependency>
             <groupId>org.springframework.security</groupId>
             <artifactId>spring-security-test</artifactId>
@@ -154,7 +172,8 @@
         </dependency>
         <!-- Testcontainers is taken at the BOM-managed 1.19.8 rather than the siblings' 1.20.4
              (backend/account) or 1.21.3 (backend/trade-history/pom.xml:L200-L217) so that a single BOM
-             is the sole version authority for this module. -->
+             is the sole version authority for the test stack - which it is in full, no test-scoped
+             coordinate being among the three security overrides declared in the properties block. -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-testcontainers</artifactId>
@@ -187,24 +206,19 @@
             <version>${jakarta.ws.rs.version}</version>
             <scope>test</scope>
         </dependency>
-        <!-- @ApplicationScoped on the copied interface; matches
-             backend/trade-history/pom.xml:L240-L245, narrowed to test scope because this module has no
-             CDI container. -->
         <dependency>
             <groupId>jakarta.enterprise</groupId>
             <artifactId>jakarta.enterprise.cdi-api</artifactId>
             <version>${jakarta.cdi.version}</version>
             <scope>test</scope>
         </dependency>
-        <!-- SpanKind on the copied interface; BOM-managed (1.38.0). -->
         <dependency>
             <groupId>io.opentelemetry</groupId>
             <artifactId>opentelemetry-api</artifactId>
             <scope>test</scope>
         </dependency>
-        <!-- @WithSpan on the copied interface. 2.4.0 declares opentelemetry-api 1.38.0, which is the
-             BOM-managed version above, so the two stay aligned; broker obtains both transitively through
-             microprofile-telemetry-api, so this direct coordinate is new to the estate. -->
+        <!-- 2.4.0 declares opentelemetry-api 1.38.0, the BOM-managed version above, so the two stay
+             aligned. -->
         <dependency>
             <groupId>io.opentelemetry.instrumentation</groupId>
             <artifactId>opentelemetry-instrumentation-annotations</artifactId>
@@ -249,6 +263,28 @@
         </dependency>
     </dependencies>
 
+    <!-- Verified build inputs. Two inputs of this module's build are fetched rather than declared, and both
+         are pinned by digest so a re-point after the build that validated them cannot go unnoticed.
+         1. The Maven distribution. .mvn/wrapper/maven-wrapper.properties carries
+            distributionSha256Sum=0d7125e8c91097b36edb990ea5934e6c68b4440eef4ea96510a0f6815e7eeadb, which
+            mvnw:222-247 and mvnw.cmd:123-131 verify on download and abort the build on mismatch. Maven
+            Central publishes no .sha256 for apache-maven-3.9.11-bin.zip, so that value was computed from the
+            9,278,421 bytes served by distributionUrl after their SHA-512 was matched against BOTH Central's
+            published .sha512 and archive.apache.org's independent copy
+            (03e2d65d4483a3396980629f260e25cac0d8b6f7f2791e4dc20bc83f9514db8d0f05b0479e699a5f34679250c49c8e52e961262ded468a20de0be254d8207076)
+            and their SHA-1 against Central's .sha1 (2b7fdf8f6983c7b295eab505b46825ee2d11959b). The value is
+            lowercase hex because mvnw.cmd compares (Get-FileHash ...).Hash.ToLower() against the literal.
+            The checksum line is the ONLY departure from the verbatim portfolio-assistant wrapper copy that
+            AAP 0.2.3 and 0.8.1 call for: lines 1-19 of that file remain byte-identical to the reference, the
+            wrapper version, distribution type and distribution URL are unchanged, and the build resolves the
+            same Maven 3.9.11. Removing it would leave the distribution unverified, which is the defect
+            CWE-494 names, so the divergence is deliberate and is reported for authorization rather than
+            hidden here.
+         2. The container base image. Dockerfile pins ubi9/openjdk-21-runtime:1.21 to its multi-arch
+            manifest-list digest; that file states its own provenance and re-derivation commands.
+         Update policy for both: a new distribution URL or base release is a reviewed change in which the
+         digest is re-derived from the vendor's published checksums and moves in the same edit as the
+         reference it verifies. Neither may be bumped without the other. -->
     <build>
         <plugins>
             <!-- Version stated explicitly so it can never drift from the parent above. The repackage

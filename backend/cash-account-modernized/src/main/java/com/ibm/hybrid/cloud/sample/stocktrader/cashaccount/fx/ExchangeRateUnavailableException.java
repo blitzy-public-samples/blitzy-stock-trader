@@ -1,44 +1,12 @@
-/*
-       Copyright 2025 Kyndryl, All Rights Reserved
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
- */
-
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.fx;
 
-// Deliberate deviation: the legacy program failed open. CASH-ACCT-CREDIT and CASH-ACCT-DEBIT selected the rate row
-// and then ran the COMPUTE and the UPDATE unconditionally [backend/cash-account-cobol/COBOL/CASH00.cbl:L214-L231],
-// so a missing row's SQLCODE 100 was overwritten by the UPDATE's SQLCODE 0 and a balance computed from the
-// uninitialized RATES host variable [backend/cash-account-cobol/COBOL/DCLFRANK.cpy:L22] was committed under a
-// success code. Failing closed instead is intentional: the balance is left unchanged and no ledger row is written
-// because retail/RetailCashAccountService resolves the rate before the write transaction opens, so no mutation has
-// begun and there is nothing to roll back. Being unchecked is what keeps this propagating out of pricing instead of
-// inviting a caller to swallow it and continue.
-//
-// Deliberately not a CashAccountException subclass: this type carries no status and no error code, so an
-// undeterminable rate reaches the service layer as a transport-level fact and RetailCashAccountService translates it
-// into EXCHANGE_RATE_UNAVAILABLE - error/ApiExceptionHandler never renders it directly, which leaves exactly one
-// route from a rate failure to the 503 response. That neutrality belongs to this type rather than to the package
-// around it: FrankfurterExchangeRateClient does reach for the taxonomy in one deliberate place, raising
-// CashAccountException(INVALID_CURRENCY) for a code it will not serve, which stays a 400 precisely so a rejected
-// input is never re-dressed as a transient 503 that invites a retry.
 /** Signals that no exchange rate could be determined; the caller translates it to 503 EXCHANGE_RATE_UNAVAILABLE. */
 public class ExchangeRateUnavailableException extends RuntimeException {
 
     private static final long serialVersionUID = 1L;
 
-    // Optional context, so a translating catch block or log line can name the pair. Both are null when the failure
-    // has no meaningful pair to report, such as a client-side configuration fault.
+    // Optional context, so a translating catch block or log line can name the pair; both are null when the failure
+    // has no pair to report, such as a client-side configuration fault.
     private final String base;
     private final String quote;
 
@@ -72,9 +40,9 @@ public class ExchangeRateUnavailableException extends RuntimeException {
         return quote;
     }
 
-    // Absent codes render as a question mark rather than failing, because this runs while an error is already being
-    // reported. Callers keep the reason to a short phrase: the message reaches the logs, so it must never carry the
-    // endpoint, a credential or a response body.
+    // Absent codes render as a question mark rather than failing, because this runs while an error is already
+    // being reported. The message reaches the logs, so a caller's reason must never carry the endpoint, a
+    // credential or a response body.
     private static String describe(String base, String quote, String reason) {
         StringBuilder message = new StringBuilder("no exchange rate for ")
                 .append(base == null ? "?" : base)

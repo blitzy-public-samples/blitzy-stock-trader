@@ -1,19 +1,3 @@
-/*
-       Copyright 2025 Kyndryl, All Rights Reserved
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
- */
-
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.contract;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -53,8 +37,6 @@ import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.transaction.support.TransactionTemplate;
 
-import com.fasterxml.jackson.core.type.TypeReference;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.ibm.hybrid.cloud.sample.stocktrader.broker.client.CashAccountClient;
 import com.ibm.hybrid.cloud.sample.stocktrader.broker.json.CashAccount;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.audit.LedgerEntryResponse;
@@ -68,51 +50,14 @@ import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.support.BrokerClientF
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.support.JwtTestTokens;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.support.PostgresTestSupport;
 
-/*
- * WHY THE REQUESTS BELOW ARE ISSUED BY BROKER'S OWN INTERFACE AND NOT BY A TEST CLIENT. The claim this whole
- * refactor rests on is that backend/broker was never edited and satisfies the new service as it stands: its
- * MicroProfile REST Client interface
- * [backend/broker/src/main/java/com/ibm/hybrid/cloud/sample/stocktrader/broker/client/CashAccountClient.java:L42-L90]
- * and its DTO [.../broker/json/CashAccount.java:L22-L24] are copied byte-identically into this module's test tree
- * (contract/CashAccountClientDriftTest fails the build if either copy drifts), and every one of the six retail
- * operations is exercised here through a proxy built from that copy by support/BrokerClientFactory. A MockMvc,
- * WebTestClient or TestRestTemplate request would assert what this test intends rather than what the caller
- * actually emits - its paths, its Accept/Content-Type pair, its JSON binding and its double-valued ?amount= - so
- * none of them stands in for the interface on any scenario the interface can express. If an assertion here could
- * only be made green by editing broker or the copies, that is the stop-and-flag condition of AAP 0.3.4, never a
- * patch.
- *
- * THREE THINGS THE INTERFACE CANNOT EXPRESS, and how each is issued instead. Its write methods take a fully
- * populated CashAccount, so a request with NO body and a request whose body omits fields cannot be sent through
- * it at all, and none of its six methods reaches an institutional path, so the ledger a transition writes cannot
- * be read through it either. Those three go out on an injected TestRestTemplate with the same StockTrader token, and one
- * scenario additionally reaches the repository directly, because whether a fresh account is INSERTed or merged is
- * decidable there and invisible over HTTP (see the contested-create test). Everything asserted about the contract
- * ITSELF - path, verb, query parameter, payload and response shape - still comes from the caller's own interface.
- *
- * WHY EVERY ACCOUNT IS DENOMINATED IN USD. credit and debit are the only retail operations that consult an
- * exchange rate, and a same-currency operation short-circuits to a rate of exactly 1 with no outbound call
- * (AAP 0.7.2), which is also what makes parity with the legacy arithmetic exact. cashaccount.fx.base-currency is
- * USD - broker's own default account currency
- * [backend/broker/src/main/java/com/ibm/hybrid/cloud/sample/stocktrader/broker/BrokerService.java:L357-L365] - and
- * src/test/resources/application-test.yml points cashaccount.fx.url at a refused local port so that no test can
- * reach the public rate API. A non-USD account on either path would therefore answer 503
- * EXCHANGE_RATE_UNAVAILABLE, which is fx/CurrencyConversionTest's subject and not this file's.
- *
- * WHY BALANCES ARE COMPARED WITHIN A TOLERANCE. The caller's DTO declares `private double balance`
- * [.../broker/json/CashAccount.java:L23] and that declaration is not ours to change, so it is the one permitted
- * floating-point value in this subtree (AAP 0.7.1). Its compensating control is in this class: the getCashAccount
- * scenario captures the raw response body and asserts the balance as literal plain-decimal TEXT, which is the
- * contract broker actually consumes, while the typed comparisons stay two orders of magnitude inside a penny.
- */
 /** Drives all six methods of broker's unmodified CashAccountClient against the running service and a real database. */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 class RetailContractIT extends PostgresTestSupport {
 
     // One owner per scenario, because support/PostgresTestSupport starts ONE container for the whole test JVM: a
-    // shared owner would make each scenario's outcome depend on which ran first. All are already uppercase and
-    // inside the 1-32 characters domain/OwnerNormalizer accepts, so the stored owner equals the value sent - except
-    // CREATE_OWNER_SENT, which is mixed case deliberately (see createCashAccount below).
+    // shared owner would make each scenario's outcome depend on which ran first. All are uppercase and within the
+    // 1-32 characters domain/OwnerNormalizer accepts, so the stored owner equals the value sent - except
+    // CREATE_OWNER_SENT, which is mixed case deliberately.
     private static final String GET_OWNER = "CTGET";
     private static final String CREATE_OWNER_SENT = "ctCreate";
     private static final String CREATE_OWNER_STORED = "CTCREATE";
@@ -135,17 +80,20 @@ class RetailContractIT extends PostgresTestSupport {
     /** Never created by any scenario, which is what makes the 404 assertion mean something. */
     private static final String MISSING_OWNER = "CTMISSING";
 
+    // Every account is USD, the configured fx base, where a same-currency operation short-circuits to a rate of
+    // exactly 1 with no outbound call (AAP 0.7.2) - so no scenario here reaches the fx url application-test.yml
+    // points at a refused port. It is also broker's own default account currency
+    // [backend/broker/src/main/java/com/ibm/hybrid/cloud/sample/stocktrader/broker/BrokerService.java:L357-L365].
     private static final String ACCOUNT_CURRENCY = "USD";
 
-    // The exact text the wire must carry for a balance of 1234.56. Jackson writes an object member without a space
-    // after the colon, and WRITE_BIGDECIMAL_AS_PLAIN (config/JacksonConfig) is what keeps the value out of the
-    // 1.23456E3 scientific form a plain BigDecimal serializer would emit for some scales. Asserting this against
-    // CashAccount.toString() instead would be meaningless: that method builds its own JSON WITH spaces
+    // Asserted against the raw body, not CashAccount.toString(): that method builds its own JSON WITH spaces
     // [.../broker/json/CashAccount.java:L70], so it would prove the DTO's formatting rather than the service's.
+    // WRITE_BIGDECIMAL_AS_PLAIN (config/JacksonConfig) is what keeps the value out of the 1.23456E3 form.
     private static final String PLAIN_DECIMAL_BALANCE_ON_THE_WIRE = "\"balance\":1234.56";
 
-    // Half a cent: far below the smallest amount NUMERIC(9,2) can represent, so the tolerance can absorb a double's
-    // representation error and nothing else.
+    // Balances are compared within a tolerance because the caller's DTO declares `private double balance`
+    // [.../broker/json/CashAccount.java:L23] and that declaration is not ours to change (AAP 0.7.1). Half a cent
+    // is below the smallest amount NUMERIC(9,2) can represent, so it absorbs representation error and nothing else.
     private static final double PENNY_TOLERANCE = 0.005;
 
     // AAP 0.6.2 binds each condition to exactly one status; named here so a red CI log reads as a contract row.
@@ -157,10 +105,9 @@ class RetailContractIT extends PostgresTestSupport {
     /** The retail seam's published prefix, which the chart hands broker as {@code cashAccount.url}. */
     private static final String RETAIL_BASE = BrokerClientFactory.RETAIL_BASE_PATH;
 
-    // The institutional path space, reached for two purposes only: the ledger is queried through the contract's own
-    // audit surface (AAP 0.6.2) rather than through a repository, and a hold is the sole way to put funds into
-    // reserved_balance - broker's client covers the retail surface alone, so that arrangement has to be made
-    // through the service's own institutional endpoints rather than through the interface under test.
+    // Reached for two purposes only: the ledger is read through the contract's own audit surface (AAP 0.6.2)
+    // rather than a repository, and a hold is the sole way to put funds into reserved_balance. Broker's client
+    // covers the retail surface alone, so neither can be arranged through the interface under test.
     private static final String INSTITUTIONAL_BASE = RETAIL_BASE + "/institutional";
 
     private static final BigDecimal ZERO_AMOUNT = new BigDecimal("0.00");
@@ -178,19 +125,18 @@ class RetailContractIT extends PostgresTestSupport {
     // Generous: it bounds a hung request rather than timing one, and a slow container must not fail the race.
     private static final long RACE_TIMEOUT_SECONDS = 30;
 
-    // Minted once for the class: the token is valid for 12 hours (support/JwtTestTokens), so re-minting per method
-    // would buy nothing. An explicit StockTrader token, rather than reliance on
-    // cashaccount.security.all-authenticated-hold-stocktrader, keeps this file independent of the role matrix that
+    // An explicit StockTrader token, rather than reliance on
+    // cashaccount.security.all-authenticated-hold-stocktrader, keeps this file independent of the role matrix
     // security/RoleEnforcementIT owns - a contract failure here can then never be an authorization finding.
     private static final String TOKEN = JwtTestTokens.stockTraderToken();
 
     @LocalServerPort
     private int port;
 
-    // Carries the requests the caller's typed interface cannot express, listed in the class comment above: a
-    // write with no body, a write whose body omits fields, a read of the institutional ledger, and the
-    // institutional hold that arranges the credit-ceiling scenario. Every scenario the interface CAN express
-    // still goes through broker's own client proxy, which is the point of the file.
+    // Carries the four requests the caller's typed interface cannot express: its write methods take a fully
+    // populated CashAccount, so a request with no body and a body omitting fields cannot be sent through it, and
+    // none of its six methods reaches an institutional path, so neither the ledger read nor the hold that
+    // arranges the credit-ceiling scenario can go through it either.
     @Autowired
     private TestRestTemplate rest;
 
@@ -207,6 +153,10 @@ class RetailContractIT extends PostgresTestSupport {
     @Autowired
     private TransactionTemplate transactions;
 
+    // A proxy over the byte-identical copy of broker's own interface, never a test client: a MockMvc,
+    // WebTestClient or TestRestTemplate request would carry the paths, Accept/Content-Type pair, JSON binding and
+    // double-valued ?amount= this test intends rather than the ones the unmodified caller actually emits
+    // [backend/broker/src/main/java/com/ibm/hybrid/cloud/sample/stocktrader/broker/client/CashAccountClient.java:L42-L90].
     private CashAccountClient client;
 
     // application-test.yml leaves the verification key unset so that no key material is checked in (AAP 0.7.5);
@@ -241,12 +191,10 @@ class RetailContractIT extends PostgresTestSupport {
 
     @Test
     void createCashAccountStoresTheOwnerUppercasedAndReturnsThatForm() {
-        // The owner is sent in mixed case on purpose. The legacy response casing depended on which paragraph
-        // answered - Q returned the database OWNER, already uppercase
-        // [backend/cash-account-cobol/COBOL/CASH00.cbl:L144], while A echoed the caller's own spelling of
-        // CUST-NAME-TEXT [CASH00.cbl:L158] - and the replacement always answers with the stored uppercase form
-        // (AAP 0.4.2). Broker reads only balance and currency out of the response
-        // [.../broker/BrokerService.java:L364-L365], so the change reaches no caller behaviour.
+        // Mixed case on purpose: legacy casing depended on which paragraph answered - Q returned the database
+        // OWNER [backend/cash-account-cobol/COBOL/CASH00.cbl:L144], A echoed CUST-NAME-TEXT [CASH00.cbl:L158] -
+        // and the replacement always answers the stored uppercase form (AAP 0.4.2). Broker reads only balance and
+        // currency out of the response [.../broker/BrokerService.java:L364-L365], so no caller behaviour changes.
         CashAccount created = client.createCashAccount(CREATE_OWNER_SENT,
                 new CashAccount(CREATE_OWNER_SENT, 1000.00, ACCOUNT_CURRENCY));
 
@@ -286,10 +234,9 @@ class RetailContractIT extends PostgresTestSupport {
     void debitReducesTheAvailableBalance() {
         seedAccount(DEBIT_OWNER, 1000.00);
 
-        // The caller's parameter is @QueryParam("amount") double [.../client/CashAccountClient.java:L83], so what
-        // reaches the wire is whatever the provider renders for that double - "250.5" here, and the 1.0E7 form for
-        // large values. The controller binds the parameter as text and parses it with new BigDecimal(String)
-        // precisely so both forms arrive intact; this scenario is the end-to-end proof of that binding.
+        // The caller's parameter is @QueryParam("amount") double [.../client/CashAccountClient.java:L83], so the
+        // wire carries whatever the provider renders for it - "250.5" here, the 1.0E7 form for large values. The
+        // controller binds it as text and parses with new BigDecimal(String) so both forms arrive intact.
         CashAccount debited = client.debit(DEBIT_OWNER, 250.50);
 
         assertAccount(debited, DEBIT_OWNER, 749.50, "PUT /cash-account/{owner}/debit?amount= (legacy D)");
@@ -306,13 +253,11 @@ class RetailContractIT extends PostgresTestSupport {
 
     @Test
     void unknownOwnerIsRejectedWithFourHundredFourAndNoEchoedBody() {
-        // The legacy read of an absent owner left SQLCODE 100 in a 10-character return field that dropped the sign
-        // [CASH00.cbl:L104] and copied the COMMAREA back verbatim [CASH00.cbl:L105-L108], so the caller received its
-        // own submitted amount as the "balance" of an account that did not exist. A 404 carrying no account body is
-        // the deliberate replacement (AAP 0.4.5): the client raises rather than returning a fabricated entity.
-        //
-        // The assertion is on the base type and the status, never on NotFoundException: which WebApplicationException
-        // subclass the MicroProfile default response-exception mapper produces is the client runtime's business.
+        // The legacy read of an absent owner left SQLCODE 100 in a return field that dropped the sign
+        // [CASH00.cbl:L104] and copied the COMMAREA back verbatim [CASH00.cbl:L105-L108], handing the caller its
+        // own submitted amount as the "balance" of an account that did not exist; a 404 with no account body is
+        // the deliberate replacement (AAP 0.4.5). Asserted on the base type, because which
+        // WebApplicationException subclass the MicroProfile mapper produces is the client runtime's business.
         assertThatExceptionOfType(WebApplicationException.class)
                 .isThrownBy(() -> client.getCashAccount(MISSING_OWNER))
                 .satisfies(rejection -> assertThat(rejection.getResponse().getStatus())
@@ -325,23 +270,19 @@ class RetailContractIT extends PostgresTestSupport {
     void zeroAmountIsAcceptedAndStillWritesItsLedgerRow() throws Exception {
         seedAccount(ZERO_OWNER, 500.00);
 
-        // A zero credit or debit computed stored +/- 0, updated the row, answered SQLCODE 0 and still wrote a
-        // history record [CASH00.cbl:L222, L256], so the transaction counts reconciliation compares are only equal
-        // if the replacement accepts it too (AAP 0.4.5). Broker never sends it - it skips lastTrade == 0
-        // [.../broker/BrokerService.java:L486-L501] - which is exactly why the contract has to honour it for the
-        // callers that do.
+        // The legacy accepted a zero credit or debit, updated the row and still wrote a history record
+        // [CASH00.cbl:L222, L256], so the transaction counts reconciliation compares are equal only if the
+        // replacement accepts it too (AAP 0.4.5). Broker skips lastTrade == 0
+        // [.../broker/BrokerService.java:L486-L501], so only another caller can exercise it.
         CashAccount unchanged = client.credit(ZERO_OWNER, 0.0);
 
         // A returned entity IS the 200: the client proxy raises a WebApplicationException on any non-2xx, so the
         // status cannot be read separately through this interface - and the entity is all broker ever sees.
         assertAccount(unchanged, ZERO_OWNER, 500.00, "PUT /cash-account/{owner}/credit?amount=0 (legacy C)");
 
-        // THE HALF THAT MATTERS FOR PARITY, asserted here rather than left to another file: an unchanged balance
-        // is also what a service that short-circuited the whole operation would return, so the row is the only
-        // evidence that the transaction happened at all. Without it, reconciliation would count one legacy C
-        // against zero target transactions and report a TRANSACTION_COUNT variance nothing in the test suite had
-        // predicted (AAP 0.10.3). The ledger is read through the institutional query surface because that is the
-        // contract's own way to read it, and in the request immediately after the credit, with no wait.
+        // An unchanged balance is also what a service that short-circuited the whole operation would return, so
+        // the ledger row is the only evidence the transaction happened at all - and without it reconciliation
+        // would count one legacy C against zero target transactions (AAP 0.10.3).
         List<LedgerEntryResponse> rows = ledger(ZERO_OWNER);
         List<LedgerEntryResponse> credits = rows.stream()
                 .filter(row -> row.eventType() == LedgerEventType.CREDIT)
@@ -362,21 +303,11 @@ class RetailContractIT extends PostgresTestSupport {
 
     @Test
     void creatingAnAccountInsertsSoTheOwnerPrimaryKeySettlesAContestedCreate() throws Exception {
-        /*
-         * TWO HALVES, AND BOTH ARE NEEDED. The service's existsByOwner pre-read is not atomic, so two callers can
-         * pass it together; whichever loses has to be refused by the owner primary key. Under the entity's earlier
-         * primitive @Version, Spring Data judged a fresh account already-persisted and routed its creation through
-         * EntityManager.merge, which SELECTed the row the winner had just committed and UPDATED it - answering 200
-         * and silently re-opening the account with the loser's balance and a new incarnation. A nullable @Version
-         * makes creation an INSERT instead, so the constraint decides.
-         *
-         * The first half asserts that mechanism where it is decidable: saving a fresh entity for an owner that
-         * already has a row must raise the constraint violation, because an INSERT is the only statement that can.
-         * It goes through the repository deliberately - the endpoint cannot express it, since existsByOwner
-         * answers first and no test can schedule itself into the window between that check and the flush. The
-         * second half then asserts the end-to-end outcome two real requests must produce. On its own the second
-         * half is not a guard: the loser is usually refused by the pre-read, which looks identical from outside.
-         */
+        // The service's existsByOwner pre-read is not atomic, so two callers can pass it together and the loser
+        // has to be refused by the owner primary key - which only an INSERT can do. The first half asserts that
+        // through the repository because the endpoint cannot express it: existsByOwner answers first, and no test
+        // can schedule itself into the window between that check and the flush. The second half asserts the
+        // end-to-end outcome, where the loser is usually refused by the pre-read and looks identical from outside.
         seedAccount(PK_GUARD_OWNER, 100.00);
 
         // Fully qualified because the simple name CashAccount belongs to broker's DTO throughout this file.
@@ -412,14 +343,11 @@ class RetailContractIT extends PostgresTestSupport {
             racers.shutdownNow();
         }
 
-        // The surviving account belongs to whichever request won, and its balance is one of the two sent - never a
-        // blend, and never the loser's value written over the winner's row.
         CashAccount survivor = client.getCashAccount(RACE_OWNER);
         assertThat(survivor.getBalance()).as("the surviving account keeps the winning request's balance")
                 .isIn(RACE_FIRST_BALANCE, RACE_SECOND_BALANCE);
 
-        // One account was opened, so one ACCOUNT_CREATED row exists. Two would mean both requests had "created"
-        // the account, which is the overwrite this scenario exists to rule out.
+        // Two rows would mean both requests had "created" the account - the overwrite this scenario rules out.
         List<LedgerEntryResponse> created = ledger(RACE_OWNER).stream()
                 .filter(row -> row.eventType() == LedgerEventType.ACCOUNT_CREATED)
                 .toList();
@@ -437,11 +365,9 @@ class RetailContractIT extends PostgresTestSupport {
     void writeWithNoBodyIsRejectedAndChangesNothing() {
         seedAccount(BODYLESS_OWNER, 500.00);
 
-        // AAP 0.6.2 defines PUT as an absolute overwrite of the balance and the currency carried by a body. An
-        // optional body made a request carrying no instruction at all indistinguishable from one asking for 0.00
-        // in the base currency, so a body-less PUT emptied the account and answered 200 with "balance":0.00. It is
-        // now 400 INVALID_AMOUNT - the closed code set's designated 400 for a body that cannot be bound
-        // (AAP 0.6.2) - and the account is untouched.
+        // AAP 0.6.2 defines PUT as an absolute overwrite of the balance and currency a body carries, so a request
+        // with no body carries no instruction and must be refused rather than read as 0.00 in the base currency -
+        // which would empty the account. 400 INVALID_AMOUNT is the closed code set's 400 for an unbindable body.
         ResponseEntity<String> rejected = rest.exchange(url(RETAIL_BASE + "/" + BODYLESS_OWNER), HttpMethod.PUT,
                 new HttpEntity<>(jsonHeaders()), String.class);
 
@@ -460,12 +386,10 @@ class RetailContractIT extends PostgresTestSupport {
         seedAccount(DEFAULTS_OWNER, 500.00);
         seedAccount(DECOY_OWNER, 700.00);
 
-        // Both halves of the documented body contract (README.md, retail contract table), asserted together
-        // because they are one payload's worth of behaviour: the body's owner component is ignored in favour of
-        // the path - broker sends the two in agreement and CashAccountErrorCode holds no mismatch condition to
-        // report - while an absent balance is 0.00 and an absent currency is USD, the values the legacy COMMAREA
-        // presented when a caller set neither [CASH00.cbl:L56]. The account named in the body must therefore be
-        // untouched and the one named in the path reset.
+        // The body's owner component is ignored in favour of the path - broker sends the two in agreement and
+        // CashAccountErrorCode holds no mismatch condition to report - while an absent balance is 0.00 and an
+        // absent currency USD, the values the legacy COMMAREA presented when a caller set neither
+        // [CASH00.cbl:L56].
         ResponseEntity<String> overwritten = rest.exchange(url(RETAIL_BASE + "/" + DEFAULTS_OWNER), HttpMethod.PUT,
                 new HttpEntity<>("{\"owner\":\"" + DECOY_OWNER + "\"}", jsonHeaders()), String.class);
 
@@ -486,7 +410,6 @@ class RetailContractIT extends PostgresTestSupport {
         assertThat(updates.get(0).availableAfter()).as("ACCOUNT_UPDATED row availableAfter")
                 .isEqualByComparingTo(ZERO_AMOUNT);
 
-        // And the owner the body named, which the service never looked at, still holds its own opening balance.
         assertAccount(client.getCashAccount(DECOY_OWNER), DECOY_OWNER, 700.00,
                 "the owner named in the request body");
     }
@@ -499,9 +422,8 @@ class RetailContractIT extends PostgresTestSupport {
         CashAccountClient capturingClient = capturingClient(responseBody::set);
 
         // An authorized deliberate improvement, not a parity gap (AAP 0.4.6, 0.14.2): WS-CALC is unsigned
-        // PIC 9(7)V99 [backend/cash-account-cobol/COBOL/CASH00.cbl:L17] and the COMPUTE that subtracts carries no
-        // ON SIZE ERROR [CASH00.cbl:L256], so the legacy stored 100.00 - 150.00 as the absolute value 50.00 and
-        // answered success. This is the target side of the RAUNAK seeded shadow mismatch in AAP 0.10.3.
+        // PIC 9(7)V99 [backend/cash-account-cobol/COBOL/CASH00.cbl:L17] and the subtracting COMPUTE carries no
+        // ON SIZE ERROR [CASH00.cbl:L256], so the legacy stored 100.00 - 150.00 as 50.00 and answered success.
         assertThatExceptionOfType(WebApplicationException.class)
                 .isThrownBy(() -> capturingClient.debit(OVERDEBIT_OWNER, 150.00))
                 .satisfies(rejection -> assertThat(rejection.getResponse().getStatus())
@@ -525,11 +447,9 @@ class RetailContractIT extends PostgresTestSupport {
         CashAccountClient capturingClient = capturingClient(responseBody::set);
 
         // The sub-cent magnitude is the point, not the sign alone: -0.001 truncates DOWN to 0.00 at scale 2, so a
-        // service that judged the sign after normalizing would answer 200 here and append a zero-amount DEBIT
-        // ledger row for a request the caller never made. AAP 0.6.2 binds a negative amount to 400 INVALID_AMOUNT
-        // on this route, and domain/Money judges the sign on the value as the caller wrote it. The value reaches
-        // the wire through the caller's own @QueryParam("amount") double
-        // [.../client/CashAccountClient.java:L83], so this is the text an unmodified broker would emit for it.
+        // service that judged the sign after normalizing would answer 200 and append a zero-amount DEBIT row for
+        // a request the caller never made. domain/Money judges the sign on the value as the caller wrote it, and
+        // AAP 0.6.2 binds a negative amount to 400 INVALID_AMOUNT on this route.
         assertThatExceptionOfType(WebApplicationException.class)
                 .isThrownBy(() -> capturingClient.debit(SUBCENT_OWNER, -0.001))
                 .satisfies(rejection -> assertThat(rejection.getResponse().getStatus())
@@ -549,13 +469,11 @@ class RetailContractIT extends PostgresTestSupport {
 
     @Test
     void creditIsRefusedWhenHeldFundsWouldHaveNoRoomToReturn() throws Exception {
-        // The account is opened near the NUMERIC(9,2) ceiling and 250.00 of it is then held, so the credit
-        // below computes an available balance that is perfectly in range on its own - 9,999,750.00 against a
-        // 9,999,999.99 ceiling - while available + reserved is not. Accepting it would leave the hold with
-        // nowhere to return to: a release, settlement or expiry has to hand those 250.00 back onto the
-        // available balance, and the reservation could then never reach a terminal state while retail
-        // PUT/DELETE answered RESERVATIONS_OUTSTANDING for as long as the row existed. The ceiling therefore
-        // bounds the pair, and this is that refusal seen from the caller's side of the seam.
+        // The credit below computes an available balance in range on its own - 9,999,750.00 against the
+        // NUMERIC(9,2) ceiling of 9,999,999.99 - while available + reserved is not. Accepting it would leave the
+        // hold nowhere to return to: a release, settlement or expiry has to hand those 250.00 back onto the
+        // available balance, so the reservation could never reach a terminal state while retail PUT/DELETE
+        // answered RESERVATIONS_OUTSTANDING for as long as the row existed. The ceiling bounds the pair.
         seedAccount(CEILING_OWNER, 9999000.00);
         placeHold(CEILING_OWNER, "250.00");
 
@@ -581,9 +499,8 @@ class RetailContractIT extends PostgresTestSupport {
         assertAccount(credited, CEILING_OWNER, 9999749.99,
                 "PUT /cash-account/{owner}/credit?amount= at the pair ceiling (legacy C)");
 
-        // What the two statuses alone cannot show. The refused credit had to write nothing, so the hold is
-        // still intact at its full amount, the available balance is the accepted credit's and no other, and
-        // exactly one CREDIT row exists across both calls - the accepted one.
+        // The statuses alone cannot show this: the refused credit had to write nothing, so the hold is still
+        // intact at its full amount and exactly one CREDIT row exists across both calls.
         InstitutionalAccountResponse account = institutionalAccount(CEILING_OWNER);
         assertThat(account.availableBalance()).isEqualByComparingTo(new BigDecimal("9999749.99"));
         assertThat(account.reservedBalance()).isEqualByComparingTo(new BigDecimal("250.00"));
@@ -602,13 +519,10 @@ class RetailContractIT extends PostgresTestSupport {
         return client.createCashAccount(owner, new CashAccount(owner, openingBalance, ACCOUNT_CURRENCY));
     }
 
-    // Each racer builds its own proxy: the two requests have to be independent all the way down, and a shared
-    // one would make the test's outcome depend on the client runtime's concurrency behaviour rather than the
-    // service's. The barrier synchronizes only the LAUNCH of the two requests - it is released before either is
-    // sent, so it cannot place them on either side of any server-side step, and whether they overlap in the
-    // window between existsByOwner and the flush is the server's scheduling and not this test's to arrange. That
-    // is precisely why the caller's half of this scenario is an invariant check rather than the regression guard,
-    // and why the deterministic repository half is what proves INSERT rather than merge.
+    // Each racer builds its own proxy, so the two requests are independent all the way down and the outcome
+    // cannot depend on the client runtime's concurrency behaviour. The barrier synchronizes only their launch:
+    // whether they overlap in the window between existsByOwner and the flush is the server's scheduling and not
+    // this test's to arrange, which is why the repository half above is the deterministic guard.
     private int createStatusAtBarrier(CyclicBarrier bothReady, double openingBalance) throws Exception {
         CashAccountClient racer = BrokerClientFactory.client(port, TOKEN);
         bothReady.await(RACE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
@@ -640,9 +554,8 @@ class RetailContractIT extends PostgresTestSupport {
         return "http://localhost:" + port + path;
     }
 
-    // The body is written as text rather than serialized from HoldRequest so this file does not compile against
-    // the institutional request record it only arranges state with; the retail wire shapes are the ones under
-    // test here, and they all travel through the copied client above.
+    // Written as text rather than serialized from HoldRequest so this file does not compile against an
+    // institutional request record it only arranges state with.
     private void placeHold(String owner, String amount) {
         HttpHeaders headers = institutionalHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);

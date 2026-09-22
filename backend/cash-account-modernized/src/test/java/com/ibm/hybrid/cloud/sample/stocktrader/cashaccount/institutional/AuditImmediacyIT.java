@@ -1,19 +1,3 @@
-/*
-       Copyright 2025 Kyndryl, All Rights Reserved
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
- */
-
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.institutional;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -85,16 +69,11 @@ class AuditImmediacyIT extends PostgresTestSupport {
         registry.add("cashaccount.security.jwt.public-key-location", JwtTestTokens::publicKeyLocation);
     }
 
-    /*
-     * WHY NOTHING IN THIS CLASS RUNS INSIDE A TEST-MANAGED TRANSACTION, AND WHY EACH TEST OWNS ITS OWN ACCOUNT.
-     * The property under test is that a transition's ledger row is committed with the balance change and is
-     * therefore visible to the very next reader (AAP 0.7.4) - so a test-managed transaction, whose writes are
-     * never committed and are rolled back at the end, would assert nothing at all. Committed rows cannot be
-     * cleaned up: ledger_entry carries a BEFORE UPDATE OR DELETE trigger (schema/cash-account-schema.sql) and
-     * LedgerEntryRepository declares no delete method, by the same audit guarantee. Distinct short uppercase
-     * owners, inside the 32-character cash_account.owner width and unused by every other *IT sharing this
-     * JVM-wide container, are therefore the isolation mechanism, and no assertion here may assume an empty table.
-     */
+    // Nothing here runs inside a test-managed transaction: the property under test is that a transition's ledger
+    // row is committed with the balance change (AAP 0.7.4), and a rolled-back transaction would assert nothing.
+    // Committed rows cannot then be cleaned up - ledger_entry carries a BEFORE UPDATE OR DELETE trigger
+    // (schema/cash-account-schema.sql) - so distinct owners are the isolation mechanism and no assertion here
+    // may assume an empty table.
 
     @Test
     void holdAndSettleLedgerRowsAreVisibleInTheVeryNextCall() throws Exception {
@@ -105,13 +84,9 @@ class AuditImmediacyIT extends PostgresTestSupport {
         assertThat(held.getStatusCode()).isEqualTo(HttpStatus.CREATED);
         UUID reservationId = reservationOf(held).reservationId();
 
-        /*
-         * The ledger query is deliberately the IMMEDIATELY next request - no sleep, no poll, no retry, no other
-         * call in between - because the guarantee is same-transaction visibility and not eventual consistency:
-         * LedgerService's append overloads all declare MANDATORY propagation, so the row can only have been
-         * written inside the transaction the hold above committed. Anything that gave the write time to land
-         * would turn this assertion into a statement about latency (AAP 0.10.5).
-         */
+        // The immediately next request, with no sleep, poll or retry: LedgerService's append overloads declare
+        // MANDATORY propagation, so the row can only have been written inside the transaction the hold committed,
+        // and anything that gave the write time to land would make this a statement about latency (AAP 0.10.5).
         List<LedgerEntryResponse> afterHold = ledger(owner);
 
         LedgerEntryResponse holdRow = rowOf(afterHold, LedgerEventType.HOLD, reservationId);
@@ -165,9 +140,15 @@ class AuditImmediacyIT extends PostgresTestSupport {
         String owner = "AUDITRELEASE";
         openAccount(owner);
 
-        ResponseEntity<String> held = postHold(owner, "IDEM-AUDIT-RELEASE", "ORD-AUDIT-RELEASE");
+        // Surrounding blanks, deliberately, and the settle test above carries the plain form: the reservation
+        // stores and hashes this reference exactly as sent (AAP 0.7.3), so every ledger row for the same hold
+        // has to carry those characters too or the audit record identifies an order the reservation does not.
+        String orderReference = "  ORD-AUDIT-RELEASE  ";
+        ResponseEntity<String> held = postHold(owner, "IDEM-AUDIT-RELEASE", orderReference);
         assertThat(held.getStatusCode()).isEqualTo(HttpStatus.CREATED);
-        UUID reservationId = reservationOf(held).reservationId();
+        ReservationResponse createdHold = reservationOf(held);
+        assertThat(createdHold.orderReference()).isEqualTo(orderReference);
+        UUID reservationId = createdHold.reservationId();
 
         ResponseEntity<String> released = postRelease(reservationId);
         assertThat(released.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -180,7 +161,11 @@ class AuditImmediacyIT extends PostgresTestSupport {
         LedgerEntryResponse releaseRow = rowOf(afterRelease, LedgerEventType.RELEASE, reservationId);
         assertThat(releaseRow.owner()).isEqualTo(owner);
         assertThat(releaseRow.reservationId()).isEqualTo(reservationId);
-        assertThat(releaseRow.orderReference()).isEqualTo("ORD-AUDIT-RELEASE");
+        assertThat(releaseRow.orderReference()).isEqualTo(orderReference);
+        // Both events of this reservation, so the rule is the ledger's and not one transition's: an immutable
+        // row records the reference the reservation returned, blanks included.
+        assertThat(rowOf(afterRelease, LedgerEventType.HOLD, reservationId).orderReference())
+                .isEqualTo(orderReference);
         assertThat(releaseRow.amount()).isEqualByComparingTo(HELD_AMOUNT);
         assertThat(releaseRow.currency()).isEqualTo(CURRENCY);
         assertThat(releaseRow.availableAfter()).isEqualByComparingTo(OPENING_BALANCE);
@@ -279,9 +264,8 @@ class AuditImmediacyIT extends PostgresTestSupport {
             LedgerEntryResponse newer = rows.get(index - 1);
             LedgerEntryResponse older = rows.get(index);
             assertThat(newer.recordedAt().toInstant()).isAfterOrEqualTo(older.recordedAt().toInstant());
-            // The entryId tie-break is load-bearing rather than decorative: rows appended in one transaction
-            // share a recordedAt - a partial settlement writes two - so the generated identity is the only
-            // thing that can order them, and a query without it would return them in an arbitrary order.
+            // Rows appended in one transaction share a recordedAt - a partial settlement writes two - so the
+            // generated identity is the only thing that can order them.
             if (newer.recordedAt().toInstant().equals(older.recordedAt().toInstant())) {
                 assertThat(newer.entryId()).isGreaterThan(older.entryId());
             }

@@ -1,19 +1,3 @@
-/*
-       Copyright 2025 Kyndryl, All Rights Reserved
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
- */
-
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.config;
 
 import java.time.Duration;
@@ -33,27 +17,22 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
 import org.springframework.validation.annotation.Validated;
 
-// Every value below carries a default, so an absent configuration branch still yields a fully populated object.
-// That matters because only six of these keys are fed by the deployment: AUTH_TYPE (auth.type), JDBC_KIND
-// (database.kind), CURRENCY_API_URL (cashAccount.exchangeRateUrl), JWT_AUDIENCE, JWT_ISSUER and the optional
-// OIDC_JWKS_URL [infra/stocktrader-operator/helm-charts/stocktrader/templates/cash-account.yaml:L73-L77, L84-L88,
-// L156-L176]. The rest - the FX timeout and base currency, the accepted-currency set, the public-key location, the
-// all-authenticated grant and both reservation durations - have no environment binding anywhere in that template,
-// so their only override path is Spring's relaxed binding (CASHACCOUNT_FX_TIMEOUT, CASHACCOUNT_RESERVATION_DEFAULT_TTL
-// and so on). Keeping them here rather than asking for new template entries is what leaves them tunable in a
-// deployment while the chart template stays untouched, which this refactor requires absolutely.
-//
-// Registered by @Component under the exact bean name Spring's own configuration-properties registrars derive
-// ("<prefix>-<fully qualified class name>"). CashAccountApplication carries no @ConfigurationPropertiesScan, so
-// component scanning is what binds this type; naming the bean this way additionally makes a later
-// @EnableConfigurationProperties(CashAccountProperties.class) on any sibling @Configuration a no-op instead of a
-// second bean definition that would leave every injection point in this package ambiguous.
 /** Typed, validated binding of the whole {@code cashaccount.*} configuration namespace. */
 @Component(CashAccountProperties.BEAN_NAME)
+// Bound by @ConfigurationProperties, and nothing in this module reads configuration any other way: Spring hands a
+// resolved @Value placeholder to its expression resolver, so a deployment value of the form #{...} - and
+// CURRENCY_API_URL arrives from a configMap key an operator edits - would execute during bean creation. The Binder
+// resolves ${...} and converts, and evaluates nothing, so a configuration value stays inert data; the packages that
+// may not import config (AAP 0.8.2) bind the same keys with Binder off the Environment for the identical reason.
 @ConfigurationProperties(prefix = "cashaccount")
 @Validated
 public class CashAccountProperties {
 
+    // CashAccountApplication carries no @ConfigurationPropertiesScan, so component scanning is what binds this
+    // type; the bean name is the one Spring's own configuration-properties registrars derive
+    // ("<prefix>-<fully qualified class name>"), which makes a later
+    // @EnableConfigurationProperties(CashAccountProperties.class) on a sibling @Configuration a no-op rather than
+    // a second definition that would leave every injection point in this package ambiguous.
     static final String BEAN_NAME =
             "cashaccount-com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.config.CashAccountProperties";
 
@@ -62,6 +41,12 @@ public class CashAccountProperties {
             "INR", "ISK", "JPY", "KRW", "MXN", "MYR", "NOK", "NZD", "PHP", "PLN", "RON", "SEK", "SGD", "THB",
             "TRY", "USD", "ZAR"));
 
+    // Every value in these four groups carries a default, so an absent configuration branch still binds a fully
+    // populated object. The chart injects six of the keys as environment variables - AUTH_TYPE, JDBC_KIND,
+    // CURRENCY_API_URL, JWT_ISSUER, JWT_AUDIENCE and the optional OIDC_JWKS_URL
+    // [infra/stocktrader-operator/helm-charts/stocktrader/templates/cash-account.yaml:L73-L77, L84-L88, L156-L176];
+    // the rest have no environment binding in that template, so a deployment retunes them through Spring's relaxed
+    // binding (CASHACCOUNT_FX_TIMEOUT, CASHACCOUNT_RESERVATION_DEFAULT_TTL and so on) with no template change.
     @Valid
     @NotNull
     private Jdbc jdbc = new Jdbc();
@@ -142,19 +127,12 @@ public class CashAccountProperties {
         @DurationMin(nanos = 1)
         private Duration timeout = Duration.ofSeconds(2);
 
-        // Adopted, not invented: this is the allowed_currencies CHECK the estate's own PostgreSQL initialization
-        // already enforces on its never-built cashaccount table
-        // [infra/stocktrader-setup/azure/modules/postgres_init/init_schema.sql.tmpl:L7]. It is the ESTATE
-        // allowlist and NOT the set the exchange-rate provider serves: that provider publishes a 30-code subset,
-        // omitting BGN as of 2026-09-22, so an accepted code is not by itself a convertible one and a code the
-        // provider does not publish surfaces as 503 EXCHANGE_RATE_UNAVAILABLE on the credit/debit path. The
-        // reasoning for keeping BGN, and the per-deployment way to narrow the list, are recorded once in
-        // application.yml beside the property, which is this policy's single authority - this default exists so
-        // that a context binding no property source still yields a fully populated, validated object (above all
-        // the ApplicationContextRunner in DataSourceGuardConfigTest), never as a second source of truth.
-        // Insertion order is preserved so the value reads back in the documented ISO order rather than a hash
-        // order. Trimming and upper-casing on the way in is a convenience local to this package; every consumer
-        // still normalizes its own input, so no correctness claim rests on it.
+        // Adopted, not invented: the allowed_currencies CHECK the estate's PostgreSQL initialization already
+        // enforces [infra/stocktrader-setup/azure/modules/postgres_init/init_schema.sql.tmpl:L7]. It is the ESTATE
+        // allowlist and not the set the exchange-rate provider serves, so an accepted code is not by itself a
+        // convertible one and a code the provider omits surfaces as 503 EXCHANGE_RATE_UNAVAILABLE. This default
+        // exists so a context binding no property source still yields a validated object - application.yml holds
+        // the policy beside the property, and insertion order is preserved so it reads back in ISO order.
         @NotEmpty
         private Set<String> acceptedCurrencies = DEFAULT_ACCEPTED_CURRENCIES;
 
@@ -199,11 +177,10 @@ public class CashAccountProperties {
 
         // True is the deployed default because it reproduces the siblings' special-subject binding
         // <security-role id="StockTrader"><special-subject type="ALL_AUTHENTICATED_USERS"/></security-role>
-        // [backend/broker/src/main/liberty/config/server.xml:L56-L60]: with it, any authenticated caller may write
-        // exactly as it may through broker today, so the GET-versus-write role split is latent rather than absent
-        // and cutover changes no caller's effective permissions. False is the supported, documented strict mode in
-        // which only the token's groups claim decides; it is a genuine bound value precisely so a deployment - and
-        // RoleEnforcementIT's second Spring context - can select it without a code change.
+        // [backend/broker/src/main/liberty/config/server.xml:L56-L60]: any authenticated caller may write exactly
+        // as it may through broker today, so cutover changes no caller's effective permissions. False is the
+        // supported strict mode in which only the token's groups claim decides, bound rather than compiled in so a
+        // deployment - and RoleEnforcementIT's second context - selects it without a code change.
         private boolean allAuthenticatedHoldStocktrader = true;
 
         @Valid

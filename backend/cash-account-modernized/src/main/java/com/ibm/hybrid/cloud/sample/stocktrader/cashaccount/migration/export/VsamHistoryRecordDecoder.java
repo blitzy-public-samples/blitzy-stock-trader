@@ -1,19 +1,3 @@
-/*
-       Copyright 2025 Kyndryl, All Rights Reserved
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
- */
-
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.migration.export;
 
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.migration.LegacyExportFormat;
@@ -24,6 +8,8 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.math.BigDecimal;
+import java.nio.channels.Channels;
+import java.nio.channels.SeekableByteChannel;
 import java.nio.charset.Charset;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -40,28 +26,12 @@ public final class VsamHistoryRecordDecoder {
 
     private final Charset legacyCharset;
 
-    // The record length is declared by the caller and never inferred from the file, and the two lengths
-    // LegacyExportFormat accepts are both decoded here, because the legacy artifacts disagree and the
-    // artifact that would reconcile them is not in this repository: CASH00 lays out a 57-byte WS-VSAM-RECORD
-    // (CASH00.cbl:L38-L45) and writes exactly LENGTH OF WS-VSAM-RECORD (CASH00.cbl:L126-L131) into a
-    // cluster defined RECSZ(100 100) (DEFKSDS.jcl:L11). The program suppresses only NOTOPEN and DUPREC
-    // (CASH00.cbl:L123-L124), so a fixed-format CICS FILE definition would have raised LENGERR and
-    // abended, while a variable-format one holds the 57-byte records as written. Which of the two is on
-    // disk is AAP 0.11.2's open item, settled by the mainframe team's FCT/CSD RECORDFORMAT/RECORDSIZE
-    // attributes or a real REPRO/PRINT sample - so MigrationToolRunner binds this from
-    // tool.history-record-length (no default; mandatory whenever the binary history file is present)
-    // and an unaccepted value fails here, before a byte is read. Inferring it from the file size would
-    // mis-frame every record of an export that happened to divide evenly, which is a wrong load rather
-    // than a failed one.
-    //
-    // WHY THE TAIL OF A PADDED RECORD IS CHECKED RATHER THAN SKIPPED. Bytes past the last declared field
-    // carry nothing the program wrote, so what they may legally hold is EBCDIC blank or zero and nothing
-    // else (LegacyExportFormat.isPaddingByte). A tail holding anything else is not harmless residue: it is
-    // the first evidence that the file was NOT framed at the declared length - a 57-byte export read as
-    // 100-byte records, a header or trailer the transfer added, or a code-page conversion that shifted
-    // every record - and every one of those decodes into plausible-looking values at the wrong offsets.
-    // Accepting it would make exactly the mis-framed load that tool.history-record-length exists to
-    // prevent, so decodeAt rejects it and names the offset.
+    // Declared from tool.history-record-length, never inferred from the file size, and both accepted
+    // lengths decode: CASH00 writes a 57-byte WS-VSAM-RECORD (CASH00.cbl:L38-L45, L126-L131) into a
+    // cluster defined RECSZ(100 100) (DEFKSDS.jcl:L11), and with only NOTOPEN and DUPREC suppressed
+    // (L123-L124) a fixed-format CICS FILE definition would have abended on LENGERR where a
+    // variable-format one holds 57 - which is on disk is AAP 0.11.2's open item. A guessed length divides
+    // some exports evenly and then mis-frames every record, a wrong load rather than a failed one.
     private final int declaredRecordLength;
 
     public VsamHistoryRecordDecoder(int declaredRecordLength) {
@@ -78,41 +48,69 @@ public final class VsamHistoryRecordDecoder {
         this.declaredRecordLength = LegacyExportFormat.requireAcceptedHistoryRecordLength(declaredRecordLength);
     }
 
+    // Capped because a list is the whole file resident at once. The path this reads is an IDCAMS REPRO of a
+    // production KSDS, whose size nothing in this repository bounds (AAP 0.12.1), so a caller that asks for a
+    // list is asking for a fixture or a reviewable window - LegacyExportFormat.MAX_WINDOW_RECORDS is what it
+    // may be - while a real REPRO belongs on streamAll below. Counted as the records are collected, so the
+    // list can never exceed the limit rather than being measured once it already does.
     public List<VsamHistoryRecord> decodeAll(Path file) {
         List<VsamHistoryRecord> records = new ArrayList<>();
-        streamAll(file, records::add);
+        streamAll(LegacyExportFormat.ExportFile.named(file), record -> {
+            LegacyExportFormat.requireWindowWithinLimit(records.size(), file);
+            records.add(record);
+        });
         return List.copyOf(records);
     }
 
     /**
      * Hands every record of a binary history export to {@code sink}, one decoded record at a time.
      *
+     * @param file the binary history export to decode
+     * @param sink the consumer each decoded record is handed to before the next is read
      * @return the number of records decoded
      */
-    // THE BOUNDED FORM, AND WHAT decodeAll(Path) IS BUILT ON. A REPRO of a production KSDS is a file of
-    // unbounded size (AAP 0.12.1), so reading it whole and then building a second full list of decoded
-    // records is two copies of it in memory at once. One declared record is read into a single reused
-    // buffer, decoded into an immutable VsamHistoryRecord and handed on before the next read overwrites
-    // the buffer, which makes the decoder's footprint one record however large the export is.
+    // The bounded form decodeAll(Path) is built on: a REPRO of a production KSDS is a file of unbounded
+    // size (AAP 0.12.1), and reusing one record buffer keeps the decoder's footprint at one record rather
+    // than holding the file's bytes and every decoded record at once.
     public long streamAll(Path file, Consumer<VsamHistoryRecord> sink) {
         if (file == null) {
             throw new IllegalArgumentException("A path to a binary history export (" + LegacyExportFormat.HISTORY_BINARY_FILE
                     + " under tool.input) is required; none was supplied");
         }
+        return streamAll(LegacyExportFormat.ExportFile.named(file), sink);
+    }
+
+    /**
+     * Hands every record of a binary history export opened inside its approved directory to {@code sink}.
+     *
+     * @return the number of records decoded
+     */
+    // The same containment the delimited reader applies, and for the same reason: the file is opened relative
+    // to the approved directory itself with no link followed, so a link substituted for history.cp037.bin -
+    // or a directory component substituted above it - is refused rather than decoded and staged into
+    // legacy_history as legacy data (AAP 0.3.2). The framing length is then taken from the OPENED channel,
+    // not from a pathname looked up beside it, so the size that decides the framing and the bytes that are
+    // decoded are guaranteed to be the same object.
+    public long streamAll(LegacyExportFormat.ExportFile file, Consumer<VsamHistoryRecord> sink) {
+        if (file == null) {
+            throw new IllegalArgumentException("A binary history export source (" + LegacyExportFormat.HISTORY_BINARY_FILE
+                    + " under tool.input) is required; none was supplied");
+        }
         if (sink == null) {
             throw new IllegalArgumentException("A record consumer is required to stream the binary history export '"
-                    + file + "'; none was supplied");
+                    + file.path() + "'; none was supplied");
         }
-        String source = "file '" + file + "'";
+        String source = "file '" + file.path() + "'";
         byte[] record = new byte[declaredRecordLength];
         long decoded = 0;
-        try (InputStream export = new BufferedInputStream(Files.newInputStream(file))) {
-            // The file's length is checked against the declared framing BEFORE the first record is decoded,
-            // exactly as reading the file whole did, and it is deliberately not left to the short read below:
-            // a file that does not divide by the declared length is mis-framed everywhere, and telling an
-            // operator that is far more use than the field-level failure its first wrongly framed record would
-            // otherwise raise. Files.size() is one stat call and reads nothing, so the read stays streamed.
-            long declaredBytes = Files.size(file);
+        try (SeekableByteChannel channel = file.openChannel();
+             InputStream export = new BufferedInputStream(Channels.newInputStream(channel))) {
+            // Checked before the first record is decoded rather than left to the short read below: a file
+            // that does not divide by the declared length is mis-framed everywhere, and saying so is more
+            // use to an operator than the field-level failure its first bad record would raise. The size comes
+            // from the open channel, so it reads nothing and cannot describe a different object than the one
+            // being decoded.
+            long declaredBytes = channel.size();
             int framingRemainder = (int) (declaredBytes % declaredRecordLength);
             if (framingRemainder != 0) {
                 throw notAWholeNumberOfRecords(declaredBytes, framingRemainder, source);
@@ -122,11 +120,9 @@ public final class VsamHistoryRecordDecoder {
                 if (read == 0) {
                     return decoded;
                 }
-                // readNBytes returns short only at end of stream, so a short read here says the stream ended
-                // mid-record after the length check above passed - a file truncated or appended to while it was
-                // being read, or a source whose length could not be known in advance. Reported as the same
-                // condition with the same two numbers, because decoding the whole records and dropping the
-                // remainder would turn a mis-declared length into a silently partial load.
+                // readNBytes returns short only at end of stream, so this is a file truncated or appended
+                // to after the length check passed. Raised rather than absorbed: decoding the whole records
+                // and dropping the remainder would turn a mis-declared length into a partial load.
                 if (read < declaredRecordLength) {
                     throw notAWholeNumberOfRecords(decoded * declaredRecordLength + read, read, source);
                 }
@@ -134,14 +130,23 @@ public final class VsamHistoryRecordDecoder {
                 sink.accept(decodeAt(record, 0, decoded, source));
             }
         } catch (IOException unreadable) {
-            throw new UncheckedIOException("The binary history export file '" + file + "' could not be read;"
-                    + " tool.input must name a directory holding " + LegacyExportFormat.HISTORY_BINARY_FILE
+            // A NOFOLLOW open of a symbolic link fails as a plain IOException (ELOOP), which no exception type
+            // separates from an ordinary I/O failure - so the path is re-examined rather than the message
+            // parsed, and a link found here is one that replaced the file in the moment of opening.
+            if (Files.isSymbolicLink(file.path())) {
+                throw new IllegalArgumentException("The binary history export file '" + file.path() + "' could"
+                        + " not be opened without following a symbolic link, so a symbolic link replaced the"
+                        + " file between the check and the open; no tool input file is read through a link"
+                        + " (AAP 0.3.2)", unreadable);
+            }
+            throw new UncheckedIOException("The binary history export file '" + file.path() + "' could not be"
+                    + " read; tool.input must name a directory holding " + LegacyExportFormat.HISTORY_BINARY_FILE
                     + ", transferred in binary so its " + legacyCharset.name() + " bytes are preserved", unreadable);
         }
     }
 
-    // The in-memory entry point: the caller already holds every byte, so there is nothing left to bound and
-    // a list is what it asked for. The file path above is the bulk path and streams.
+    // No streaming form: the caller already holds every byte, so there is nothing left to bound. The
+    // file-path form above is the bulk path.
     public List<VsamHistoryRecord> decodeAll(byte[] data) {
         return decode(data, IN_MEMORY_SOURCE);
     }
@@ -174,8 +179,8 @@ public final class VsamHistoryRecordDecoder {
         return List.copyOf(records);
     }
 
-    // One wording for the condition however it is detected, so an operator comparing a streamed run with an
-    // in-memory one reads the same two numbers and the same guidance.
+    // One wording however the condition is detected, so a streamed run and an in-memory one hand an
+    // operator the same two numbers and the same guidance.
     private IllegalArgumentException notAWholeNumberOfRecords(long totalBytes, int remainder, String source) {
         return new IllegalArgumentException("The binary history export is not a whole number of records: "
                 + source + " holds " + totalBytes + " bytes, tool.history-record-length declares "
@@ -190,10 +195,9 @@ public final class VsamHistoryRecordDecoder {
         for (FixedField field : LegacyExportFormat.HISTORY_FIELDS) {
             values.put(field.name(), decodeField(data, recordStart, field));
         }
-        // The name is returned with the caller's own casing, unfolded: CASH00.cbl:L111 moves WS-NAME into
-        // the record untouched, so "John"+stamp and "JOHN"+stamp are two distinct, equally valid 29-byte
-        // keys and both must survive the import; the uppercased join key is a later derivation
-        // (reconcile/LegacyHistory.ownerKey).
+        // The name keeps the caller's casing unfolded (CASH00.cbl:L111), so two records differing only in
+        // case stay two valid 29-byte keys; the uppercased join key is derived later, in
+        // reconcile/LegacyHistory.ownerKey.
         return new VsamHistoryRecord(
                 decoded(values, LegacyExportFormat.HISTORY_NAME),
                 decoded(values, LegacyExportFormat.HISTORY_DATE),
@@ -204,13 +208,11 @@ public final class VsamHistoryRecordDecoder {
                 decoded(values, LegacyExportFormat.HISTORY_RETCODE));
     }
 
-    // Every byte past the last declared field, on every record - not a sample of them and not the first
-    // record alone: a transfer that inserted a separator, or a length declared 100 for a 57-byte export,
-    // corrupts records from the point it begins rather than from the file's start. The check sits here, in
-    // the one method decodeAll(Path), decodeAll(byte[]) and decodeRecord all funnel through, so no entry
-    // point can decode a frame another entry point would have refused. With the declared length at
-    // HISTORY_RECORD_LENGTH there is no tail and the range is empty, which is the 57-byte case passing
-    // through unchanged.
+    // A tail holding anything but EBCDIC blank or zero is the first evidence that the file was not framed
+    // at the declared length - a 57-byte export read as 100, an added header or trailer, a code-page
+    // conversion - each of which decodes into plausible values at the wrong offsets, so it is rejected
+    // rather than skipped. Checked on every record and in the one method all three entry points funnel
+    // through; at HISTORY_RECORD_LENGTH the range is empty, which is the 57-byte case passing untouched.
     private void requirePaddedTail(byte[] data, int recordStart, long ordinal, String source) {
         int tailStart = recordStart + LegacyExportFormat.HISTORY_RECORD_LENGTH;
         int recordEnd = recordStart + declaredRecordLength;
@@ -218,8 +220,8 @@ public final class VsamHistoryRecordDecoder {
         if (violation < 0) {
             return;
         }
-        // The offset is reported WITHIN the record, because that is the number an operator compares against
-        // the layout and the declared length; the byte is reported in hex because it is not text.
+        // The offset is record-relative, because that is what an operator compares against the layout and
+        // the declared length; the byte is hex because it is not text.
         throw new IllegalArgumentException("Record " + ordinal + " of " + source + " carries 0x"
                 + String.format("%02X", data[violation]) + " at offset " + (violation - recordStart)
                 + " of its " + declaredRecordLength + "-byte frame, where a padded history record holds only"
@@ -243,14 +245,11 @@ public final class VsamHistoryRecordDecoder {
         return value;
     }
 
-    // Each field is converted from its own byte slice with the configured charset. Decoding the whole
-    // record once and substringing it is correct only while the code page is single-byte and silently
-    // mis-splits every field the moment it is not, and any String constructor without a Charset would
-    // read EBCDIC bytes through the platform default and yield text that still parses but means nothing
-    // (AAP 0.12.2). The charset is configurable rather than constant because CCSID EBCDIC
-    // (DB2DDL.jcl:L22, L29, L51, L61) names an encoding family, not a code page, and the CICS region's
-    // actual CCSID is nowhere in this repository: IBM037 is only LegacyExportFormat's default and
-    // remains an assumption pending the mainframe team's answer (AAP 0.11.2).
+    // Per-field slice rather than one decode of the whole record: substringing holds only while the code
+    // page is single-byte, and a String constructor without a Charset reads EBCDIC through the platform
+    // default and yields text that parses but means nothing (AAP 0.12.2). The charset is configuration
+    // because CCSID EBCDIC (DB2DDL.jcl:L22, L29, L51, L61) names a family, not a code page, and the
+    // region's actual CCSID is AAP 0.11.2's open item - IBM037 is only the documented assumption.
     private String decodeField(byte[] data, int recordStart, FixedField field) {
         return LegacyExportFormat.trimPadding(
                 new String(data, recordStart + field.offset(), field.length(), legacyCharset));
@@ -265,10 +264,10 @@ public final class VsamHistoryRecordDecoder {
                     + ") and tool.history-record-length (declaring " + declaredRecordLength
                     + " bytes per record) against the CICS FILE definition of HISTORY");
         }
-        // PIC 9(7)V99 is unsigned zoned decimal: no sign nibble, no separator and an implied point, so
-        // the only faithful read is the digits verbatim with the point shifted left by the declared
-        // scale. A floating-point parse would reintroduce representation error into values COBOL held
-        // exactly and scatter penny-level differences across a reconciliation run (AAP 0.7.1).
+        // PIC 9(7)V99 is unsigned zoned decimal - no sign nibble, no separator, an implied point - so the
+        // faithful read is the digits verbatim with the point shifted left by the declared scale. A
+        // floating-point parse would reintroduce representation error into values COBOL held exactly
+        // (AAP 0.7.1).
         return new BigDecimal(digits).movePointLeft(LegacyExportFormat.MONEY_SCALE);
     }
 

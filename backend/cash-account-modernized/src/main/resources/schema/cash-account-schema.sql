@@ -1,22 +1,8 @@
---       Copyright 2025 Kyndryl, All Rights Reserved
---
---   Licensed under the Apache License, Version 2.0 (the "License");
---   you may not use this file except in compliance with the License.
---   You may obtain a copy of the License at
---
---       http://www.apache.org/licenses/LICENSE-2.0
---
---   Unless required by applicable law or agreed to in writing, software
---   distributed under the License is distributed on an "AS IS" BASIS,
---   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
---   See the License for the specific language governing permissions and
---   limitations under the License.
-
 -- Relational schema of the modernized cash ledger: accounts, reservations, the append-only ledger and the migration staging and reporting tables.
 
 -- Applied by Spring Boot SQL initialization instead of Flyway or Liquibase because neither is present in
 -- any pom.xml of this checkout, and backend/portfolio already hand-applies its DDL
--- (backend/portfolio/createTables.ddl:L16); the mechanism therefore stays inside the mandated framework
+-- (backend/portfolio/createTables.ddl:L15); the mechanism therefore stays inside the mandated framework
 -- while the same file remains applicable by hand under a DDL-owning role. Accepted limitation: this is not
 -- a versioned migration history, so a later schema change needs a versioned tool or a hand-written ALTER
 -- step appended to this file.

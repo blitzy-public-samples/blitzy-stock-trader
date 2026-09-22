@@ -1,19 +1,3 @@
-/*
-       Copyright 2025 Kyndryl, All Rights Reserved
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
- */
-
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.domain;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -23,6 +7,7 @@ import java.util.Locale;
 
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.error.CashAccountErrorCode;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.error.CashAccountException;
+import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.error.LogSafeText;
 import org.junit.jupiter.api.Test;
 
 /** Unit tests for owner identity normalization: trim, upper case, and the 1-32 character bound. */
@@ -42,14 +27,11 @@ class OwnerNormalizerTest {
         // how many times a row had been read.
         assertThat(OwnerNormalizer.normalize("JOHN")).isEqualTo("JOHN");
 
-        // PRESERVED (AAP 0.4.6): legacy owner identity was case-insensitive on every path - reads, deletes,
-        // credits and debits matched LOWER(Owner) = LOWER(:CUST-NAME-TEXT) [CASH00.cbl:L141] and updates matched
-        // UPPER(Owner) = UPPER(:CUST-NAME-TEXT) [CASH00.cbl:L178]. Collapsing the casings to one stored form keeps
-        // every lookup that worked before working, now against a single primary key.
-        //
-        // DELIBERATELY CHANGED (AAP 0.4.6): the value handed back is always the stored form. The legacy echo was
-        // inconsistent - Q returned the database's upper-case column [CASH00.cbl:L144] while A returned the
-        // caller's own casing [CASH00.cbl:L158] - which costs no caller compatibility to drop, because broker maps
+        // Preserved (AAP 0.4.6): legacy owner identity was case-insensitive on every path, reads and deletes
+        // matching LOWER(Owner) [CASH00.cbl:L141] and updates UPPER(Owner) [CASH00.cbl:L178], so collapsing the
+        // casings to one stored form keeps every lookup that worked before working, against a single primary key.
+        // Always answering with that stored form is the deliberate change: the legacy echo was inconsistent, Q
+        // returning the column [CASH00.cbl:L144] and A the caller's own casing [CASH00.cbl:L158], and broker maps
         // only balance and currency out of the response.
         assertThat(OwnerNormalizer.normalize("john"))
                 .isEqualTo(OwnerNormalizer.normalize("John"))
@@ -57,9 +39,9 @@ class OwnerNormalizerTest {
                 .isEqualTo("JOHN");
 
         // Locale.ROOT, not the no-argument toUpperCase(): under a Turkish default locale the latter maps "i" to
-        // U+0130 (dotted capital I), which would put a non-ASCII character into the primary key and make identity
-        // depend on the JVM's locale. The ASCII outcome is asserted rather than the locale switched, because a test
-        // that mutates the JVM default locale corrupts every test sharing the JVM.
+        // U+0130 (dotted capital I), putting a non-ASCII character into the primary key and making identity depend
+        // on the JVM's locale. The ASCII outcome is asserted rather than the locale switched, which would corrupt
+        // every test sharing this JVM.
         assertThat(OwnerNormalizer.normalize("iris")).isEqualTo("IRIS");
 
         // Only the edges are stripped; interior characters survive as given, so owners carrying separators are not
@@ -73,11 +55,10 @@ class OwnerNormalizerTest {
 
         assertThat(OwnerNormalizer.normalize("j")).isEqualTo("J");
 
-        // DELIBERATELY CHANGED (AAP 0.4.6): the legacy 15-character ceiling was a COMMAREA artifact - WS-NAME was
+        // Deliberate change (AAP 0.4.6): the legacy 15-character ceiling was a COMMAREA artifact - WS-NAME was
         // PIC X(15) [CASH00.cbl:L55] while the column behind it was CHAR(32) [DCLCASH.cpy:L9, L17] - so a longer
         // owner was silently cut at the interface boundary and two owners sharing a 15-character prefix collapsed
-        // into one account with nothing reporting it. A twenty-character owner surviving whole is that truncation
-        // gone; it would have reached the table as "INSTITUTIONAL-D".
+        // into one account with nothing reporting it. A twenty-character owner surviving whole is that gone.
         assertThat(OwnerNormalizer.normalize("institutional-desk-7"))
                 .isEqualTo("INSTITUTIONAL-DESK-7")
                 .hasSize(20);
@@ -91,22 +72,14 @@ class OwnerNormalizerTest {
         // CHAR(32) export column is accepted rather than refused for being 38 characters of raw text.
         assertThat(OwnerNormalizer.normalize("   " + fullWidth + "   ")).hasSize(OwnerNormalizer.MAX_LENGTH);
 
-        // Built by repetition so the input is one character past the bound by construction rather than by a
-        // hand-counted literal.
         assertThat(rejectionCodeFor("A".repeat(OwnerNormalizer.MAX_LENGTH + 1)))
                 .isEqualTo(CashAccountErrorCode.INVALID_OWNER);
 
         // The bound is applied to the canonical form, after the case fold, because folding is one-to-many: 31
         // "a" followed by U+00DF (sharp s) is exactly 32 characters as sent and 33 once folded, since sharp s
-        // upper-cases to "SS". Measured before the fold this input passed, so normalize returned a 33-character
-        // owner - one the VARCHAR(32) column cannot hold and, worse, one normalize itself rejects, which made
-        // the fold non-idempotent. Every consumer re-normalizes (CashAccount.create, LedgerEntry, LedgerService,
-        // the loader, the reconciler), so the escape surfaced late: whichever call normalized second raised the
-        // 400 and echoed the folded value instead of the caller's input, while a path that re-normalized only
-        // after using the value carried an over-length account and join key. Rejecting up front restores the
-        // idempotence the case-insensitive identity assertions above depend on.
-        // The intermediate assertions pin why this input is interesting, so the rejection below cannot be
-        // misread as contradicting the full-width acceptance above.
+        // upper-cases to "SS". Bounding the pre-fold value would return a 33-character owner the VARCHAR(32)
+        // column cannot hold and that normalize itself rejects - a non-idempotent fold every consumer that
+        // re-normalizes an already-normalized owner then trips over, rejecting late and echoing the folded value.
         String expandsWhenFolded = "a".repeat(OwnerNormalizer.MAX_LENGTH - 1) + "\u00DF";
         assertThat(expandsWhenFolded).hasSize(OwnerNormalizer.MAX_LENGTH);
         assertThat(expandsWhenFolded.toUpperCase(Locale.ROOT)).hasSize(OwnerNormalizer.MAX_LENGTH + 1);
@@ -114,9 +87,8 @@ class OwnerNormalizerTest {
 
         // Counted in code points, not UTF-16 units, because code points are the unit the destination column
         // bounds: PostgreSQL measures character varying in characters. U+1D400 is one character costing two
-        // UTF-16 units, so 32 of them are 64 units - counting units refused an owner that VARCHAR(32) stores
-        // without complaint (verified on postgres 12.22: 32 insert, 33 are refused "value too long"). It is an
-        // uppercase letter that folds to itself, so the canonical form is the input.
+        // UTF-16 units, so counting units would refuse an owner that VARCHAR(32) stores without complaint
+        // (verified on postgres 12.22). It folds to itself, so the canonical form is the input.
         String oneCharacterTwoUnits = "\uD835\uDC00";
         String fullWidthInCodePoints = oneCharacterTwoUnits.repeat(OwnerNormalizer.MAX_LENGTH);
         assertThat(fullWidthInCodePoints).hasSize(OwnerNormalizer.MAX_LENGTH * 2);
@@ -124,9 +96,56 @@ class OwnerNormalizerTest {
         assertThat(normalized).isEqualTo(fullWidthInCodePoints);
         assertThat(normalized.codePointCount(0, normalized.length())).isEqualTo(OwnerNormalizer.MAX_LENGTH);
 
-        // One code point past the bound is still refused, so widening the unit did not weaken the ceiling.
         assertThat(rejectionCodeFor(oneCharacterTwoUnits.repeat(OwnerNormalizer.MAX_LENGTH + 1)))
                 .isEqualTo(CashAccountErrorCode.INVALID_OWNER);
+    }
+
+    // The two halves of one contract, asserted together because each is only safe given the other. An owner may
+    // carry an interior control or line-separator code point - the legacy CHAR(32) column restricted none and AAP
+    // 0.4.2 and 0.6.2 fix INVALID_OWNER to blank-or-over-32, so narrowing identity here would change which accounts
+    // exist and would refuse export rows the migration loader must carry. That makes the value dangerous in exactly
+    // one place: a line-oriented log record, where a newline ends the record and whatever follows reads as a
+    // separate line this service wrote (CWE-117). error/LogSafeText is where it is neutralized, and every record
+    // naming an owner goes through it.
+    @Test
+    void controlCharactersSurviveNormalizationAndAreEncodedAtTheLoggingBoundary() {
+        // Normalization is unchanged: case-folded, stripped at the edges, interior code points intact.
+        assertThat(OwnerNormalizer.normalize("  jo\nhn  ")).isEqualTo("JO\nHN");
+
+        // The value that reaches a log record is the RAW one, because a rejection echoes back what it refused so
+        // the ApiError payload can name it - which is why the encoder, not the normalizer, is the control.
+        String forged = "JOHN\r\n2026-09-22 ERROR Rejecting request for owner ADMIN: ACCOUNT_DELETED";
+        assertThat(rejectionCodeFor(forged)).isEqualTo(CashAccountErrorCode.INVALID_OWNER);
+
+        // Encoded, so no code point that could end or rewrite a record survives - and unambiguously, since the
+        // escape character is itself escaped.
+        assertThat(LogSafeText.of("JO\nHN")).isEqualTo("JO\\u000AHN");
+        assertThat(LogSafeText.of(forged))
+                .startsWith("JOHN\\u000D\\u000A")
+                .doesNotContain("\n")
+                .doesNotContain("\r");
+        assertThat(LogSafeText.of("JOHN\u2028X")).isEqualTo("JOHN\\u2028X");
+        assertThat(LogSafeText.of("JOHN\\u000A")).isEqualTo("JOHN\\\\u000A");
+
+        // Bounded, because a rejected owner has passed no length check at all: an unbounded log field is its own
+        // denial of service against whoever has to read and store it.
+        assertThat(LogSafeText.of("A".repeat(500)))
+                .hasSize(LogSafeText.MAX_CODE_POINTS + 3)
+                .endsWith("...");
+
+        // A legitimate owner is untouched, and a condition that names no owner keeps logging exactly as before:
+        // the encoder changes what a record contains, never which records exist.
+        assertThat(LogSafeText.of("JOHN.DOE-1")).isEqualTo("JOHN.DOE-1");
+        assertThat(LogSafeText.of(null)).isNull();
+
+        // The message form encodes identically and differs only in how much it keeps, because a framework message
+        // built around a percent-decoded request path carries the same hazard while needing to stay readable.
+        assertThat(LogSafeText.ofMessage("No static resource /cash-account/x\nFORGED.")).doesNotContain("\n");
+        assertThat(LogSafeText.ofMessage("A".repeat(500)))
+                .hasSize(LogSafeText.MAX_MESSAGE_CODE_POINTS + 3)
+                .endsWith("...");
+        assertThat(LogSafeText.MAX_MESSAGE_CODE_POINTS).isGreaterThan(LogSafeText.MAX_CODE_POINTS);
+        assertThat(LogSafeText.ofMessage(null)).isNull();
     }
 
     @Test
@@ -135,14 +154,11 @@ class OwnerNormalizerTest {
         assertThat(rejectionCodeFor("")).isEqualTo(CashAccountErrorCode.INVALID_OWNER);
         assertThat(rejectionCodeFor("   ")).isEqualTo(CashAccountErrorCode.INVALID_OWNER);
 
-        // The code is only half the contract; 400 is the status AAP 0.6.2 pins for this condition, and
-        // CashAccountErrorCode is the single place it is decided, so the rejection is tied here to the response a
-        // caller actually receives.
+        // AAP 0.6.2 pins 400 for this condition and CashAccountErrorCode is the single place it is decided, so
+        // the rejection is tied here to the response a caller actually receives.
         assertThat(CashAccountErrorCode.INVALID_OWNER.status().value()).isEqualTo(400);
     }
 
-    // Yields the rejected condition's code so each call site reads as one fact. The exception message is asserted
-    // nowhere: it is a human-facing default the error code supplies, not part of the contract.
     private static CashAccountErrorCode rejectionCodeFor(String raw) {
         CashAccountException thrown =
                 catchThrowableOfType(() -> OwnerNormalizer.normalize(raw), CashAccountException.class);

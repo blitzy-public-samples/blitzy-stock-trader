@@ -1,19 +1,3 @@
-/*
-       Copyright 2025 Kyndryl, All Rights Reserved
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
- */
-
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.domain;
 
 import jakarta.persistence.Column;
@@ -37,37 +21,6 @@ import org.hibernate.type.SqlTypes;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.error.CashAccountErrorCode;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.error.CashAccountException;
 
-/*
- * WHY THIS TABLE HAS NO LEGACY COUNTERPART. STOCKTRD.CASHACCOUNTY held one mutable BALANCE per OWNER
- * [backend/cash-account-cobol/DB2-DDL/DB2DDL.jcl:L46-L52; backend/cash-account-cobol/COBOL/DCLCASH.cpy:L8-L12]
- * and the program offered no way to earmark part of it: the only means of reserving funds was the debit
- * paragraph, which destroyed the information needed to give them back. A reservation row is therefore a new
- * capability rather than a migrated one (AAP 0.14.2), and nothing in this class is a parity requirement -
- * while every column, width and constraint below is a schema requirement, because ddl-auto=validate compares
- * this mapping against schema/cash-account-schema.sql at start-up and refuses to boot on any difference.
- *
- * WHY THERE IS NO ASSOCIATION TO CashAccount - no @ManyToOne, no @JoinColumn, no foreign key. These rows are
- * retained as the audit record after a retail DELETE of the account (AAP 0.6.3, 0.11.1), so a foreign key
- * would make that promised deletion fail as soon as a terminal reservation existed. owner and incarnation_id
- * are plain scalar columns, and an instance may legitimately name an owner that has no cash_account row at
- * all; no code here may assume the account still exists. An association would additionally make
- * ddl-auto=validate demand a join column the schema script never creates.
- *
- * WHY THE IDEMPOTENCY KEY IS SCOPED BY incarnation_id. UNIQUE (incarnation_id, idempotency_key) is not
- * hygiene, it is the atomic first-writer-wins guard the hold path is built on (AAP 0.7.3): two concurrent
- * holds with one key race to the INSERT, the loser catches the DataIntegrityViolationException the constraint
- * raises and re-reads in a FRESH transaction - a PostgreSQL unique violation aborts the transaction it occurs
- * in, so the re-read cannot happen inside it - then replays the winner's response when request_hash matches
- * or answers 422 IDEMPOTENCY_KEY_REUSED when it does not. Scoping by the account's incarnation rather than by
- * the owner is what stops a key from a deleted-and-recreated owner's previous life from replaying a
- * reservation that reserved nothing in the new account.
- *
- * WHY @Table NAMES THE TABLE AND NOTHING ELSE. No schema is declared, so statements resolve through the
- * connection's search path and the runbook's rehearsal override (spring.datasource.hikari.schema=
- * cash_account_rehearsal) reaches this entity without a code change. The unique constraint above and the
- * (owner) and (state, expires_at) indexes are declared once, in schema/cash-account-schema.sql; repeating
- * them in annotations would create a second source of truth that ddl-auto=validate does not even read.
- */
 /** An institutional hold on part of an owner's cash: how much is reserved, for which order, and until when. */
 @Entity
 @Table(name = "cash_reservation")
@@ -76,7 +29,6 @@ public class CashReservation {
     /** Bound by VARCHAR(128) on idempotency_key; a longer key is refused rather than truncated. */
     private static final int IDEMPOTENCY_KEY_MAX_LENGTH = 128;
 
-    /** Bound by VARCHAR(64) on order_reference. */
     private static final int ORDER_REFERENCE_MAX_LENGTH = 64;
 
     /** Bound by VARCHAR(8) on currency, the legacy CURRENCYC CHAR(8) width kept for migrated values. */
@@ -93,9 +45,12 @@ public class CashReservation {
     @Column(name = "reservation_id", nullable = false, updatable = false)
     private UUID reservationId;
 
-    // Copied from the account, never pointed at it: see the no-foreign-key note above. updatable = false on
-    // both because re-pointing a reservation at another owner or another incarnation would move money the
-    // ledger has already accounted for under the original identity.
+    // Copied from the account, never pointed at it: there is no @ManyToOne and no foreign key, because these
+    // rows are retained as the audit record after a retail DELETE of the account (AAP 0.6.3, 0.11.1) and a
+    // foreign key would make that promised deletion fail as soon as a terminal reservation existed. An
+    // instance may therefore legitimately name an owner with no cash_account row, and no code here may assume
+    // the account still exists. updatable = false on both because re-pointing a reservation at another owner
+    // or another incarnation would move money the ledger has already accounted for.
     @Column(name = "owner", length = 32, nullable = false, updatable = false)
     private String owner;
 
@@ -107,13 +62,12 @@ public class CashReservation {
     @Column(name = "order_reference", length = 64, nullable = false, updatable = false)
     private String orderReference;
 
-    // WHY precision AND scale ARE BOTH DECLARED: Hibernate substitutes its own default scale when a mapping
-    // is silent, which would make this entity describe a column the schema does not have and turn
+    // precision AND scale are both declared because Hibernate substitutes its own default scale when a
+    // mapping is silent, which would make this entity describe a column the schema does not have and turn
     // ddl-auto=validate from a guard into a start-up failure. 9 and 2 are the legacy NUMERIC(9,2) precision
     // [backend/cash-account-cobol/DB2-DDL/DB2DDL.jcl:L48] that schema/cash-account-schema.sql reproduces.
-    //
-    // The held amount is fixed for the life of the row - a hold is never resized, it is settled or released -
-    // so updatable = false, which is also what makes CHECK (settled_amount <= amount) a stable invariant.
+    // The held amount is fixed for the life of the row - a hold is settled or released, never resized - so
+    // updatable = false, which is also what makes CHECK (settled_amount <= amount) a stable invariant.
     @Column(name = "amount", precision = 9, scale = 2, nullable = false, updatable = false)
     private BigDecimal amount;
 
@@ -138,24 +92,26 @@ public class CashReservation {
     @Column(name = "state", length = 16, nullable = false)
     private ReservationState state;
 
-    // The caller's Idempotency-Key header, one half of the unique constraint described above.
+    // One half of UNIQUE (incarnation_id, idempotency_key), the atomic first-writer-wins guard the hold path
+    // is built on (AAP 0.7.3): two concurrent holds with one key race to the INSERT and the loser re-reads in
+    // a FRESH transaction - a PostgreSQL unique violation aborts the transaction it occurs in - then replays
+    // the winner's response when request_hash matches or answers 422 IDEMPOTENCY_KEY_REUSED when it does not.
+    // Scoping by the account's incarnation is what stops a key from a deleted-and-recreated owner's previous
+    // life from replaying a reservation that reserved nothing in the new account.
     @Column(name = "idempotency_key", length = 128, nullable = false, updatable = false)
     private String idempotencyKey;
 
     /*
-     * WHY THIS MAPPING CARRIES @JdbcTypeCode(SqlTypes.CHAR) AND MUST KEEP IT. The column is CHAR(64). A plain
-     * String field makes Hibernate expect varchar(64) with JDBC type code VARCHAR, while pgJDBC reports the
-     * column as bpchar with type code CHAR. The schema validator accepts a column when the expected code
-     * equals the reported code or the expected type text startsWith the reported type name, and
-     * "varchar(64)".startsWith("bpchar") is false - so without this annotation ddl-auto=validate fails and
-     * the application does not start. Declaring the code directly is the fix; columnDefinition = "char(64)"
-     * is not, because it replaces the type text Hibernate validates against without reliably correcting the
-     * code, and widening the column to VARCHAR(64) is not available either - AAP 0.6.3 specifies CHAR(64)
-     * and schema/cash-account-schema.sql already declares it.
+     * @JdbcTypeCode(SqlTypes.CHAR) must stay: the column is CHAR(64), for which a plain String field makes
+     * Hibernate expect varchar(64) while pgJDBC reports bpchar, and the schema validator's
+     * "varchar(64)".startsWith("bpchar") is false - so without it ddl-auto=validate fails and the application
+     * does not start. columnDefinition = "char(64)" is not the fix, because it replaces the type text without
+     * reliably correcting the code, and widening to VARCHAR(64) is not available: AAP 0.6.3 specifies
+     * CHAR(64) and schema/cash-account-schema.sql declares it.
      *
-     * PostgreSQL blank-pads bpchar on read. A SHA-256 hex digest is exactly 64 characters, so no padding can
-     * arise from a value this class accepts - the factory rejects any other length - but the accessor strips
-     * regardless, so a replay comparison can never turn on trailing blanks a shorter value would acquire.
+     * PostgreSQL blank-pads bpchar on read. A hex SHA-256 digest is exactly 64 characters and the factory
+     * rejects any other length, but the accessor strips regardless, so a replay comparison can never turn on
+     * trailing blanks a shorter value would have acquired.
      */
     @JdbcTypeCode(SqlTypes.CHAR)
     @Column(name = "request_hash", length = 64, nullable = false, updatable = false)
@@ -188,17 +144,11 @@ public class CashReservation {
     /**
      * Places a hold on {@code account} for {@code amount}, bound to that account's current incarnation.
      *
-     * <p>The returned reservation is transient and in state {@link ReservationState#HELD} with no settled
-     * amount. Moving the account's available and reserved balances is the caller's transaction to complete:
-     * this factory creates the record of the hold, and {@code ReservationStateMachine} owns the balance
-     * effects that must accompany it.</p>
-     *
-     * <p>Two values are deliberately computed elsewhere. {@code requestHash} is the SHA-256 of the canonical
-     * payload defined in AAP 0.7.3, which belongs to {@code institutional/ReservationService} because only
-     * the service sees the request as the caller sent it; this entity stores the result and never recomputes
-     * it. {@code expiresAt} is derived from {@code cashaccount.reservation.default-ttl} when the caller omits
-     * it, and reading configuration is not something a domain type does - the package stays free of Spring
-     * and of property lookups.</p>
+     * <p>This factory creates only the record of the hold; {@code ReservationStateMachine} owns the balance
+     * effects that must accompany it in the same transaction. Two values are deliberately computed
+     * elsewhere: {@code requestHash}, because only {@code institutional/ReservationService} sees the request
+     * as the caller sent it, and {@code expiresAt}, whose default comes from configuration a domain type
+     * does not read - this package stays free of Spring.</p>
      *
      * @param account the account whose funds are held; supplies both {@code owner} and {@code incarnationId}
      * @param orderReference the caller's reference for the backing order, 1 to 64 characters
@@ -268,18 +218,15 @@ public class CashReservation {
     }
 
     /*
-     * WHY THIS IS PACKAGE-PRIVATE AND MUST STAY THAT WAY. Which (state, command) pairs are legal, which are
-     * idempotent no-ops and which are rejected is knowledge the module keeps in exactly one place -
-     * ReservationStateMachine, the only type in this package with reason to call this method (AAP 0.6.5).
-     * Package-private turns "entities never mutate state outside the state machine" into a compile-time fact:
-     * the retail, institutional and migration packages physically cannot reach it, so no second
-     * implementation of the hold, settle, release or expiry rules can come into existence. Widening the
-     * visibility would give that guarantee away silently, which is why the reason is recorded here.
+     * Package-private and must stay that way: which (state, command) pairs are legal, idempotent or rejected
+     * is knowledge the module keeps only in ReservationStateMachine (AAP 0.6.5), and retail, institutional
+     * and migration code physically cannot reach this method, which turns "entities never mutate state
+     * outside the state machine" into a compile-time fact.
      *
-     * This method applies, it does not judge: it asks nothing about the current state, because the caller has
-     * already decided the transition is legal and has computed the balances that must move with it. The
-     * settled amount is authoritative rather than merged - passing null clears it - so a release or an expiry
-     * leaves the column NULL, which is the "never settled" fact the ledger rows rely on.
+     * This method applies, it does not judge: the caller has already decided the transition is legal and
+     * computed the balances that move with it. The settled amount is authoritative rather than merged -
+     * passing null clears it - so a release or an expiry leaves the column NULL, the "never settled" fact
+     * the ledger rows rely on.
      */
     void applyTransition(ReservationState newState, Money settledAmount) {
         if (newState == null) {
@@ -314,12 +261,11 @@ public class CashReservation {
     }
 
     /**
-     * Returns the settled portion, or {@code null} while the reservation has never been settled.
-     *
-     * <p>The null is the contract, not an oversight, and an {@link java.util.Optional} is deliberately not
+     * The null is the contract, not an oversight, and an {@link java.util.Optional} is deliberately not
      * returned: "never settled" and "settled for 0.00" are different facts - a zero settlement is legal and
-     * releases the whole hold - and an entity accessor that wrapped the column would invite callers to treat
-     * the two as one.</p>
+     * releases the whole hold - and wrapping the column would invite callers to treat the two as one.
+     *
+     * @return the settled portion, or {@code null} while the reservation has never been settled
      */
     public Money settledAmount() {
         return settledAmount == null ? null : Money.of(settledAmount);
@@ -360,24 +306,24 @@ public class CashReservation {
     }
 
     /**
-     * Reports whether funds are still held, which is the only state that constrains anything outside itself.
+     * HELD is the only state that constrains anything outside itself: it is what makes a retail {@code PUT}
+     * or {@code DELETE} answer 409 RESERVATIONS_OUTSTANDING (AAP 0.6.2) and what makes the loader leave an
+     * existing owner untouched with a {@code STATE} variance rather than overwrite a balance that is partly
+     * committed elsewhere (AAP 0.6.3).
      *
-     * <p>A held reservation is what makes a retail {@code PUT} or {@code DELETE} answer
-     * 409 RESERVATIONS_OUTSTANDING (AAP 0.6.2) and what makes the loader leave an existing owner untouched
-     * with a {@code STATE} variance instead of overwriting a balance that is partly committed elsewhere
-     * (AAP 0.6.3).</p>
+     * @return whether funds are still held
      */
     public boolean isHeld() {
         return state == ReservationState.HELD;
     }
 
     /**
-     * Reports whether this reservation is overdue as at {@code now} and therefore expirable.
+     * True only for a held reservation: the three terminal states are already resolved, and reporting one of
+     * them as expirable would let the sweep write a second terminal transition for the same hold.
      *
-     * <p>True only for a held reservation: the three terminal states are already resolved, and reporting one
-     * of them as expirable would let the sweep write a second terminal transition for the same hold. The
-     * instant is a parameter rather than a call to the clock so the scheduled sweep and the lazy check a
-     * settle or release performs first can judge one reservation against one instant.</p>
+     * @param now the instant to judge against, passed rather than read from the clock so the scheduled sweep
+     *        and the lazy check a settle or release performs first judge one reservation against one instant
+     * @return whether this reservation is overdue as at {@code now} and therefore expirable
      */
     public boolean isExpiredAt(OffsetDateTime now) {
         if (now == null) {
@@ -403,26 +349,18 @@ public class CashReservation {
     }
 
     /*
-     * WHY EVERY TIMESTAMP THIS CLASS STORES IS PUT THROUGH HERE FIRST. These three columns are TIMESTAMPTZ,
-     * which resolves instants to microseconds, and application.yml pins hibernate.jdbc.time_zone to UTC - so
-     * whatever offset and however many nanoseconds a value arrives with, what comes back out of PostgreSQL is
-     * that instant in UTC at microsecond resolution. An unnormalized value therefore makes the in-memory
-     * entity disagree with its own row: a hold created with a caller-supplied expiresAt of
-     * 2099-06-01T14:00:00.123456789+02:00 answers with those nanoseconds and that offset, while every later
-     * read of the same reservation - including the replay of that very hold, which AAP 0.6.2 and 0.7.3
-     * require to return the original response body - answers 2099-06-01T12:00:00.123456Z. Normalizing at
-     * construction removes the disagreement at its source, which a post-flush refresh would only paper over
-     * for the paths that happened to refresh.
+     * Every timestamp this class stores passes through here so the in-memory entity cannot disagree with its
+     * own row: the columns are TIMESTAMPTZ at microsecond resolution and application.yml pins
+     * hibernate.jdbc.time_zone to UTC, so a hold created with expiresAt 2099-06-01T14:00:00.123456789+02:00
+     * would answer with those nanoseconds and that offset while every later read - including the replay that
+     * AAP 0.6.2 and 0.7.3 require to return the original body - answered 2099-06-01T12:00:00.123456Z.
+     * Truncation rather than rounding, applied before the value is sent: pgJDBC rounds sub-microsecond digits
+     * on the way out, and domain/LedgerEntry stamps recorded_at by the same UTC-at-microseconds rule, so the
+     * two tables that publish timestamps agree on what an instant is.
      *
-     * Truncation rather than rounding, and applied before the value is ever sent: pgJDBC rounds sub-microsecond
-     * digits on the way out, so truncating here makes what is sent already exact and leaves that rounding with
-     * nothing to do. The at-most-999ns an expiry moves earlier is immaterial against a TTL measured in hours,
-     * and isExpiredAt judges the same instant either way. domain/LedgerEntry stamps recorded_at with the same
-     * UTC-at-microseconds rule, so the two tables that publish timestamps agree on what an instant is.
-     *
-     * The scope of this rule is what the service stores and publishes, never what it compares: the
-     * idempotency hash is taken from the payload as the caller sent it (AAP 0.7.3), so a retry of a hold that
-     * named an explicit expiry resends that same payload rather than the normalized instant this returns.
+     * The rule covers what the service stores and publishes, never what it compares: the idempotency hash is
+     * taken from the payload as the caller sent it (AAP 0.7.3), so a retry of a hold that named an explicit
+     * expiry resends that payload rather than the normalized instant this returns.
      */
     private static OffsetDateTime storedInstant(OffsetDateTime value) {
         if (value == null) {
@@ -432,33 +370,27 @@ public class CashReservation {
     }
 
     /*
-     * WHY THE MUTATOR STAMPS updated_at INSTEAD OF A @PreUpdate CALLBACK: @PreUpdate runs at flush, so every
-     * read taken between the transition and the flush - which includes the ReservationResponse the
-     * institutional endpoint builds from this instance before its transaction commits - would still carry the
-     * previous value. Stamping inside the mutator makes the in-memory entity correct the instant it changes,
-     * and the column's DEFAULT now() remains the safety net for a row some other tool inserts.
+     * The mutator stamps updated_at instead of a @PreUpdate callback, which runs at flush, so every read
+     * taken between the transition and the flush - including the ReservationResponse the institutional
+     * endpoint builds from this instance before its transaction commits - would still carry the previous
+     * value. The column's DEFAULT now() remains the safety net for a row some other tool inserts.
      */
     private void touch() {
         updatedAt = storedInstant(OffsetDateTime.now());
     }
 
     /*
-     * The service is responsible for producing a usable order reference - HoldRequest already declares
-     * @NotBlank @Size(max = 64), so a caller's bad value is rejected as a 400 by bean validation long before
-     * this point - which makes anything unusable here a defect in this module rather than a caller error, and
-     * IllegalArgumentException the honest report. Checking it at all is what stops a silent
-     * DataIntegrityViolationException at flush, rendered as an opaque 500, from being the first sign.
+     * Validation only, never normalization: the value is stored exactly as it arrives, blanks and all,
+     * because request_hash is the SHA-256 of a canonical payload whose first component is this reference
+     * taken verbatim (AAP 0.7.3, which compares it exactly). Trimming or case-folding it would make the
+     * reference this reservation hands back hash to something other than the digest stored beside it, so a
+     * caller replaying its hold with that reference would receive 422 IDEMPOTENCY_KEY_REUSED for an
+     * identical request, and "  ORD  " would stop being a distinct request from "ORD".
      *
-     * WHY THE VALUE IS STORED EXACTLY AS IT ARRIVES, BLANKS AND ALL. request_hash is the SHA-256 of a
-     * canonical payload whose first component is this order reference taken verbatim (AAP 0.7.3, which
-     * compares it exactly), and a repeated Idempotency-Key is judged a replay by that hash alone. Altering
-     * the value on the way into the column - trimming it, folding its case - would make the reference this
-     * reservation returns hash to something other than the digest stored beside it, so a caller replaying
-     * its hold with the reference it was handed back would receive 422 IDEMPOTENCY_KEY_REUSED for the same
-     * request. Storing it unaltered makes the returned value replayable and keeps "  ORD  " and "ORD"
-     * distinct requests, which is the exact comparison the contract specifies. The checks below are
-     * therefore validation only, never normalization: the value must exist and must fit VARCHAR(64), which
-     * HoldRequest's @NotBlank @Size(max = 64) has already established for anything a caller sent.
+     * HoldRequest's @NotBlank @Size(max = 64) has already rejected a caller's bad value as a 400, so
+     * anything unusable here is a defect in this module and IllegalArgumentException is the honest report;
+     * checking at all is what stops an opaque 500 from a flush-time DataIntegrityViolationException from
+     * being the first sign.
      */
     private static String requireOrderReference(String raw) {
         if (raw == null || raw.isBlank()) {
@@ -472,15 +404,13 @@ public class CashReservation {
     }
 
     /*
-     * Shape only, and less strict than cash_account.currency deliberately: that column carries
-     * CHECK (currency ~ '^[A-Z]{3}$') while this one carries none, because the institutional path never
-     * converts and the service's CURRENCY_MISMATCH check against the already-validated account currency is
-     * the real guard (AAP 0.7.2). What is enforced here is only that the value exists and fits VARCHAR(8) -
-     * the legacy CURRENCYC width [backend/cash-account-cobol/DB2-DDL/DB2DDL.jcl:L49] - so the failure is an
-     * explicit 400 rather than a constraint violation surfacing as 500 at flush.
-     *
-     * Locale.ROOT, never the no-argument toUpperCase(): a Turkish default locale maps "i" to U+0130, which
-     * would store a different code on one pod than on another.
+     * Deliberately less strict than cash_account.currency, which carries ck_cash_account_currency_iso while
+     * this column carries no shape constraint: the institutional path never converts, so the service's
+     * CURRENCY_MISMATCH check against the already-validated account currency is the real guard (AAP 0.7.2).
+     * Enforced here is only that the value exists and fits VARCHAR(8), the legacy CURRENCYC width
+     * [backend/cash-account-cobol/DB2-DDL/DB2DDL.jcl:L49], so the failure is an explicit 400 rather than a
+     * constraint violation surfacing as 500 at flush. Locale.ROOT, never the no-argument toUpperCase(): a
+     * Turkish default locale maps "i" to U+0130 and would store a different code on one pod than on another.
      */
     private static String requireCurrency(String raw, String owner) {
         if (raw == null || raw.isBlank()) {

@@ -1,19 +1,3 @@
-/*
-       Copyright 2025 Kyndryl, All Rights Reserved
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
- */
-
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.support;
 
 import java.io.ByteArrayInputStream;
@@ -49,28 +33,11 @@ import org.eclipse.microprofile.rest.client.RestClientBuilder;
 
 import com.ibm.hybrid.cloud.sample.stocktrader.broker.client.CashAccountClient;
 
-// The call shape follows the estate's only REST Client precedent,
-// backend/trade-history/src/test/java/com/kyndryl/cjot/sample/stocktrader/tradehistory/test/RestClientProducers.java
-// - RestClientBuilder.newBuilder().baseUri(...).build(Interface.class) - with two of its decorations deliberately
-// dropped. Its class-level provider registration naming Yasson's JSON-B provider class is not carried over because
-// Yasson is not a dependency here: this module supplies johnzon-jsonb plus RESTEasy's JSON-B binding provider, which
-// RESTEasy discovers on its own, and naming the Yasson class would not even compile. Its CDI plumbing - an
-// application-scoped bean exposing a producer method qualified for REST-client injection - is not carried over
-// either, because there is no CDI container in a Spring Boot test: trade-history pulls weld-junit5 precisely because
-// it runs one, and this module intentionally does not.
-//
-// The MicroProfile Config fallback below exists for a specific, verified reason. broker's interface carries a
-// valueless @RegisterClientHeaders, which makes the implementation install DefaultClientHeadersFactoryImpl; that
-// factory reads org.eclipse.microprofile.rest.client.propagateHeaders (the property broker sets at
-// backend/broker/src/main/resources/META-INF/microprofile-config.properties:L1) through
-// ConfigProvider.getConfig(), which throws "No ConfigProviderResolver implementation found" when the classpath
-// carries the MP Config API without an implementation. org.jboss.resteasy.microprofile:microprofile-rest-client
-// 3.0.1.Final declares io.smallrye.config:smallrye-config <optional>true</optional>, so the implementation does not
-// arrive transitively: Liberty supplies one to trade-history, and trade-history's own pom.xml:L224-L230 additionally
-// declares it at test scope - the precedent this module's pom.xml follows with smallrye-config 3.9.1, the version
-// resteasy-microprofile-parent 3.0.1.Final manages. The fallback is the belt to that braces: it activates only when
-// no implementation is present, so the pom stays the real fix and this class never masks its absence silently.
-/** Builds broker's real {@code CashAccountClient} against a running instance of this service. */
+/**
+ * Builds broker's real {@code CashAccountClient} through {@code RestClientBuilder}, the estate's own call shape
+ * [backend/trade-history/src/test/java/com/kyndryl/cjot/sample/stocktrader/tradehistory/test/RestClientProducers.java],
+ * against a running instance of this service rather than through a client written for the test.
+ */
 public final class BrokerClientFactory {
 
     private static final Logger LOGGER = Logger.getLogger(BrokerClientFactory.class.getName());
@@ -81,18 +48,23 @@ public final class BrokerClientFactory {
      */
     public static final String RETAIL_BASE_PATH = "/cash-account";
 
-    // Runs exactly once, on class initialization, which is necessarily before the first client is built. The value is
-    // reported in the build-failure message so a broken classpath names its own cause instead of surfacing as an
-    // ExceptionInInitializerError from inside RESTEasy.
+    // A fallback is needed at all because broker's valueless @RegisterClientHeaders installs a header factory that
+    // reads org.eclipse.microprofile.rest.client.propagateHeaders
+    // [backend/broker/src/main/resources/META-INF/microprofile-config.properties:L1] through
+    // ConfigProvider.getConfig(), while resteasy-microprofile declares smallrye-config optional. pom.xml pins
+    // smallrye-config at test scope, as backend/trade-history/pom.xml:L224-L230 does, so this installs only in its
+    // absence and never masks it.
     private static final boolean FALLBACK_CONFIG_INSTALLED = installFallbackConfigIfMissing();
 
     private BrokerClientFactory() {
     }
 
     /**
-     * Client for a service listening on {@code port} of this host, carrying {@code token} as its bearer credential.
+     * Client for a service listening on {@code port} of this host.
      *
+     * @param port bound TCP port, as an {@code *IT} receives it from {@code @LocalServerPort}
      * @param token compact JWS from {@link JwtTestTokens}, or {@code null} to send no {@code Authorization} header
+     * @return a client based at {@code http://localhost:<port>} plus {@link #RETAIL_BASE_PATH}
      */
     public static CashAccountClient client(int port, String token) {
         if (port <= 0 || port > 65535) {
@@ -106,6 +78,10 @@ public final class BrokerClientFactory {
     /**
      * Client for a service reachable at {@code baseUri}, which must already carry {@link #RETAIL_BASE_PATH}: the
      * interface maps {@code @Path("/{owner}")} against the root of whatever base URI it is given.
+     *
+     * @param baseUri absolute base URI including the retail path prefix
+     * @param token compact JWS from {@link JwtTestTokens}, or {@code null} to send no {@code Authorization} header
+     * @return a client based at {@code baseUri}, capturing no response body
      */
     public static CashAccountClient client(URI baseUri, String token) {
         return client(baseUri, token, null);
@@ -115,7 +91,10 @@ public final class BrokerClientFactory {
      * Client that additionally hands every response body, as UTF-8 text, to {@code rawBodySink} before it is
      * deserialized - the hook the one raw-wire assertion needs to see {@code "balance":1234.56} as a plain decimal.
      *
+     * @param baseUri absolute base URI including the retail path prefix
+     * @param token compact JWS from {@link JwtTestTokens}, or {@code null} to send no {@code Authorization} header
      * @param rawBodySink receives each response body, or {@code null} to capture nothing
+     * @return a client based at {@code baseUri}
      */
     public static CashAccountClient client(URI baseUri, String token, Consumer<String> rawBodySink) {
         Objects.requireNonNull(baseUri, "baseUri");
@@ -143,8 +122,8 @@ public final class BrokerClientFactory {
         }
     }
 
-    // Guarded so the fallback is entirely inert whenever a real implementation is present: instance() succeeding means
-    // smallrye-config (or any other provider) is on the classpath and must stay in charge of every lookup.
+    // instance() succeeding means a real provider is on the classpath and must stay in charge of every lookup, so
+    // the fallback is installed only in its absence.
     private static boolean installFallbackConfigIfMissing() {
         try {
             ConfigProviderResolver.instance();
@@ -165,9 +144,8 @@ public final class BrokerClientFactory {
         private final String headerValue;
 
         private AuthorizationHeaderFilter(String token) {
-            // "Bearer " + compact serialization, the exact shape
-            // frontend/trader/.../Utilities.java:L110-L150 sends and broker propagates unchanged. The token arrives
-            // already minted; nothing here re-signs or re-wraps it.
+            // The shape frontend/trader/.../Utilities.java:L122 sends and broker propagates unchanged; the token
+            // arrives already minted, so nothing here re-signs or re-wraps it.
             this.headerValue = "Bearer " + token;
         }
 
@@ -238,8 +216,7 @@ public final class BrokerClientFactory {
 
         @Override
         public void registerConfig(Config config, ClassLoader classLoader) {
-            // Nothing to register against: getConfig ignores the classloader and always answers the single instance
-            // above, so accepting the call and keeping that contract is the whole behaviour.
+            // Nothing to register against: getConfig ignores the classloader and always answers the one instance.
         }
 
         @Override

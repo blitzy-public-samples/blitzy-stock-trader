@@ -1,35 +1,42 @@
-/*
-       Copyright 2025 Kyndryl, All Rights Reserved
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
- */
-
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.persistence;
 
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.migration.reconcile.MigrationRun;
+import java.util.Collection;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 import org.springframework.data.jpa.repository.JpaRepository;
 
 /** Data access for {@code migration_run}: one row per migration-tooling invocation. */
 public interface MigrationRunRepository extends JpaRepository<MigrationRun, UUID> {
 
-    // Keyed on batch_id rather than run_id because a load applies its whole export in one transaction: an
-    // attempt that fails applies nothing and its retry is a NEW run_id under the SAME --tool.batch-id, so
-    // the reconcile that judges that load can only reach it through the batch. Ascending started_at reads
-    // the step in the order it happened, FAILED attempts included, since they are part of its evidence.
-    //
-    // Mode stays out of the signature by choice: a batch holds a handful of rows, so the caller filters
-    // them in memory and this interface never depends on how MigrationRun models that enum.
-    List<MigrationRun> findByBatchIdOrderByStartedAtAsc(UUID batchId);
+    // The only statuses in which a load has staged anything: a load applies its whole export in one transaction
+    // (AAP 0.6.3), ending CLEAN or VARIANCE with every row applied or FAILED with none. RUNNING is excluded on
+    // purpose - it names an attempt still in flight or one whose JVM died before it could be closed, whose staging
+    // is empty, partial or about to be rolled back - so a newer interrupted attempt cannot mask the last load that
+    // really staged.
+    List<MigrationRun.Status> COMPLETED_LOAD_STATUSES =
+            List.of(MigrationRun.Status.CLEAN, MigrationRun.Status.VARIANCE);
+
+    /**
+     * The load whose staged rows a later command of the same batch must read, or empty when the batch has none.
+     *
+     * @param batchId the runbook step's {@code --tool.batch-id}, shared by its load and the command judging it
+     * @return the batch's most recent completed load, or empty when no load of the batch has staged
+     */
+    // One selector for three callers: reconcile/ReconciliationService, shadow/ShadowComparator and
+    // fx/LegacyRateTableSource all ask which run staged the rate rows this batch is judged on, and answering it
+    // per caller left three copies of the rule to drift apart. Keyed on batch_id rather than run_id because a load
+    // and the reconcile judging it are separate invocations sharing --tool.batch-id, and a retry after a failure
+    // is a new run_id under that same batch (AAP 0.6.3).
+    default Optional<MigrationRun> findLatestCompletedLoad(UUID batchId) {
+        return findFirstByBatchIdAndModeAndStatusInOrderByStartedAtDescRunIdDesc(
+                batchId, MigrationRun.Mode.LOAD, COMPLETED_LOAD_STATUSES);
+    }
+
+    // Intended to be called only through the selector above; a caller-supplied mode or status set would reopen
+    // the per-caller drift it closes. run_id DESC is a deterministic tie-break: started_at is not unique, so
+    // ordering on it alone would let two commands of one batch resolve different loads.
+    Optional<MigrationRun> findFirstByBatchIdAndModeAndStatusInOrderByStartedAtDescRunIdDesc(
+            UUID batchId, MigrationRun.Mode mode, Collection<MigrationRun.Status> statuses);
 }

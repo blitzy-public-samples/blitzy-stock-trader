@@ -92,17 +92,16 @@ class LedgerImmutabilityIT extends PostgresTestSupport {
         assertRejected(target, DELETE_ATTEMPT, "DELETE");
     }
 
-    // Raw SQL rather than the repository because that is the whole point: persistence/LedgerEntryRepository exposes
-    // only save and two finders, so nothing above the database can even express this attack, and the ledger it
-    // protects replaces a VSAM history that nothing ever read back and that silently discarded a second record for
-    // the same owner within one second [backend/cash-account-cobol/COBOL/CASH00.cbl:L123-L131].
+    // Raw SQL rather than the repository, because persistence/LedgerEntryRepository exposes only save and two
+    // finders and nothing above the database can express this attack. The ledger it protects replaces a VSAM
+    // history that nothing read back and that silently discarded a second record for one owner within the same
+    // second [backend/cash-account-cobol/COBOL/CASH00.cbl:L123-L131].
     private void assertRejected(JdbcTemplate target, String statement, String operation) {
         assertThatExceptionOfType(DataAccessException.class)
                 .isThrownBy(() -> target.update(statement))
                 .satisfies(failure -> {
                     SQLException raised = rootSqlException(failure);
                     assertThat(raised.getSQLState()).isEqualTo(RAISE_EXCEPTION_SQLSTATE);
-                    // The message, not just the state: it is the wording ledger_entry_reject() itself raises.
                     assertThat(raised.getMessage())
                             .contains("ledger_entry is append-only: " + operation + " is rejected");
                 });
@@ -119,12 +118,10 @@ class LedgerImmutabilityIT extends PostgresTestSupport {
                     .web(WebApplicationType.NONE)
                     .bannerMode(Banner.Mode.OFF)
                     .profiles("test")
-                    // Outside the test context nothing contributes Testcontainers' JdbcConnectionDetails, so
-                    // config/DataSourceGuardConfig assembles the URL itself; an explicit spring.datasource.url is the
-                    // single input it returns verbatim, which is what lands this start-up on the seeded container.
-                    // These arrive as command-line arguments rather than through properties(), which would place
-                    // them in defaultProperties where application.yml's own ${JDBC_ID:}/${JDBC_PASSWORD:} - empty
-                    // here - outrank them, leaving the connection unauthenticated.
+                    // Outside the test context nothing contributes Testcontainers' JdbcConnectionDetails, and an
+                    // explicit spring.datasource.url is the single input config/DataSourceGuardConfig returns
+                    // verbatim. Passed as command-line arguments, not through properties(), where
+                    // application.yml's own empty ${JDBC_ID:}/${JDBC_PASSWORD:} would outrank them.
                     .run("--spring.datasource.url=" + POSTGRES.getJdbcUrl(),
                             "--spring.datasource.username=" + POSTGRES.getUsername(),
                             "--spring.datasource.password=" + POSTGRES.getPassword(),

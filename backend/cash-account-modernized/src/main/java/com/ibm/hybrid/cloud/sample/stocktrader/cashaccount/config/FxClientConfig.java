@@ -1,53 +1,43 @@
-/*
-       Copyright 2025 Kyndryl, All Rights Reserved
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
- */
-
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.config;
 
+import java.io.FilterInputStream;
+import java.io.IOException;
+import java.io.InputStream;
 import java.net.http.HttpClient;
 import java.time.Duration;
 
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatusCode;
+import org.springframework.http.client.ClientHttpResponse;
 import org.springframework.http.client.JdkClientHttpRequestFactory;
 import org.springframework.web.client.RestClient;
+import org.springframework.web.client.RestClientException;
 
-// Transport only. The rate lookup itself lives in fx/FrankfurterExchangeRateClient, and no ExchangeRateSource bean
-// is declared here on purpose: fx/ExchangeRateSourceWiringTest asserts that the deployed profile holds exactly one
-// such bean, and the staged legacy rate table must never become reachable from the request path. That split also
-// keeps the dependency direction the module is built on - fx receives a framework type it can consume without
-// importing this package, so config still wires everything and is itself depended on by nothing.
-//
-// No base URL is configured. The endpoint is a deployment value, not a property of this code: the chart injects it
-// as CURRENCY_API_URL from configMap key cashAccount.exchangeRateUrl
-// [infra/stocktrader-operator/helm-charts/stocktrader/templates/cash-account.yaml:L156-L160], the client reads that
-// value as cashaccount.fx.url and sends it as an absolute URI. A base URL here would be either dead weight or, if
-// the two ever disagreed, a silent rewrite of the request target - so the host stays unknown to this file.
-//
-// No default headers of any kind are set, and that absence is the security control rather than an omission.
-// Broker forwards the caller's credentials into this service - propagateHeaders=Authorization,Proxy-Authorization
-// [backend/broker/src/main/resources/META-INF/microprofile-config.properties:L1] - and this service's only
-// outbound call is to a public third-party exchange-rate API that requires no credential whatsoever. Forwarding a
-// caller's token there would be a security defect, so no header is ever attached by default and nothing is
-// registered on this client that could add one. The lookup is driven from the plain RestClient.builder() rather
-// than the auto-configured builder bean for the same reason: a customizer contributed elsewhere in the context
-// cannot reach a builder that was never exposed to one. fx/CurrencyConversionTest mutates this very bean and
-// asserts the recorded request carries no credential header, so the guarantee is checked and not merely stated.
-/** Publishes the single bounded, header-free HTTP client used for the outbound exchange-rate lookup. */
+/**
+ * Publishes the single bounded, header-free HTTP client used for the outbound exchange-rate lookup, the rate lookup
+ * itself and its {@code ExchangeRateSource} bean staying in {@code fx}.
+ */
 @Configuration
 public class FxClientConfig {
+
+    /**
+     * Hard ceiling on the bytes accepted from the exchange-rate endpoint, enforced before anything is bound.
+     *
+     * <p>A timeout bounds how long a third party may keep a request thread; it does nothing about how much that
+     * third party may make this process allocate. The answer is deserialized into a {@code Map} of rates, so an
+     * endpoint that has been compromised, misrouted or merely replaced by an error page of another shape can drive
+     * heap consumption from the outside - the remote-resource-exhaustion class of CWE-400. 64 KiB is roughly a
+     * hundred times the largest legitimate answer (the whole published set is under a kilobyte, a single pair
+     * under a hundred bytes), so it can only ever reject an answer that is already not the contract.
+     *
+     * <p>Deliberately a constant and not a property: it is a safety ceiling rather than a tuning knob, and an
+     * operator raising it through relaxed binding would remove the bound at the moment it mattered. Public so
+     * {@code fx/CurrencyConversionTest}, which lives in another package, asserts the limit rather than a copy
+     * of it.
+     */
+    public static final int MAX_RESPONSE_BYTES = 64 * 1024;
 
     /**
      * The one {@link RestClient} bean in the application context, named so that injection by type, by name and by
@@ -58,27 +48,20 @@ public class FxClientConfig {
      */
     @Bean
     public RestClient fxRestClient(CashAccountProperties properties) {
-        // One budget, applied to both phases of the call, because either one can hang alone: a connect that never
-        // completes and a response that never arrives are the same outage from the caller's seat. Read once so the
-        // two can never drift apart. The value is configuration with an internal default and no environment
-        // binding in the chart template, so retuning it needs relaxed binding (CASHACCOUNT_FX_TIMEOUT) and never a
-        // template change; its validated lower bound makes it non-null and positive here.
-        //
-        // Bounding it is not tidiness. Readiness deliberately excludes the exchange-rate endpoint so that a
-        // third-party outage never flaps pods, and an unbounded wait would defeat that from the other side by
-        // parking request threads until the pool is gone - turning someone else's outage into ours. Bounded, the
-        // failure surfaces as 503 EXCHANGE_RATE_UNAVAILABLE with Retry-After: 5, the balance untouched and no
-        // ledger row written. That is a deliberate improvement on the program being replaced, which ran its
-        // COMPUTE and UPDATE even after the rate SELECT found no row and let the UPDATE's SQLCODE 0 mask it,
-        // committing a balance derived from an uninitialized RATES host variable under a success code
-        // [backend/cash-account-cobol/COBOL/CASH00.cbl:L214-L231; backend/cash-account-cobol/COBOL/DCLFRANK.cpy:L22].
+        // One budget for both phases, read once so the two can never drift: a connect that never completes and a
+        // response that never arrives are the same outage from the caller's seat. Readiness deliberately excludes
+        // the FX endpoint so a third-party outage never flaps pods, and an unbounded wait would defeat that from
+        // the other side by parking request threads; bounded, the failure surfaces as 503
+        // EXCHANGE_RATE_UNAVAILABLE with the balance untouched, where the legacy program ran its COMPUTE and UPDATE
+        // even after the rate SELECT found no row [backend/cash-account-cobol/COBOL/CASH00.cbl:L214-L231].
         Duration timeout = properties.getFx().getTimeout();
 
-        // Redirects are followed because the endpoint the chart ships answers one: the configured default
-        // api.frankfurter.app/latest returns 301 to its api.frankfurter.dev/v1 host, and the JDK client declines
-        // redirects unless asked, which would turn every cross-currency conversion into a rate failure. NORMAL
-        // rather than ALWAYS so a redirect from HTTPS down to HTTP is refused instead of quietly downgrading the
-        // hop. Retuning the URL is a chart value change, so this client must cope with the value as shipped.
+        // The endpoint the chart ships answers a redirect - api.frankfurter.app/latest returns 301 to
+        // api.frankfurter.dev/v1 - and the JDK client declines redirects unless asked, which would turn every
+        // cross-currency conversion into a rate failure. NORMAL rather than ALWAYS is the security half of that
+        // choice and must stay: it refuses a redirect from HTTPS down to HTTP, so the HTTPS-only endpoint
+        // fx/FrankfurterExchangeRateClient enforces at start-up cannot be walked back to plaintext by a hop the
+        // operator never configured.
         HttpClient httpClient = HttpClient.newBuilder()
                 .followRedirects(HttpClient.Redirect.NORMAL)
                 .connectTimeout(timeout)
@@ -87,6 +70,143 @@ public class FxClientConfig {
         JdkClientHttpRequestFactory requestFactory = new JdkClientHttpRequestFactory(httpClient);
         requestFactory.setReadTimeout(timeout);
 
-        return RestClient.builder().requestFactory(requestFactory).build();
+        // Broker propagates the caller's credential into this service
+        // [backend/broker/src/main/resources/META-INF/microprofile-config.properties:L1] and the public FX provider
+        // requires none, so no default header is attached and the plain builder is used rather than the
+        // auto-configured one, which a customizer contributed elsewhere in the context could reach. No base URL
+        // either: the chart supplies the endpoint as CURRENCY_API_URL and the client sends it as an absolute URI.
+        // The one interceptor exists to take something away rather than add anything: it sets no header and reads
+        // nothing of the request, so no credential can be attached here; it bounds the response before a message
+        // converter sees it, which no timeout can do (see MAX_RESPONSE_BYTES).
+        return RestClient.builder()
+                .requestFactory(requestFactory)
+                .requestInterceptor((request, body, execution) ->
+                        new SizeBoundedResponse(execution.execute(request, body), MAX_RESPONSE_BYTES))
+                .build();
+    }
+
+    // Both body framings are covered, because either alone leaves the hole open: a declared Content-Length above
+    // the ceiling is refused before a single byte is read, and a body that declares nothing - chunked, or
+    // delimited by connection close - is metered as it is consumed. The stream bound also catches a response that
+    // declares a small length and then sends more, which is precisely what a hostile endpoint would do.
+    private static final class SizeBoundedResponse implements ClientHttpResponse {
+
+        private final ClientHttpResponse delegate;
+        private final long maxBytes;
+        private InputStream boundedBody;
+
+        private SizeBoundedResponse(ClientHttpResponse delegate, long maxBytes) {
+            this.delegate = delegate;
+            this.maxBytes = maxBytes;
+        }
+
+        // Cached rather than wrapped afresh on each call: Spring introspects the body for emptiness before handing
+        // it to a converter, so a second wrapper would restart the count and the ceiling would apply per call
+        // instead of per response.
+        @Override
+        public InputStream getBody() throws IOException {
+            if (boundedBody == null) {
+                long declared = delegate.getHeaders().getContentLength();
+                if (declared > maxBytes) {
+                    throw oversize(HttpHeaders.CONTENT_LENGTH + " " + declared, maxBytes);
+                }
+                boundedBody = new SizeBoundedBody(delegate.getBody(), maxBytes);
+            }
+            return boundedBody;
+        }
+
+        @Override
+        public HttpStatusCode getStatusCode() throws IOException {
+            return delegate.getStatusCode();
+        }
+
+        @Override
+        public String getStatusText() throws IOException {
+            return delegate.getStatusText();
+        }
+
+        @Override
+        public HttpHeaders getHeaders() {
+            return delegate.getHeaders();
+        }
+
+        @Override
+        public void close() {
+            delegate.close();
+        }
+    }
+
+    private static final class SizeBoundedBody extends FilterInputStream {
+
+        private final long maxBytes;
+        private long consumed;
+        private long markedAt;
+
+        private SizeBoundedBody(InputStream body, long maxBytes) {
+            super(body);
+            this.maxBytes = maxBytes;
+        }
+
+        @Override
+        public int read() throws IOException {
+            int value = in.read();
+            if (value != -1) {
+                meter(1);
+            }
+            return value;
+        }
+
+        // FilterInputStream.read(byte[]) delegates to this method on `this`, so both array forms are metered here.
+        @Override
+        public int read(byte[] buffer, int offset, int length) throws IOException {
+            int count = in.read(buffer, offset, length);
+            if (count > 0) {
+                meter(count);
+            }
+            return count;
+        }
+
+        @Override
+        public long skip(long count) throws IOException {
+            long skipped = in.skip(count);
+            if (skipped > 0) {
+                meter(skipped);
+            }
+            return skipped;
+        }
+
+        // Rewinding rewinds the meter too, so the ceiling stays a property of the response rather than of how many
+        // times something peeked at it: Spring checks whether the body is empty before handing it to a converter,
+        // and on a markable stream that check reads a byte and resets.
+        @Override
+        public synchronized void mark(int readLimit) {
+            in.mark(readLimit);
+            markedAt = consumed;
+        }
+
+        @Override
+        public synchronized void reset() throws IOException {
+            in.reset();
+            consumed = markedAt;
+        }
+
+        private void meter(long count) {
+            consumed += count;
+            if (consumed > maxBytes) {
+                throw oversize("read " + consumed + " bytes", maxBytes);
+            }
+        }
+    }
+
+    // A RestClientException and deliberately not an IOException, because the two are read differently one layer
+    // up: fx/FrankfurterExchangeRateClient retries a ResourceAccessException - Spring's wrapper for an I/O fault,
+    // the only failure a second attempt could change - and treats a RestClientException as the settled, no-retry
+    // outcome it maps to 503 EXCHANGE_RATE_UNAVAILABLE. An oversize answer is settled: retrying it would read the
+    // same flood twice and report it as an unreachable endpoint. Spring re-throws a RestClientException raised
+    // during conversion unchanged, which is what keeps that distinction intact. The message names the limit and
+    // the observed size and never the endpoint or any response content.
+    private static RestClientException oversize(String observed, long maxBytes) {
+        return new RestClientException("exchange-rate answer exceeds the " + maxBytes + " byte limit (" + observed
+                + "); no rate was bound");
     }
 }

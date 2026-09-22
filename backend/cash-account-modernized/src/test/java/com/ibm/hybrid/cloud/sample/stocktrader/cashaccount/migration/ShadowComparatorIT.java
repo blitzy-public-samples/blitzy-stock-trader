@@ -1,29 +1,20 @@
-/*
-       Copyright 2025 Kyndryl, All Rights Reserved
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
- */
-
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.migration;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.fail;
 import static org.assertj.core.api.Assertions.tuple;
 
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.EntityManagerFactory;
+
+import java.io.BufferedWriter;
+import java.io.IOException;
 import java.math.BigDecimal;
 import java.net.URISyntaxException;
 import java.net.URL;
 import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.FileSystemNotFoundException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -35,6 +26,7 @@ import java.util.UUID;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.DefaultApplicationArguments;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -43,6 +35,7 @@ import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Primary;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.mock.env.MockEnvironment;
 
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.fx.ExchangeRateSource;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.fx.LegacyRateTableSource;
@@ -59,40 +52,20 @@ import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.persistence.CashAccou
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.persistence.LegacyRateTableRepository;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.persistence.MigrationReconciliationRepository;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.persistence.MigrationRunRepository;
-import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.support.MigrationReconciliationTestQueries;
+import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.retail.RetailCashAccountService;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.support.PostgresTestSupport;
 
-/*
- * FIXTURES ONLY, AND THAT IS A PROHIBITION RATHER THAN A CONVENIENCE (AAP 0.3.1-0.3.2, 0.10.6). "Do not run the
- * dual-run mechanism against the live legacy system": this class replays the two committed synthetic captures under
- * src/test/resources/fixtures/shadow and nothing else. It opens no connection to DB2 for z/OS, reads no VSAM data
- * set, speaks to no CICS region, and its passing proves nothing about production traffic. A live shadow window needs
- * capture infrastructure, sign-off and a rollback plan that belong to docs/operational-runbook.md step 2, which this
- * deliverable documents and deliberately does not execute.
- *
- * WHY THE "tool" PROFILE STAYS OFF even though this exercises the tooling. migration/MigrationToolRunner is an
- * ApplicationRunner carrying @Profile("tool"), @SpringBootTest executes runners, and the runner ends in
- * System.exit(SpringApplication.exit(...)) - so activating the profile would terminate the Failsafe JVM mid-suite
- * and report as an infrastructure failure rather than a test result. ShadowComparator and LegacyLoader are
- * deliberately un-profiled for exactly this reason, so the comparator is driven directly and the run row's verdict
- * is written here, the way the runner writes it.
- *
- * WHY EXACTLY TWO TESTS. AAP 0.7.6 caps the reconciliation-against-characterization group at six tests across four
- * classes and allocates this file two of them: matched -> zero rows, seeded -> exactly the seeded rows. Exploratory
- * cases, parameterized matrices and redundant variants are not to be generated. Two evidence-integrity regressions
- * found in code review are asserted as further phases INSIDE the seeded scenario rather than as tests of their own,
- * because neither is reachable from a committed fixture - the fixture contract requires every success line to carry
- * a balance, and no fixture can make a window fail while recording a finding - and the allocation is frozen.
+/**
+ * Proves the dual-run comparator on the committed shadow captures alone (AAP 0.3.1-0.3.2, 0.10.6), and that its
+ * evidence survives a lost window.
  */
-/** Proves the dual-run comparator on the committed shadow captures, and that its evidence survives a lost window. */
-// NONE, not MOCK: the comparator replays through the service layer and never over HTTP (AAP 0.8.2), so a servlet
-// context and a mock dispatcher would add moving parts to a comparison that does not involve them.
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE,
         properties = {
-                // MANDATORY here, not inherited: ShadowComparator binds tool.rate-source with @Value, and
-                // application-test.yml owns no tool.* key (application-tool.yml does, and the tool profile is off
-                // above). legacy-table is the AAP 0.12.5 parity gate - both sides priced from the same staged RATES -
-                // so a balance difference cannot be a rate difference and no RATE_SOURCE row can arise.
+                // Mandatory here rather than inherited: ShadowComparator binds tool.rate-source with @Value and
+                // application-test.yml owns no tool.* key, the tool profile staying off because
+                // MigrationToolRunner's System.exit(SpringApplication.exit(...)) would end the Failsafe JVM.
+                // legacy-table is the AAP 0.12.5 parity gate - both sides priced from the same staged RATES - so a
+                // balance difference cannot be a rate difference and no RATE_SOURCE row can arise.
                 "tool.rate-source=legacy-table"
         })
 class ShadowComparatorIT extends PostgresTestSupport {
@@ -111,8 +84,20 @@ class ShadowComparatorIT extends PostgresTestSupport {
     /** A zero return code, which is what the legacy status channel rendered for a successful request. */
     private static final String SUCCESS_RETCODE = "000000000";
 
-    /** {@code migration_run.source_path} for the one window built in memory rather than read from a fixture. */
+    /** {@code migration_run.source_path} for the windows built in memory rather than read from a fixture. */
     private static final String IN_MEMORY_WINDOW = "in-memory capture (no fixture shape carries it)";
+
+    // The GBP rate the live-mode phase stages under the batch's COMPLETED load, deliberately different from the
+    // corpus rate of 0.79 the replay is priced at, so the two sides differ by an amount only this row
+    // re-derives. Two decimals because RATES is DECIMAL(3,2) (DB2DDL.jcl:L58; DCLFRANK.cpy:L12).
+    private static final BigDecimal COMPLETED_LOAD_GBP_RATE = new BigDecimal("0.50");
+
+    // credit(123456.78, 0.50, 100.00) = 123506.78, the legacy COMPUTE of CASH00.cbl:L222 applied to GREG's
+    // corpus balance at the rate above. Stated as text because a double cannot hold it exactly (AAP 0.7.1).
+    private static final BigDecimal CAPTURED_GBP_BALANCE = new BigDecimal("123506.78");
+
+    /** GREG's balance after the same credit priced at the corpus rate of 0.79, which is what the target replays. */
+    private static final BigDecimal TARGET_GBP_BALANCE = new BigDecimal("123535.78");
 
     @Autowired
     private ShadowComparator shadowComparator;
@@ -123,14 +108,15 @@ class ShadowComparatorIT extends PostgresTestSupport {
     @Autowired
     private MigrationRunRepository migrationRuns;
 
-    // Two views of one table: the production repository is what the runner is built with, because its failure
-    // accounting reads the rows a command left behind; the test-only finders below are how this class asserts
-    // over them, so no query that exists only for a test sits on the production interface.
+    // The runner is built with the production repository because its failure accounting reads the rows a command
+    // left behind, and its shipped read is a COUNT; the row-returning reads this class asserts over are JPQL below,
+    // so no query that exists only for a test sits on the production interface or beside it (AAP 0.6.1 fixes the
+    // test-support file list at three).
     @Autowired
     private MigrationReconciliationRepository reconciliationRepository;
 
     @Autowired
-    private MigrationReconciliationTestQueries reconciliations;
+    private EntityManagerFactory entityManagers;
 
     @Autowired
     private CashAccountRepository accounts;
@@ -141,8 +127,12 @@ class ShadowComparatorIT extends PostgresTestSupport {
     @Autowired
     private ReconciliationService reconciliationService;
 
-    // The context the runner is handed. It uses it only in run(...), which this class never calls, but the
-    // constructor requires it - and a @SpringBootTest context IS a ConfigurableApplicationContext.
+    // Injected only so the live-mode phase below can build a comparator of its own; every other replay in this
+    // class goes through the context's comparator.
+    @Autowired
+    private RetailCashAccountService retailService;
+
+    // Handed to the runner because its constructor requires it, though only run(...) - never called here - uses it.
     @Autowired
     private ConfigurableApplicationContext applicationContext;
 
@@ -152,27 +142,21 @@ class ShadowComparatorIT extends PostgresTestSupport {
     @Autowired
     private StagedLegacyRateSource stagedRates;
 
-    // The drift guard AAP 0.10.1 requires of the reconciliation classes: the fixtures' expected values are derived
-    // from the characterization document's formula, so a run against a missing or gutted document would be asserting
-    // arithmetic whose authority no longer exists.
+    // The drift guard of AAP 0.10.1: the fixtures' expected values come from the characterization document's
+    // formula, so a run against a missing or gutted document would assert arithmetic with no authority behind it.
     @BeforeAll
     static void characterizationDocumentIsPresent() {
         CharacterizationDocPresentTest.requireCharacterizationDocument();
     }
 
-    /**
-     * Restores the corpus, the staged rates and an empty findings table before each replay.
-     */
-    // ledger_entry IS DELIBERATELY ABSENT FROM THIS RESET. The trigger ledger_entry_immutable rejects every UPDATE
-    // and DELETE (schema/cash-account-schema.sql), which is the audit guarantee of AAP 0.7.4 and not an obstacle to
-    // work around - so the replay's CREDIT/DEBIT/ACCOUNT_* rows accumulate across tests and across the sibling *IT
-    // classes sharing this JVM-wide container. That is harmless because every assertion below is scoped by run_id or
-    // by owner and none counts ledger rows. Each reset therefore takes a FRESH run id, which also satisfies the
+    // ledger_entry is deliberately absent from this reset: the ledger_entry_immutable trigger rejects every UPDATE
+    // and DELETE (schema/cash-account-schema.sql), the audit guarantee of AAP 0.7.4 rather than an obstacle to work
+    // around, so replay rows accumulate across the classes sharing this JVM-wide container. Harmless because every
+    // assertion below is scoped by run id or owner, and each reset takes a fresh run id, which also satisfies the
     // partial unique index uq_ledger_entry_migration_load on (run_id, owner).
     @BeforeEach
     void restoreStartingState() {
-        // FK-safe order: migration_reconciliation.run_id references migration_run
-        // (fk_migration_reconciliation_run); nothing else here is referenced by anything.
+        // FK-safe order: migration_reconciliation.run_id references migration_run.
         jdbcTemplate.update("DELETE FROM migration_reconciliation");
         jdbcTemplate.update("DELETE FROM migration_run");
         jdbcTemplate.update("DELETE FROM legacy_history");
@@ -184,10 +168,9 @@ class ShadowComparatorIT extends PostgresTestSupport {
         MigrationRun corpusLoad = migrationRuns.save(MigrationRun.start(UUID.randomUUID(), UUID.randomUUID(),
                 MigrationRun.Mode.LOAD, corpus.toString(), MigrationRun.CharacterizationStatus.DRAFT));
 
-        // The accounts and rates are named explicitly rather than through LoadSources.inDirectory, which would also
-        // resolve the history.cp037.bin this fixture directory carries and then demand tool.history-record-length -
-        // a property no shadow window needs, since a capture stream is what this class replays rather than the
-        // legacy audit file. The charset and zone are consequently inert, and are the tool's own defaults.
+        // Named explicitly rather than through LoadSources.inDirectory, which would resolve the history.cp037.bin
+        // this directory carries and then demand tool.history-record-length - a property no shadow window needs,
+        // since what this class replays is a capture stream and not the legacy audit file.
         LegacyLoader.LoadResult loaded = legacyLoader.load(corpusLoad,
                 new LegacyLoader.LoadSources(corpus.resolve(LegacyExportFormat.CASH_ACCOUNT_FILE),
                         corpus.resolve(LegacyExportFormat.RATE_TABLE_FILE), null, null),
@@ -204,13 +187,11 @@ class ShadowComparatorIT extends PostgresTestSupport {
                 .as("the staged USD/EUR/GBP rates are what the cross-currency replays are priced from")
                 .hasSize(CORPUS_RATES);
 
-        // WHY A STAGED RATE SOURCE IS WIRED IN AT ALL. RetailCashAccountService injects ExchangeRateSource, and in
-        // profile test the only bean is the live FrankfurterExchangeRateClient pointed at the refused port
-        // 127.0.0.1:1 (application-test.yml) - so the GREG (GBP) and ERIC (EUR) replays would come back
-        // 503 EXCHANGE_RATE_UNAVAILABLE and the matched window would report rejections instead of parity. Parity
-        // also has to be judged on the very RATES the legacy arithmetic used (AAP 0.12.5), which is these staged
-        // rows, and no test may reach the public exchange-rate API. The run is handed over per reset because the
-        // rows belong to this load alone.
+        // A staged rate source is wired in because profile test's only ExchangeRateSource bean is the live client
+        // pointed at the refused port 127.0.0.1:1 (application-test.yml), so the GREG (GBP) and ERIC (EUR) replays
+        // would return 503 EXCHANGE_RATE_UNAVAILABLE and the matched window would report rejections instead of
+        // parity - and parity must anyway be judged on the very RATES the legacy arithmetic used (AAP 0.12.5),
+        // with no test reaching the public API. The run is handed over per reset, the rows belonging to this load.
         stagedRates.useStagingRun(corpusLoad.runId());
     }
 
@@ -228,15 +209,15 @@ class ShadowComparatorIT extends PostgresTestSupport {
                         + "legacy request codes A/Q/U/X/C/D (CASH00.cbl:L89-L102)", MATCHED_SHADOW_FIXTURES)
                 .isZero();
 
-        // The whole row set for the run, not just its VARIANCE rows: an agreeing capture line gets no row at all -
-        // not even a MATCHED one - so "no rows" is the entire assertion and an invented row of any status fails it.
-        assertThat(reconciliations.findByRunIdOrderByReconciliationIdAsc(runId))
+        // The whole row set, not just its VARIANCE rows: an agreeing capture line gets no row at all, not even a
+        // MATCHED one, so an invented row of any status fails this.
+        assertThat(findingsOfRun(runId))
                 .as("a clean window records nothing")
                 .isEmpty();
-        assertThat(reconciliations.countByRunIdAndStatus(runId, ReconciliationStatus.VARIANCE)).isZero();
+        assertThat(reconciliationRepository.countByRunIdAndStatus(runId, ReconciliationStatus.VARIANCE)).isZero();
 
-        // The comparator sets the three counts through setters and deliberately neither saves nor finishes the run;
-        // closing it is the runner's job, reproduced here so the persisted verdict is asserted rather than assumed.
+        // The comparator neither saves nor finishes the run - closing it is the runner's job, reproduced here so
+        // the persisted verdict is asserted rather than assumed.
         assertThat(run.legacyRecordCount()).isEqualTo(10);
         assertThat(run.migratedRecordCount()).isEqualTo(10);
         assertThat(run.varianceCount()).isZero();
@@ -250,10 +231,9 @@ class ShadowComparatorIT extends PostgresTestSupport {
         assertThat(closed.status()).isEqualTo(MigrationRun.Status.CLEAN);
         assertThat(closed.varianceCount()).isZero();
 
-        // Target state moved, rather than the comparator merely declining to find fault: KARRI's debit, GREG's
-        // cross-rate credit at the staged 0.79 and ERIC's sub-cent debit at 0.92 all landed, and RAUNAK survived the
-        // X-then-A pair at seq 8/9 - ordered that way in the fixture because RAUNAK is already in the corpus, so a
-        // create before the delete would collide (409/-803) and destroy the zero-variance guarantee.
+        // Target state moved, rather than the comparator merely declining to find fault. RAUNAK's X-then-A pair at
+        // seq 8/9 is ordered that way in the fixture because RAUNAK is already in the corpus, so a create before
+        // the delete would collide (409/-803) and destroy the zero-variance guarantee.
         assertThat(balanceOf("KARRI")).isEqualByComparingTo(new BigDecimal("12000.00"));
         assertThat(balanceOf("GREG")).isEqualByComparingTo(new BigDecimal("123535.78"));
         assertThat(balanceOf("ERIC")).isEqualByComparingTo(new BigDecimal("1234567.61"));
@@ -263,12 +243,52 @@ class ShadowComparatorIT extends PostgresTestSupport {
     }
 
     /**
-     * The seeded window's evidence, in three phases: the three seeded rows and nothing else, then the two
-     * conditions a committed fixture cannot express - a capture line with no balance on the legacy side, and a
-     * window lost while recording a finding.
+     * A captured window larger than the declared limit: refused naming the limit, with no evidence row written.
      */
-    // Phases rather than separate tests because AAP 0.7.6 allocates this file two, and each phase takes its own
-    // fresh run id, so no phase's row set can disturb another's.
+    // compare(run, directory) reads both captures into lists, which is right for a window an operator reviews row
+    // by row at runbook Step 2 and wrong for anything larger: an unbounded read of a mis-transferred bulk export
+    // would exhaust the tool JVM instead of saying which file to split (CWE-400). A test of its own rather than a
+    // phase of the seeded scenario because no committed fixture may carry an oversized window. The row count is
+    // taken from LegacyExportFormat.MAX_WINDOW_RECORDS so the test moves with the limit.
+    @Test
+    void refusesACapturedWindowLargerThanTheDeclaredLimit(@TempDir Path window) throws IOException {
+        Path transactionsFile = window.resolve(LegacyExportFormat.SHADOW_TRANSACTIONS_FILE);
+        try (BufferedWriter capture = Files.newBufferedWriter(transactionsFile, StandardCharsets.UTF_8)) {
+            capture.write(String.join(",", LegacyExportFormat.SHADOW_TRANSACTION_COLUMNS));
+            capture.write("\n");
+            // One line past the limit, so the refusal is the limit itself rather than any property of a row: every
+            // line is a well-formed Q read of an owner the corpus holds, with no amount and no currency.
+            for (int seq = 1; seq <= LegacyExportFormat.MAX_WINDOW_RECORDS + 1; seq++) {
+                capture.write(seq + ",JOHN,Q,,\n");
+            }
+        }
+
+        // Required by the window's contract and deliberately header-only: the transactions capture is read first,
+        // so no reply of this file is ever reached and inventing content for them would assert nothing.
+        Files.writeString(window.resolve(LegacyExportFormat.SHADOW_LEGACY_RESPONSES_FILE),
+                String.join(",", LegacyExportFormat.SHADOW_LEGACY_RESPONSE_COLUMNS) + "\n");
+
+        UUID runId = UUID.randomUUID();
+        MigrationRun run = migrationRuns.save(MigrationRun.start(runId, UUID.randomUUID(),
+                MigrationRun.Mode.SHADOW, window.toString(), MigrationRun.CharacterizationStatus.DRAFT));
+
+        // The real path, because that is the contained path the comparator resolves the capture to and names.
+        Path refusedCapture = window.toRealPath().resolve(LegacyExportFormat.SHADOW_TRANSACTIONS_FILE);
+        assertThatThrownBy(() -> shadowComparator.compare(run, window))
+                .as("an oversized capture is an input error that names the file and the limit, never a variance")
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining(refusedCapture.toString())
+                .hasMessageContaining(String.valueOf(LegacyExportFormat.MAX_WINDOW_RECORDS));
+
+        assertThat(findingsOfRun(runId))
+                .as("a window refused before its first replay records nothing under the run")
+                .isEmpty();
+    }
+
+    /**
+     * The seeded window's evidence in three phases - the seeded rows, then the two conditions no committed fixture
+     * can express - phased rather than split because AAP 0.7.6 allocates this file two tests.
+     */
     @Test
     void seededStreamProducesExactlyTheThreeSeededRows() {
         Path window = fixtureDirectory(SEEDED_SHADOW_FIXTURES);
@@ -279,15 +299,15 @@ class ShadowComparatorIT extends PostgresTestSupport {
         int variances = shadowComparator.compare(run, window);
 
         // Two, not three: RAUNAK's row is an ACCEPTED_EXCEPTION, and only VARIANCE feeds variance_count and the
-        // exit code - collapsing the two would make every characterized legacy quirk look like a migration defect.
+        // exit code, because collapsing the two would make a characterized legacy quirk look like a defect.
         assertThat(variances)
                 .as("the seeded window's two outstanding differences are JOHN's balance and RYAN's count")
                 .isEqualTo(2);
 
-        List<MigrationReconciliation> rows = reconciliations.findByRunIdOrderByReconciliationIdAsc(runId);
+        List<MigrationReconciliation> rows = findingsOfRun(runId);
 
-        // Size first, over the FULL row set for the run: a missing row means the comparator has a hole in it and a
-        // fourth means it invented one, and AAP 0.10.3 fixes this set at exactly three.
+        // Over the run's full row set, which AAP 0.10.3 fixes at exactly three: a missing row is a hole in the
+        // comparator and a fourth is one it invented.
         assertThat(rows)
                 .as("exactly the three seeded rows of %s/MANIFEST.md, and nothing else", SEEDED_SHADOW_FIXTURES)
                 .hasSize(3);
@@ -299,9 +319,8 @@ class ShadowComparatorIT extends PostgresTestSupport {
                         tuple("RAUNAK", VarianceKind.REJECTED_BY_TARGET, ReconciliationStatus.ACCEPTED_EXCEPTION),
                         tuple("RYAN", VarianceKind.TRANSACTION_COUNT, ReconciliationStatus.VARIANCE));
 
-        // JOHN: the request is byte-identical to the matched window's, and only the captured reply differs - the
-        // cleanest possible balance seed. variance = migrated - legacy is the module-wide convention, so the target
-        // holding a dime less than the reply claimed is -0.10 and not +0.10.
+        // JOHN's request is byte-identical to the matched window's and only the captured reply differs. Under the
+        // module-wide convention variance = migrated - legacy, a target holding a dime less reads -0.10.
         MigrationReconciliation john = row(rows, "JOHN", VarianceKind.BALANCE);
         assertThat(john.legacyBalance()).isEqualByComparingTo(new BigDecimal("1250.60"));
         assertThat(john.migratedBalance()).isEqualByComparingTo(new BigDecimal("1250.50"));
@@ -310,11 +329,10 @@ class ShadowComparatorIT extends PostgresTestSupport {
         assertThat(john.legacyValue()).isEqualTo("1250.60");
         assertThat(john.migratedValue()).isEqualTo("1250.50");
 
-        // RAUNAK: 100.00 - 1.00 x 150.00 is raw -50.00, which the unsigned WS-CALC PIC 9(7)V99 stored as its
+        // RAUNAK's 100.00 - 1.00 x 150.00 is raw -50.00, which the unsigned WS-CALC PIC 9(7)V99 stored as its
         // absolute value 50.00 (CASH00.cbl:L17 field, L255-L256 COMPUTE). The target refuses the over-debit with
-        // 422 INSUFFICIENT_FUNDS - the deliberate behavioural improvement the user authorized (AAP 0.4.6, 0.14.2) -
-        // so the row is evidence of an authorized deviation, which is why it is an ACCEPTED_EXCEPTION and not a
-        // defect. Nothing is asserted about a migrated balance: the target wrote none.
+        // 422 INSUFFICIENT_FUNDS, the authorized behavioural deviation of AAP 0.4.6 and 0.14.2, so the row is an
+        // ACCEPTED_EXCEPTION rather than a defect and the target wrote no migrated balance to assert.
         MigrationReconciliation raunak = row(rows, "RAUNAK", VarianceKind.REJECTED_BY_TARGET);
         assertThat(raunak.legacyValue()).isEqualTo("50.00");
         assertThat(raunak.legacyBalance()).isEqualByComparingTo(new BigDecimal("50.00"));
@@ -325,11 +343,10 @@ class ShadowComparatorIT extends PostgresTestSupport {
                 .as("a refused debit leaves the balance exactly as the corpus load left it")
                 .isEqualByComparingTo(new BigDecimal("100.00"));
 
-        // RYAN: the seed is the reply at seq 7 that no transaction pairs with. The comparator joins on seq plus the
-        // normalized owner rather than on file order - EBCDIC and UTF-8 collate differently (AAP 0.12.2), so an
-        // ordinal pairing would compare unrelated lines - which is what lets an unpaired successful reply count
-        // toward the legacy total without being replayed: five counted replies against four replayed transactions.
-        // A target shortfall cannot be explained by the DUPREC lower bound (CASH00.cbl:L124), hence VARIANCE.
+        // RYAN's seed is the reply at seq 7 that no transaction pairs with. The comparator joins on seq plus the
+        // normalized owner rather than file order - EBCDIC and UTF-8 collate differently (AAP 0.12.2) - which is
+        // what lets an unpaired successful reply count toward the legacy total without being replayed. A target
+        // shortfall cannot be explained by the DUPREC lower bound (CASH00.cbl:L124), hence VARIANCE.
         MigrationReconciliation ryan = row(rows, "RYAN", VarianceKind.TRANSACTION_COUNT);
         assertThat(ryan.legacyValue()).isEqualTo("5");
         assertThat(ryan.migratedValue()).isEqualTo("4");
@@ -338,9 +355,9 @@ class ShadowComparatorIT extends PostgresTestSupport {
         assertThat(ryan.migratedBalance()).isNull();
         assertThat(ryan.variance()).isNull();
 
-        // The absences the row set encodes, asserted rather than inferred from the size alone: KARRI, GREG and ERIC
-        // are untouched by this stream; RAUNAK's refused line still counts as processed, so its counts agree at 1/1
-        // and it gets no TRANSACTION_COUNT row; and no RATE_SOURCE row can arise under tool.rate-source=legacy-table.
+        // The absences asserted rather than inferred from the size: RAUNAK's refused line still counts as
+        // processed, so its counts agree at 1/1 and it gets no TRANSACTION_COUNT row, and no RATE_SOURCE row can
+        // arise under tool.rate-source=legacy-table.
         assertThat(rows).extracting(MigrationReconciliation::owner)
                 .doesNotContain("KARRI", "GREG", "ERIC");
         assertThat(rows)
@@ -363,32 +380,29 @@ class ShadowComparatorIT extends PostgresTestSupport {
         migrationRuns.save(run);
 
         MigrationRun closed = requireRun(runId);
-        // VARIANCE with variance_count 2 is what MigrationToolRunner turns into exit code 2. The third row raises
-        // neither, deliberately: an accepted exception is recorded for the evidence trail and never counted.
+        // VARIANCE with variance_count 2 is what MigrationToolRunner turns into exit code 2; the third row raises
+        // neither, an accepted exception being recorded for the evidence trail and never counted.
         assertThat(closed.status()).isEqualTo(MigrationRun.Status.VARIANCE);
         assertThat(closed.varianceCount()).isEqualTo(2);
-        assertThat(reconciliations.countByRunIdAndStatus(runId, ReconciliationStatus.ACCEPTED_EXCEPTION))
+        assertThat(reconciliationRepository.countByRunIdAndStatus(runId, ReconciliationStatus.ACCEPTED_EXCEPTION))
                 .isEqualTo(1);
 
         malformedCaptureIsRecordedWithAnExplicitAbsenceToken();
         lostWindowKeepsItsProgressAndItsCommittedFindings();
+        liveExplanationResolvesTheBatchsCompletedLoadAndNotANewerRunningOne();
     }
 
     /**
-     * A success reply that carried no balance: the row must name the absent side rather than leave it blank.
+     * A success reply that carried no balance: the row must name the absent side rather than leave it blank, a
+     * shape no fixture can carry because the fixture contract requires every success line to carry a balance.
      */
-    // Part of the seeded scenario rather than a test of its own, because AAP 0.7.6 allocates this file two tests
-    // and this shape cannot come from a fixture: the fixture contract requires every success line to carry a
-    // balance, so the capture is built in memory through the comparator's own in-memory entry point. Its run id is
-    // fresh, so the row set asserted above is unaffected.
     private void malformedCaptureIsRecordedWithAnExplicitAbsenceToken() {
         UUID runId = UUID.randomUUID();
         MigrationRun run = migrationRuns.save(MigrationRun.start(runId, UUID.randomUUID(),
                 MigrationRun.Mode.SHADOW, IN_MEMORY_WINDOW, MigrationRun.CharacterizationStatus.DRAFT));
 
-        // A Q read of an owner the corpus holds, paired with a reply that claims success (a zero retcode,
-        // CASH00.cbl:L104) and states no balance at all - so the target answers with the account's balance and the
-        // legacy side offers nothing to compare it against.
+        // A Q read of an owner the corpus holds, paired with a reply claiming success (a zero retcode,
+        // CASH00.cbl:L104) that states no balance, so the legacy side offers nothing to compare against.
         BigDecimal targetBalance = balanceOf("JOHN");
         int variances = shadowComparator.compare(run,
                 List.of(new ShadowTransaction(1L, "JOHN", "Q", null, null)),
@@ -398,7 +412,7 @@ class ShadowComparatorIT extends PostgresTestSupport {
                 .as("a comparison with nothing on the legacy side fails closed as one outstanding variance")
                 .isEqualTo(1);
 
-        List<MigrationReconciliation> rows = reconciliations.findByRunIdOrderByReconciliationIdAsc(runId);
+        List<MigrationReconciliation> rows = findingsOfRun(runId);
         assertThat(rows)
                 .as("one row for the malformed line, and no TRANSACTION_COUNT row: Q changed no state, so it is"
                         + " counted on neither side")
@@ -406,10 +420,8 @@ class ShadowComparatorIT extends PostgresTestSupport {
 
         MigrationReconciliation absent = row(rows, "JOHN", VarianceKind.BALANCE);
         assertThat(absent.status()).isEqualTo(ReconciliationStatus.VARIANCE);
-        // The point of the row: an absent side is NAMED. Without the token the finding would carry a null
-        // legacy_value beside a null legacy_balance and a null variance, which is indistinguishable from a
-        // comparison the tooling failed to complete - and an operator reviewing the window's rows could neither
-        // triage it nor trace it back to the capture that is malformed.
+        // The absent side is named: without the token the finding would carry a null legacy_value beside a null
+        // balance and a null variance, indistinguishable from a comparison the tooling failed to complete.
         assertThat(absent.legacyValue()).isEqualTo(MigrationReconciliation.ABSENT_IN_CAPTURE);
         assertThat(absent.legacyBalance())
                 .as("no balance may be invented for a side that stated none")
@@ -422,19 +434,81 @@ class ShadowComparatorIT extends PostgresTestSupport {
     }
 
     /**
-     * A window lost while recording a finding: the FAILED row must state the progress and the findings that stand.
+     * A live-mode difference is attributed to the rate of the batch's completed load, never to a newer load
+     * still running.
      */
-    // DRIVEN THROUGH MigrationToolRunner.execute, the production recovery path, rather than by reproducing it here:
-    // the row's closure is the runner's own logic, and asserting a hand-rolled copy of it would leave the real path
-    // unexercised. execute(...) is the package-private entry point that returns the exit code instead of forcing
-    // it; run(...) - the one that ends in System.exit - is never called, which is why the tool profile can stay off
-    // (see the class note) while the runner is still exercised. @Profile("tool") is not evaluated for an instance
-    // constructed explicitly, the same reason the staged rate source below can reuse LegacyRateTableSource.
-    //
-    // The injected failure is on the REJECTED_BY_TARGET insert, which the seeded window writes at seq 2 (RAUNAK)
-    // AFTER seq 1 (JOHN) has been replayed and its BALANCE finding has committed, and at the moment seq 2's own
-    // target refusal has already happened. That one fault point covers both halves of the accounting: a finding
-    // that committed must be counted, and a line whose evidence insert failed must still appear in the progress.
+    // A phase of the seeded scenario rather than a test of its own: AAP 0.7.6 allocates this file two tests, and
+    // no committed fixture can express a batch holding two loads in different states with a staged rate that
+    // differs from the replay's price. A comparator is built here because tool.rate-source reaches
+    // ShadowComparator through its constructor, so live mode cannot be selected inside the parity-gate context;
+    // the collaborators handed to it are the proxied beans, so every transaction boundary inside the replay is
+    // the production one. The staged rate belongs to the CLEAN load alone and the RUNNING load staged nothing
+    // (AAP 0.6.3), so the ACCEPTED_EXCEPTION asserted below is reachable only while the completed load is the
+    // one resolved.
+    private void liveExplanationResolvesTheBatchsCompletedLoadAndNotANewerRunningOne() {
+        UUID batchId = UUID.randomUUID();
+
+        MigrationRun completedLoad = MigrationRun.start(UUID.randomUUID(), batchId, MigrationRun.Mode.LOAD,
+                IN_MEMORY_WINDOW, MigrationRun.CharacterizationStatus.DRAFT);
+        completedLoad.finish(MigrationRun.Status.CLEAN, 1, 1, 0);
+        migrationRuns.save(completedLoad);
+
+        // Inserted rather than loaded from a file: the row's rate must differ from the corpus rate the replay is
+        // priced at, and no committed fixture may carry a rate that contradicts the corpus it ships beside (the
+        // fixtures are the AAP 0.10.3 acceptance evidence).
+        jdbcTemplate.update("INSERT INTO legacy_rate_table (run_id, currnkey, currnbase, amount, rates)"
+                        + " VALUES (?, 'GBP', 'USD', 1.00, ?)",
+                completedLoad.runId(), COMPLETED_LOAD_GBP_RATE);
+
+        MigrationRun inFlightRetry = MigrationRun.start(UUID.randomUUID(), batchId, MigrationRun.Mode.LOAD,
+                IN_MEMORY_WINDOW, MigrationRun.CharacterizationStatus.DRAFT);
+        migrationRuns.save(inFlightRetry);
+        assertThat(requireRun(inFlightRetry.runId()).status())
+                .as("the batch's newest load is RUNNING, and it has staged no rate row")
+                .isEqualTo(MigrationRun.Status.RUNNING);
+        assertThat(legacyRates.findByRunId(inFlightRetry.runId()))
+                .as("a load still running has staged nothing a reader may price an explanation from")
+                .isEmpty();
+
+        // Bound off an Environment exactly as the container binds it, so the phase exercises the same inert
+        // tool.rate-source intake a live shadow-compare command line reaches.
+        ShadowComparator liveRateComparator = new ShadowComparator(retailService, reconciliationService,
+                reconciliationRepository, migrationRuns, legacyRates, accounts,
+                new MockEnvironment().withProperty("tool.rate-source", "live"));
+
+        UUID runId = UUID.randomUUID();
+        MigrationRun run = migrationRuns.save(MigrationRun.start(runId, batchId, MigrationRun.Mode.SHADOW,
+                IN_MEMORY_WINDOW, MigrationRun.CharacterizationStatus.DRAFT));
+
+        int variances = liveRateComparator.compare(run,
+                List.of(new ShadowTransaction(1L, "GREG", "C", new BigDecimal("100.00"), "GBP")),
+                List.of(new ShadowLegacyResponse(1L, "GREG", SUCCESS_RETCODE, CAPTURED_GBP_BALANCE)));
+
+        assertThat(variances)
+                .as("a difference the completed load's staged rate re-derives exactly is authorized, so it"
+                        + " raises neither the variance count nor the exit code")
+                .isZero();
+
+        List<MigrationReconciliation> rows = findingsOfRun(runId);
+        assertThat(rows).as("the window's only finding").hasSize(1);
+
+        MigrationReconciliation explained = row(rows, "GREG", VarianceKind.RATE_SOURCE);
+        assertThat(explained.status()).isEqualTo(ReconciliationStatus.ACCEPTED_EXCEPTION);
+        assertThat(explained.legacyBalance()).isEqualByComparingTo(CAPTURED_GBP_BALANCE);
+        assertThat(explained.migratedBalance()).isEqualByComparingTo(TARGET_GBP_BALANCE);
+        assertThat(explained.variance())
+                .as("an accepted exception leaves no signed difference outstanding")
+                .isNull();
+        assertThat(balanceOf("GREG"))
+                .as("the replay itself landed, priced at the corpus rate the target holds")
+                .isEqualByComparingTo(TARGET_GBP_BALANCE);
+    }
+
+    /** A window lost while recording a finding: the FAILED row must state the progress and the findings that stand. */
+    // Driven through MigrationToolRunner.execute, the production recovery path: closing that row is the runner's
+    // own logic, and execute(...) returns the exit code where run(...) forces it through System.exit. The fault is
+    // injected on the REJECTED_BY_TARGET insert the seeded window writes at seq 2, after seq 1's finding has
+    // committed and after seq 2's own target refusal, so one point covers both halves of the accounting.
     private void lostWindowKeepsItsProgressAndItsCommittedFindings() {
         Path window = fixtureDirectory(SEEDED_SHADOW_FIXTURES);
         UUID batchId = UUID.randomUUID();
@@ -444,8 +518,8 @@ class ShadowComparatorIT extends PostgresTestSupport {
         try {
             exitCode = shadowCompareRunner(window, batchId).execute(new DefaultApplicationArguments());
         } finally {
-            // Dropped whatever happened above: the PostgreSQL container is JVM-wide and shared with the sibling
-            // ITs, so a trigger left behind would fail an unrelated class.
+            // Dropped whatever happened above: the container is JVM-wide, so a trigger left behind would fail an
+            // unrelated class.
             removeRejectionRowInsertFailure();
         }
 
@@ -455,9 +529,8 @@ class ShadowComparatorIT extends PostgresTestSupport {
                 .isEqualTo(1);
 
         MigrationRun lost = onlyRunOfBatch(batchId);
-        // A FAILED row that states what the attempt actually did. Closed with zeroed counters it would tell the
-        // operator who signs off runbook Step 2 that the window found nothing, with its finding sitting under the
-        // same run id; left RUNNING it could not be signed off at all.
+        // Closed with zeroed counters, the row would tell the operator signing off runbook Step 2 that the window
+        // found nothing while its finding sat under the same run id; left RUNNING it could not be signed off.
         assertThat(lost.status()).isEqualTo(MigrationRun.Status.FAILED);
         assertThat(lost.legacyRecordCount())
                 .as("all seven captured replies were read and joined before the window was lost")
@@ -473,16 +546,14 @@ class ShadowComparatorIT extends PostgresTestSupport {
                 .as("a closed run is stamped, whatever its verdict")
                 .isNotNull();
 
-        assertThat(reconciliations.findByRunIdOrderByReconciliationIdAsc(lost.runId()))
+        assertThat(findingsOfRun(lost.runId()))
                 .as("the finding that reached the table survives the failure that followed it")
                 .extracting(MigrationReconciliation::owner, MigrationReconciliation::varianceKind,
                         MigrationReconciliation::status)
                 .containsExactly(tuple("JOHN", VarianceKind.BALANCE, ReconciliationStatus.VARIANCE));
     }
 
-    /**
-     * The runner as the runbook's Step 2 command line configures it, for one shadow window.
-     */
+    /** The runner as the runbook's Step 2 command line configures it, for one shadow window. */
     private MigrationToolRunner shadowCompareRunner(Path window, UUID batchId) {
         return new MigrationToolRunner(legacyLoader, reconciliationService, shadowComparator, migrationRuns,
                 reconciliationRepository, applicationContext, "shadow-compare", window.toString(), batchId.toString(),
@@ -491,7 +562,7 @@ class ShadowComparatorIT extends PostgresTestSupport {
 
     /** The one run the runner opened for a batch, failing rather than guessing when the batch holds another. */
     private MigrationRun onlyRunOfBatch(UUID batchId) {
-        List<MigrationRun> runsOfBatch = migrationRuns.findByBatchIdOrderByStartedAtAsc(batchId);
+        List<MigrationRun> runsOfBatch = runsOfBatch(batchId);
         if (runsOfBatch.size() != 1) {
             return fail("the runner must open exactly one run for batch %s, but the batch holds %s"
                     .formatted(batchId, runsOfBatch));
@@ -499,12 +570,9 @@ class ShadowComparatorIT extends PostgresTestSupport {
         return runsOfBatch.get(0);
     }
 
-    /**
-     * Makes the next {@code REJECTED_BY_TARGET} insert fail, so a window dies while recording a finding.
-     */
-    // plpgsql with a WHEN condition, both available on the PostgreSQL 12 floor this module is written to, so the
-    // injection is as narrow as the scenario: no other row kind, table or test is affected. Nothing in the
-    // comparator, the runner, the fixtures or the schema is altered - the trigger is created and dropped here.
+    /** Makes the next {@code REJECTED_BY_TARGET} insert fail, so a window dies while recording a finding. */
+    // plpgsql with a WHEN condition, both available on the PostgreSQL 12 floor this module is written to, so no
+    // other row kind, table or test is affected and nothing outside this method is altered.
     private void injectRejectionRowInsertFailure() {
         jdbcTemplate.execute("""
                 CREATE FUNCTION shadow_it_reject_rejection_row() RETURNS trigger AS $fn$
@@ -530,8 +598,43 @@ class ShadowComparatorIT extends PostgresTestSupport {
                 .orElseGet(() -> fail("the run row %s must be readable back after it was closed".formatted(runId)));
     }
 
-    // The account's type is never named, so this class imports nothing from the domain package: the repository's
-    // declared return type is the whole contract these two helpers need.
+    /** Every finding one window recorded, in insertion order. */
+    // Ordered by the generated identity because row order here is evidence order: AAP 0.10.3 fixes the row sets
+    // at "none" and "exactly three", and PostgreSQL returns rows in any order without an ORDER BY. A short-lived
+    // EntityManager keeps the read outside any transaction of the comparator under test, so each assertion
+    // judges what committed.
+    private List<MigrationReconciliation> findingsOfRun(UUID runId) {
+        EntityManager entityManager = entityManagers.createEntityManager();
+        try {
+            return entityManager
+                    .createQuery("select finding from MigrationReconciliation finding"
+                            + " where finding.runId = :runId order by finding.reconciliationId asc",
+                            MigrationReconciliation.class)
+                    .setParameter("runId", runId)
+                    .getResultList();
+        } finally {
+            entityManager.close();
+        }
+    }
+
+    /** Every run of a batch, oldest first. */
+    // Read here rather than through the repository because MigrationRunRepository publishes one selector - the
+    // batch's completed load - and no broad batch list; run_id breaks a started_at tie exactly as the selector
+    // does, so a batch's runs cannot come back in one order here and another order there.
+    private List<MigrationRun> runsOfBatch(UUID batchId) {
+        EntityManager entityManager = entityManagers.createEntityManager();
+        try {
+            return entityManager
+                    .createQuery("select run from MigrationRun run where run.batchId = :batchId"
+                            + " order by run.startedAt asc, run.runId asc", MigrationRun.class)
+                    .setParameter("batchId", batchId)
+                    .getResultList();
+        } finally {
+            entityManager.close();
+        }
+    }
+
+    // The account's type is never named, so this class imports nothing from the domain package.
     private BigDecimal balanceOf(String owner) {
         return accounts.findByOwner(owner)
                 .map(account -> account.availableBalance().amount())
@@ -544,9 +647,7 @@ class ShadowComparatorIT extends PostgresTestSupport {
                 .orElseGet(() -> fail("the replay must leave account %s in place".formatted(owner)));
     }
 
-    /**
-     * The one row of a kind for an owner, failing rather than returning empty when the set does not hold it.
-     */
+    /** The one row of a kind for an owner, failing rather than returning empty when the set does not hold it. */
     private static MigrationReconciliation row(List<MigrationReconciliation> rows, String owner, VarianceKind kind) {
         return rows.stream()
                 .filter(candidate -> owner.equals(candidate.owner()) && candidate.varianceKind() == kind)
@@ -555,12 +656,8 @@ class ShadowComparatorIT extends PostgresTestSupport {
                 .orElseGet(() -> fail("the run recorded no %s row for %s; rows were %s".formatted(kind, owner, rows)));
     }
 
-    /**
-     * Resolves a test-classpath fixture directory to a filesystem path.
-     *
-     * <p>Fails rather than skips when a fixture is absent: a comparison with nothing to replay proves nothing, and
-     * a skipped test reports as success.
-     */
+    // Fails rather than skips when a fixture is absent: a comparison with nothing to replay proves nothing, and a
+    // skipped test reports as success.
     private static Path fixtureDirectory(String resource) {
         URL location = ShadowComparatorIT.class.getClassLoader().getResource(resource);
         if (location == null) {
@@ -580,20 +677,15 @@ class ShadowComparatorIT extends PostgresTestSupport {
         return directory;
     }
 
-    /**
-     * Wires the production staged-rate lookup in as the replay's rate source.
-     */
-    // A nested @TestConfiguration, so it applies to this class alone and fx/ExchangeRateSourceWiringTest still sees
-    // the deployed wiring - exactly one ExchangeRateSource bean, the live client - in the default profile.
+    /** Wires the production staged-rate lookup in as the replay's rate source, for this class alone. */
     @TestConfiguration
     static class StagedRateSourceConfiguration {
 
-        // @Profile("tool") on LegacyRateTableSource is a containment boundary for COMPONENT SCANNING and is not
-        // evaluated when the class is instantiated explicitly here, so the production implementation is reused
-        // verbatim rather than reimplemented: the five-character key truncation of CASH00.cbl:L213/L247, the
-        // fail-closed answer to an absent or null RATES row, and the unrescaled return that leaves domain.Money
-        // holding the single truncation point are all its behaviour, not this test's. The batch id is empty because
-        // the run-explicit overload it is driven through never consults it.
+        // @Profile("tool") bounds component scanning and is not evaluated for an explicitly instantiated class, so
+        // the production implementation is reused verbatim: the five-character key truncation of
+        // CASH00.cbl:L213/L247, the fail-closed answer to an absent or null RATES row and the unrescaled return
+        // that leaves domain.Money holding the single truncation point are all its behaviour, not this test's. The
+        // batch id is empty because the run-explicit overload never consults it.
         @Bean
         @Primary
         StagedLegacyRateSource stagedLegacyRateSource(LegacyRateTableRepository legacyRates,
@@ -602,20 +694,18 @@ class ShadowComparatorIT extends PostgresTestSupport {
         }
     }
 
-    /**
-     * The staged rate table as an {@link ExchangeRateSource}, scoped to the load the current test staged.
-     */
-    // A hand-written delegate, never a mock - Mockito is excluded from spring-boot-starter-test (AAP 0.7.6) and must
-    // not be added. It exists only because LegacyRateTableSource's interface method resolves its staging run from
-    // tool.batch-id once and caches it, while this class re-stages the corpus under a fresh run id before every
-    // test; the run-explicit overload it delegates to takes that run as an argument, so no rate value, key rule or
-    // failure mode is reimplemented here.
+    /** The staged rate table as an {@link ExchangeRateSource}, scoped to the load the current test staged. */
     static final class StagedLegacyRateSource implements ExchangeRateSource {
 
         private final LegacyRateTableSource delegate;
 
         private volatile UUID stagingRunId;
 
+        // A hand-written delegate rather than a mock, Mockito being excluded from the test stack (AAP 0.7.6). It
+        // exists because LegacyRateTableSource's interface method resolves its staging run from tool.batch-id once
+        // and caches it, while this class re-stages the corpus under a fresh run id before every test; the
+        // run-explicit overload it delegates to takes that run as an argument, so no rate value, key rule or
+        // failure mode is reimplemented here.
         StagedLegacyRateSource(LegacyRateTableSource delegate) {
             this.delegate = Objects.requireNonNull(delegate, "delegate");
         }
@@ -628,12 +718,10 @@ class ShadowComparatorIT extends PostgresTestSupport {
         public BigDecimal rate(String base, String quote) {
             UUID staged = stagingRunId;
             if (staged == null) {
-                // IllegalStateException and deliberately NOT the module's rate-unavailable exception: an
-                // undeclared staging run is a fault in this harness, and the service layer would translate a
+                // Deliberately not the module's rate-unavailable exception: the service layer would translate a
                 // rate outage into 503 EXCHANGE_RATE_UNAVAILABLE, which the comparator classifies as an
-                // authorized deviation - so a misconfigured test would record a quiet ACCEPTED_EXCEPTION row
-                // instead of failing. An unexpected runtime failure becomes an outstanding VARIANCE row, which
-                // breaks both assertions loudly.
+                // authorized deviation, so a misconfigured harness would record a quiet ACCEPTED_EXCEPTION row
+                // instead of failing loudly.
                 throw new IllegalStateException(
                         "no staging run has been declared for this test; the corpus load must run first");
             }

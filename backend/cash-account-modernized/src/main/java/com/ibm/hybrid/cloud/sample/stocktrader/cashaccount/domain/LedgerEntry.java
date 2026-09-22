@@ -1,19 +1,3 @@
-/*
-       Copyright 2025 Kyndryl, All Rights Reserved
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
- */
-
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.domain;
 
 import jakarta.persistence.Column;
@@ -35,76 +19,37 @@ import java.util.UUID;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.error.CashAccountErrorCode;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.error.CashAccountException;
 
-/*
- * WHAT THIS REPLACES. The legacy audit trail was WS-VSAM-RECORD, a 57-byte fixed layout of NAME X(15),
- * DATE X(8), TIME X(6), REQ X(1), BALANCE 9(7)V99, CURRENCY X(8) and RETCODE X(10)
- * [backend/cash-account-cobol/COBOL/CASH00.cbl:L38-L45], written to the HISTORY KSDS on every request
- * [CASH00.cbl:L126-L131] under a 29-byte key of name plus date plus time [CASH00.cbl:L47-L50].
- *
- * WHY THAT TRAIL WAS LOSSY AND THIS ONE IS NOT. The writer was preceded by
- * "EXEC CICS IGNORE CONDITION DUPREC" [CASH00.cbl:L123-L124], so a second event for the same owner inside
- * the same second collided on that one-second-resolution key and was discarded with no error to the caller
- * and no trace anywhere - which is why migrated legacy history counts can only ever be a lower bound
- * (AAP 0.11.1) and why identity here is a generated surrogate rather than a natural key: two events one
- * microsecond apart are two rows, always. Nothing in the repository ever read the file back either (the
- * WRITE is its only application access), so a queryable audit record is new capability, not a port.
- *
- * WHY INSERT-ONLY IS STRUCTURAL RATHER THAN CONVENTIONAL. Immutability is enforced twice, and the halves
- * are deliberately different in kind. In Java, every mapped column is updatable = false and the class has
- * no setter, so Hibernate's dirty check has nothing it could ever turn into an UPDATE; in the database,
- * the trigger ledger_entry_immutable (BEFORE UPDATE OR DELETE, RAISE EXCEPTION) in
- * src/main/resources/schema/cash-account-schema.sql refuses the statement outright. The Java half is the
- * one that matters for correctness of live traffic: were an updatable column to slip in, an accidental
- * mutation would reach the trigger during flush, and the resulting exception would roll back the caller's
- * entire transaction - so a stray field edit would surface as a lost business operation rather than as a
- * rejected audit edit. The database half is what makes the guarantee hold for anything that is not this
- * code path.
- *
- * WHY THERE IS NO ASSOCIATION TO ANY OTHER ENTITY. owner, incarnation_id, reservation_id and run_id are
- * plain scalar columns: the schema declares no foreign key from ledger_entry to cash_account because these
- * rows outlive the account (AAP 0.6.3), and the ledger query must still return them after a retail DELETE
- * (AAP 0.6.2). A @ManyToOne would also make ddl-auto=validate demand a join column the SQL file does not
- * create, and would put a lazy load on the append path that LedgerService runs inside the caller's
- * transaction.
- */
 /** The append-only audit record: one immutable, timestamped row per balance-changing state transition. */
 @Entity
 @Table(name = "ledger_entry")
 public class LedgerEntry {
 
-    /*
-     * Nested rather than a file of its own because AAP 0.6.1 fixes this package at eight files and lists no
-     * LedgerSource.java; consumers therefore write LedgerEntry.Source.RETAIL. Extracting it later would
-     * break that inventory, which is the only reason it is not a top-level type.
-     *
-     * The four constants are the closed set of AAP 0.6.3, and the longest, INSTITUTIONAL at 13 characters,
-     * fits the VARCHAR(16) column with room the set does not need.
-     */
+    /** Nested because AAP 0.6.1 fixes this package at eight files and lists no LedgerSource.java. */
     public enum Source {
 
-        /** The retail seam broker calls: the six endpoints that replace request codes A/Q/U/X/C/D. */
         RETAIL,
 
-        /** The additive hold, settle and release surface. */
         INSTITUTIONAL,
 
-        /** The migration tooling's loader, which writes one MIGRATION_LOAD row per owner per run. */
         MIGRATION,
 
-        /** The service itself acting without a caller - today, the reservation expiry sweep. */
+        /** The service itself acting without a caller - the reservation expiry sweep. */
         SYSTEM
     }
 
     /*
-     * GenerationType.IDENTITY, never SEQUENCE and never AUTO. The column is
-     * BIGINT GENERATED ALWAYS AS IDENTITY (schema/cash-account-schema.sql:L76), which rejects any
-     * client-supplied value outright unless the statement carries OVERRIDING SYSTEM VALUE; AUTO resolves to
-     * a sequence generator on PostgreSQL and would try to supply one. IDENTITY makes Hibernate omit the
-     * column from the INSERT and read the assigned value back, which is also what lets a just-persisted row
-     * be ordered and returned within the same transaction.
+     * A generated surrogate rather than the legacy's natural key: the HISTORY KSDS keyed history on name plus
+     * date plus time at one-second resolution and dropped a same-second collision silently
+     * [backend/cash-account-cobol/COBOL/CASH00.cbl:L47-L50, L123-L124], so migrated counts are only a lower
+     * bound (AAP 0.11.1) while here two events a microsecond apart are two rows, always.
      *
-     * insertable = false states that intent in the mapping as well, so the column cannot be pulled into an
-     * INSERT by a later edit of this class.
+     * GenerationType.IDENTITY, never SEQUENCE and never AUTO: entry_id is declared
+     * BIGINT GENERATED ALWAYS AS IDENTITY in schema/cash-account-schema.sql, which rejects a client-supplied
+     * value unless the statement carries OVERRIDING SYSTEM VALUE, and AUTO resolves to a sequence generator
+     * on PostgreSQL that would try to supply one. IDENTITY also makes Hibernate read the assigned value back,
+     * which is what lets a just-persisted row be ordered and returned within the same transaction;
+     * insertable = false states the same intent in the mapping, so no later edit can pull the column into an
+     * INSERT.
      */
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
@@ -123,10 +68,9 @@ public class LedgerEntry {
     private UUID incarnationId;
 
     /*
-     * EnumType.STRING is mandatory rather than stylistic. The partial index
-     * UNIQUE (run_id, owner) WHERE event_type = 'MIGRATION_LOAD'
-     * (schema/cash-account-schema.sql:L162-L163) matches the persisted text as a SQL string literal, and it
-     * is what guarantees one load row per owner per run - the migration loader's retry-deduplication rule
+     * EnumType.STRING is mandatory rather than stylistic: the partial index uq_ledger_entry_migration_load
+     * in schema/cash-account-schema.sql matches event_type against the SQL string literal 'MIGRATION_LOAD',
+     * and it is what guarantees one load row per owner per run - the loader's retry-deduplication rule
      * (AAP 0.6.3). ORDINAL would store an integer the index could never match, and renaming the
      * LedgerEventType constant would silently disarm it.
      */
@@ -136,9 +80,9 @@ public class LedgerEntry {
 
     /*
      * The magnitude of the event, never a signed delta - the column is NUMERIC(9,2) under
-     * CHECK (amount >= 0) (schema/cash-account-schema.sql:L80, L90), the legacy DECIMAL(9,2) precision of
-     * backend/cash-account-cobol/DB2-DDL/DB2DDL.jcl:L48. Direction comes from eventType alone; see the
-     * factory for the full mapping.
+     * ck_ledger_entry_amount_nonneg in schema/cash-account-schema.sql, the legacy DECIMAL(9,2) precision of
+     * backend/cash-account-cobol/DB2-DDL/DB2DDL.jcl:L48. Direction comes from eventType alone; the factory
+     * carries the mapping.
      */
     @Column(name = "amount", precision = 9, scale = 2, nullable = false, updatable = false)
     private BigDecimal amount;
@@ -163,7 +107,14 @@ public class LedgerEntry {
     @Column(name = "reserved_after", precision = 9, scale = 2, nullable = false, updatable = false)
     private BigDecimal reservedAfter;
 
-    /** Set on the reservation events (HOLD, SETTLEMENT, RELEASE, EXPIRY) and null on the retail ones. */
+    /*
+     * Set on the reservation events (HOLD, SETTLEMENT, RELEASE, EXPIRY) and null on the retail ones. This
+     * column, and owner, incarnation_id and run_id with it, is a plain scalar and not a @ManyToOne: these
+     * rows outlive the account (AAP 0.6.3) and the ledger query must still return them after a retail DELETE
+     * (AAP 0.6.2), so the schema declares no foreign key for an association to map, ddl-auto=validate would
+     * demand a join column the SQL file never creates, and a lazy load would land on the append path
+     * LedgerService runs inside the caller's transaction.
+     */
     @Column(name = "reservation_id", updatable = false)
     private UUID reservationId;
 
@@ -181,25 +132,18 @@ public class LedgerEntry {
 
     /*
      * OffsetDateTime, never LocalDateTime: the column is TIMESTAMPTZ, and LocalDateTime maps to
-     * "timestamp without time zone", which ddl-auto=validate rejects at start-up.
+     * "timestamp without time zone", which ddl-auto=validate rejects at start-up. The value is stamped by
+     * the application clock in the factory rather than left to the column's DEFAULT now(), because the row
+     * is read back in the very next request with no entity refresh and the in-memory instance therefore has
+     * to carry the timestamp the row carries; the DDL default stays as the safety net for rows inserted by
+     * psql during a migration rehearsal.
      *
-     * The value is stamped by the application clock in the factory rather than left to the column's
-     * DEFAULT now(). AuditImmediacyIT reads the row back in the very next request with no entity refresh,
-     * so the in-memory instance has to carry the timestamp the row carries; a database default would leave
-     * the field null until something re-read it. The default stays in the DDL as the safety net for rows
-     * inserted by psql during a migration rehearsal.
-     *
-     * Clock skew between pods is not a correctness problem here because this value is not an ordering key
-     * on its own: both the index (owner, recorded_at DESC, entry_id DESC) and the ledger query's
-     * "recordedAt DESC, entryId DESC" (AAP 0.6.2) break ties on the monotonic entry_id, so same-instant
-     * rows still have one stable order and no database round trip for a clock is needed.
-     *
-     * The stamp is truncated to microseconds, the resolution of the column, so that the in-memory row and
-     * the stored row carry the identical instant. Verified on PostgreSQL 12.22: a nanosecond stamp is
-     * ROUNDED on storage, not truncated, so an untruncated 08:01:16.512733795Z came back as
-     * ...512734Z - an entity still in the persistence context would then disagree with its own row, and a
-     * "since" lower bound taken from that entity could exclude the very event it was read from. Truncating
-     * toward the past is also the module's standing choice wherever precision is discarded (Money.ROUNDING).
+     * The stamp is truncated to the column's microsecond resolution so the in-memory row and the stored row
+     * carry the identical instant. Verified on PostgreSQL 12.22: a nanosecond stamp is ROUNDED on storage,
+     * not truncated, so an untruncated 08:01:16.512733795Z came back as ...512734Z, after which a "since"
+     * lower bound taken from that entity could exclude the very event it was read from. Clock skew between
+     * pods is harmless because this is not an ordering key on its own - both the (owner, recorded_at DESC,
+     * entry_id DESC) index and the ledger query break ties on the monotonic entry_id (AAP 0.6.2).
      */
     @Column(name = "recorded_at", nullable = false, updatable = false)
     private OffsetDateTime recordedAt;
@@ -209,10 +153,9 @@ public class LedgerEntry {
     }
 
     /*
-     * THE MAGNITUDE-PLUS-IMPLIED-DIRECTION CONTRACT. amount is always non-negative and eventType alone says
-     * which way the money moved, which is why Money is the parameter type: it is non-negative by
-     * construction, so the DDL's CHECK (amount >= 0) can never be the first thing to notice a bad value.
-     * The mapping, which the names do not reveal (AAP 0.6.3):
+     * amount is a magnitude and eventType alone says which way the money moved, which is why Money is the
+     * parameter type: it is non-negative by construction, so ck_ledger_entry_amount_nonneg can never be the
+     * first thing to notice a bad value. The mapping, which the names do not reveal (AAP 0.6.3):
      *
      *   CREDIT                                     inflow to available
      *   DEBIT                                      outflow from available
@@ -224,16 +167,14 @@ public class LedgerEntry {
      *   MIGRATION_LOAD                             balance, not a delta
      *   ACCOUNT_DELETED                            amount is the balance removed
      *
-     * WHY THIS IS THE ONLY CONSTRUCTOR. A builder or a second overload would let a caller omit an attribute
-     * the row must carry, and the parameter order deliberately mirrors the column order of
-     * schema/cash-account-schema.sql:L75-L91 so that a mapping review reads as a single column-by-column
-     * pass (AAP 0.7.6).
+     * The only constructor, because a builder or a second overload would let a caller omit an attribute the
+     * row must carry; the parameter order follows the ledger_entry column order of
+     * schema/cash-account-schema.sql so that a mapping review reads as one column-by-column pass.
      *
-     * WHY THE TWO FAILURE KINDS DIFFER. A null eventType, source, incarnationId or Money argument is a
-     * programming error and raises NullPointerException naming the argument, which the exception handler's
-     * catch-all renders as 500 INTERNAL - a bug must not be dressed up as a plausible 4xx. A rejected owner
-     * or currency is a caller-reachable condition and raises CashAccountException with its explicit code, as
-     * everywhere else in the module.
+     * The two failure kinds differ deliberately: a null eventType, source, incarnationId or Money argument
+     * is a programming error and raises NullPointerException naming the argument, which the handler's
+     * catch-all renders as 500 INTERNAL, while a rejected owner or currency is caller-reachable and raises
+     * CashAccountException with its explicit code, as everywhere else in the module.
      */
     public static LedgerEntry of(String owner,
             UUID incarnationId,
@@ -256,7 +197,7 @@ public class LedgerEntry {
         entry.availableAfter = Objects.requireNonNull(availableAfter, "availableAfter").amount();
         entry.reservedAfter = Objects.requireNonNull(reservedAfter, "reservedAfter").amount();
         entry.reservationId = reservationId;
-        entry.orderReference = trimToNull(orderReference);
+        entry.orderReference = storableOrderReference(orderReference);
         entry.source = Objects.requireNonNull(source, "source");
         entry.runId = runId;
         entry.recordedAt = OffsetDateTime.now(ZoneOffset.UTC).truncatedTo(ChronoUnit.MICROS);
@@ -280,9 +221,9 @@ public class LedgerEntry {
     }
 
     /*
-     * The stored columns are BigDecimal so the mapping can declare precision and scale, while the three
-     * monetary accessors hand back Money: a caller comparing a ledger row with a balance must do it in the
-     * module's one money type, and a raw BigDecimal would invite a scale-sensitive equals.
+     * The columns are BigDecimal so the mapping can declare precision and scale, while the three monetary
+     * accessors hand back Money: a caller comparing a ledger row with a balance must do it in the module's
+     * one money type, and a raw BigDecimal would invite a scale-sensitive equals.
      */
     public Money amount() {
         return Money.of(amount);
@@ -322,9 +263,16 @@ public class LedgerEntry {
 
     // JavaBean aliases of the accessors above, for the same reason CashAccountException publishes them: the
     // row's readers - the ledger DTO, the audit service and the reconciliation reports - are separate
-    // classes, and the aliases mean none of them is edited over an accessor-naming preference. There is
-    // deliberately no matching mutator for any of them, and no delta() helper: a signed delta is derived
-    // from consecutive available_after / reserved_after values, never stored (AAP 0.6.3).
+    // classes, and the aliases mean none of them is edited over an accessor-naming preference.
+    //
+    // No mutator accompanies any of them, and that absence together with updatable = false on every mapped
+    // column is the Java half of the immutability guarantee: Hibernate's dirty check then has nothing it
+    // could turn into an UPDATE. It is the half that matters for live traffic, because an accidental
+    // mutation would otherwise reach the ledger_entry_immutable trigger during flush and roll back the
+    // caller's whole transaction, surfacing a stray field edit as a lost business operation. The trigger in
+    // schema/cash-account-schema.sql is what makes the guarantee hold for everything that is not this code
+    // path. There is no delta() helper either: a signed delta is derived from consecutive available_after /
+    // reserved_after values, never stored (AAP 0.6.3).
     public Long getEntryId() {
         return entryId;
     }
@@ -378,15 +326,12 @@ public class LedgerEntry {
     }
 
     /*
-     * Identity is the generated entry_id and nothing else, which is the only identity a row that records a
-     * repeatable event can have: two HOLD events of the same amount on the same owner in the same instant
-     * are distinct rows, and value equality would collapse exactly the duplicates the legacy DUPREC drop
-     * lost [CASH00.cbl:L123-L124].
-     *
-     * A not-yet-persisted instance has no id and is therefore equal only to itself, never to another
-     * id-less instance. The comparison reads the other side through its accessor rather than its field so
-     * that an uninitialized Hibernate proxy answers with its identifier instead of a null field; instanceof
-     * accepts a proxy because a proxy is a subclass.
+     * Identity is the generated entry_id and nothing else, the only identity a row recording a repeatable
+     * event can have: two HOLD events of the same amount on the same owner in the same instant are distinct
+     * rows, and value equality would collapse exactly the duplicates the legacy DUPREC drop lost
+     * [backend/cash-account-cobol/COBOL/CASH00.cbl:L123-L124]. An unpersisted instance therefore equals only
+     * itself. The other side is read through its accessor so an uninitialized Hibernate proxy answers with
+     * its identifier instead of a null field.
      */
     @Override
     public boolean equals(Object other) {
@@ -425,16 +370,13 @@ public class LedgerEntry {
     }
 
     /*
-     * Trimmed and upper-cased for the same reason owners are: legacy CHAR(8) values arrive blank-padded
-     * from an export or an EBCDIC record, and a padded or lower-case code would otherwise become a distinct
-     * currency in the ledger. Locale.ROOT, never the no-argument toUpperCase(), so identity cannot depend
-     * on the JVM's default locale.
-     *
-     * The length check is the cheap half of a contract the database states expensively: the column is
-     * VARCHAR(8) NOT NULL, so a longer value would surface at flush as a driver-level truncation error
-     * naming neither the field nor the caller. INVALID_CURRENCY (400) names both. The accepted three-letter
-     * ISO set is enforced at the boundaries that admit currencies (AAP 0.7.2); this is the ledger's own
-     * storable-width guard, and it deliberately still admits the wider migrated values the tooling loads.
+     * Trimmed and upper-cased for the same reason owners are: legacy CHAR(8) values arrive blank-padded from
+     * an export or an EBCDIC record, and a padded or lower-case code would become a distinct currency in the
+     * ledger. Locale.ROOT, never the no-argument toUpperCase(), so identity cannot depend on the JVM's
+     * default locale. The length check turns what the VARCHAR(8) NOT NULL column would report at flush as a
+     * driver-level truncation error, naming neither field nor caller, into INVALID_CURRENCY (400), which
+     * names both; the accepted three-letter ISO set is enforced at the boundaries that admit currencies
+     * (AAP 0.7.2), so this guard deliberately still admits the wider migrated values the tooling loads.
      */
     private static String normalizeCurrency(String raw) {
         if (raw == null) {
@@ -448,15 +390,36 @@ public class LedgerEntry {
     }
 
     /*
-     * A blank order reference is stored as NULL rather than as an empty string, because the column is
-     * nullable precisely to say "this event had no order behind it", and two spellings of absence would
-     * make every later query test for both.
+     * The reference is recorded exactly as the reservation holds it, blanks and all - the one place this
+     * class deliberately does not normalize a String. cash_reservation stores the caller's order reference
+     * verbatim because request_hash is the SHA-256 of a canonical payload whose first component is that
+     * reference taken exactly, with no trimming and no case folding (AAP 0.7.3), which is what makes
+     * "  ORD  " and "ORD" two different requests under one Idempotency-Key. Altering it on the way into this
+     * row would give one hold two identities - the reservation's, and a silently different one in the
+     * immutable record of the very same event - and the audit record is the half that cannot be corrected
+     * afterwards, since ledger_entry accepts no UPDATE (AAP 0.7.4).
+     *
+     * Absence still has exactly one spelling, NULL: the column is nullable precisely to say "this event had
+     * no order behind it", which is every retail, migration and account-level event, and a blank string is no
+     * reference either. A blank cannot arrive from a caller in any case - HoldRequest declares @NotBlank and
+     * CashReservation.requireOrderReference rejects it.
+     *
+     * The width check is this class's own storable-width guard, for the reason normalizeCurrency carries one:
+     * the value reaches a VARCHAR(64) column unaltered, so its stored length is its raw length, and an
+     * over-long reference would otherwise surface at flush as a driver-level truncation error naming neither
+     * the field nor the caller - one that, because the append runs inside the caller's transaction, would roll
+     * back the business operation it was only meant to record. No caller can reach it: HoldRequest's
+     * @Size(max = 64) bounds the raw string and CashReservation bounds it again, so a value arriving here
+     * over-length is a defect in this module, which IllegalArgumentException reports as one exactly as that
+     * method does instead of dressing it up as a caller-facing error code.
      */
-    private static String trimToNull(String raw) {
-        if (raw == null) {
+    private static String storableOrderReference(String raw) {
+        if (raw == null || raw.isBlank()) {
             return null;
         }
-        String stripped = raw.strip();
-        return stripped.isEmpty() ? null : stripped;
+        if (raw.length() > 64) {
+            throw new IllegalArgumentException("orderReference must be at most 64 characters");
+        }
+        return raw;
     }
 }

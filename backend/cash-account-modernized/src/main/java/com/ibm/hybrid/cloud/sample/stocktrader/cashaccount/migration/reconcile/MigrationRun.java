@@ -1,19 +1,3 @@
-/*
-       Copyright 2025 Kyndryl, All Rights Reserved
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
- */
-
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.migration.reconcile;
 
 import jakarta.persistence.Column;
@@ -27,22 +11,10 @@ import java.util.Locale;
 import java.util.Objects;
 import java.util.UUID;
 
-// Mutable, unlike ledger_entry: a run row is the operational record of one command, not an audit event.
-// MigrationToolRunner opens it RUNNING before the work starts and closes it with the counts, the final
-// status and finished_at, so the row has to be updatable - which is why the append-only trigger in
-// schema/cash-account-schema.sql guards ledger_entry alone and deliberately does not extend here. The
-// evidence that must never change is the ledger; this row merely says which command produced it.
-//
-// Only the table name is declared. The (batch_id) index is idx_migration_run_batch_id in
-// cash-account-schema.sql, and ddl-auto=validate never creates an index, so repeating it in @Table would
-// add a second place to keep in step while enforcing nothing.
 /** One row per migration-tooling invocation: what it read, what it found, and how it ended. */
 @Entity
 @Table(name = "migration_run")
 public class MigrationRun {
-
-    // The four enums below are nested rather than separate files because AAP 0.6.1 caps this
-    // sub-package at nine files, the same reason domain/LedgerEntry nests its Source enum.
 
     /** Which tooling command the run executed. */
     public enum Mode {
@@ -52,12 +24,8 @@ public class MigrationRun {
     }
 
     /**
-     * Run-level outcome.
-     *
-     * <p>{@code VARIANCE} here is the roll-up over the run and is a distinct type from
-     * {@link ReconciliationStatus#VARIANCE}, which is one row's disposition; a run is
-     * {@code VARIANCE} because it produced at least one such row. The two stay separate so the
-     * run-level verdict and the row-level finding can never be assigned to one another.</p>
+     * Run-level outcome, a distinct type from {@link ReconciliationStatus} so that a run's verdict and a
+     * row's disposition can never be assigned to one another.
      */
     public enum Status {
         RUNNING,
@@ -73,22 +41,10 @@ public class MigrationRun {
     }
 
     /**
-     * Which exchange rate the run priced its comparisons with: the one canonicalization of
-     * {@code tool.rate-source}.
-     *
-     * <p>Deliberately not a column. The shape of {@code migration_run} is fixed (AAP 0.6.3) and this module
-     * adds none, so the source a run used is recorded in the tooling's start-up log line and in the
-     * invocation the runbook step captures. The type still belongs here rather than beside either reader,
-     * because it is a parameter <em>of the run</em> - a run's variance rows are interpretable only against a
-     * single source - which is what {@link Mode} and {@link CharacterizationStatus} are too.</p>
+     * The one canonicalization of {@code tool.rate-source}: every reader parses through this type, because
+     * a rate source read differently by the delegate that prices a replay and by the classifiers that judge
+     * it would record live-priced differences as genuine balance variances.
      */
-    // ONE CANONICALIZATION, NOT THREE. fx/ToolExchangeRateSource (which picks the delegate that prices the
-    // replay) and reconcile/ReconciliationService plus shadow/ShadowComparator (which decide whether a
-    // difference may be attributed to the rate) all read the same property, and all three have to agree about
-    // what it says. A value of " LIVE " that selected the live delegate while the classifiers still read it as
-    // the legacy-table parity gate would record live-priced differences as genuine balance variances, and the
-    // run's rows would then state the opposite of what produced them. Parsing therefore happens here, once,
-    // and no caller compares the raw text.
     public enum RateSource {
 
         /** The parity gate and the default: both sides of a comparison are priced from the staged legacy RATES. */
@@ -97,12 +53,11 @@ public class MigrationRun {
         /** Live pricing, under which a difference the rate fully explains is reclassified {@code RATE_SOURCE}. */
         LIVE("live");
 
-        // A rejected value is echoed into an exception message that reaches an operator's console, so the echo
-        // is bounded: enough to spot a typo, too little to carry an injected record.
+        // A rejected value is echoed to an operator's console, so the echo is bounded: enough to spot a
+        // typo, too little to carry an injected record.
         private static final int MAX_ECHOED_CHARS = 40;
 
-        // Stands in for an absent value so it does not render as an empty pair of quotes, which reads like a
-        // tool defect rather than a missing argument.
+        // So an absent value does not render as an empty pair of quotes, which reads like a tool defect.
         private static final String UNSET = "<unset>";
 
         private final String token;
@@ -113,18 +68,13 @@ public class MigrationRun {
 
         /**
          * The source a {@code tool.rate-source} value names, tolerating only surrounding whitespace and
-         * letter case.
+         * letter case and failing closed on anything else: defaulting a misspelling would let a whole run
+         * judge parity against rates the legacy program never saw.
          *
          * @param rawValue the property value as configuration supplied it, possibly {@code null}
          * @return the source it names
          * @throws IllegalStateException when the value is absent or is neither documented token
          */
-        // FAIL CLOSED, as the module fails closed on an unmapped path, an unknown auth type and a non-postgres
-        // JDBC_KIND (AAP 0.6.5). Defaulting a misspelling such as leagcy-table to either source would let a
-        // whole run judge parity against rates the legacy program never saw - producing a wall of unexplained
-        // BALANCE variances, or worse a clean-looking run for the wrong reason, with nothing in the evidence to
-        // show which happened. No tolerant alias is recognized because none is documented: accepting
-        // legacy_table here would make the accepted spelling depend on which class read the property.
         public static RateSource of(String rawValue) {
             String requested = rawValue == null ? "" : rawValue.strip().toLowerCase(Locale.ROOT);
             for (RateSource candidate : values()) {
@@ -137,12 +87,20 @@ public class MigrationRun {
                     + abbreviate(requested.isEmpty() ? UNSET : requested) + "'");
         }
 
-        /** The canonical spelling, exactly as {@code application-tool.yml} and the runbook's commands use it. */
+        /**
+         * The canonical spelling of this mode.
+         *
+         * @return the spelling exactly as {@code application-tool.yml} and the runbook use it
+         */
         public String token() {
             return token;
         }
 
-        /** Whether the run prices live, the one mode that opens the {@code RATE_SOURCE} reclassification. */
+        /**
+         * Whether this mode prices against the live provider.
+         *
+         * @return true for the one mode that opens {@code RATE_SOURCE} reclassification
+         */
         public boolean isLive() {
             return this == LIVE;
         }
@@ -152,17 +110,15 @@ public class MigrationRun {
         }
     }
 
-    // Assigned, never generated: the identifier IS the invocation's identity. MigrationToolRunner mints it
-    // with UUID.randomUUID() and echoes it in the runbook's evidence, so the value has to exist before the
-    // insert rather than be handed back by the database afterwards.
+    // Assigned, never generated: one run_id per tool invocation, minted by the runner and echoed in the
+    // runbook's evidence, so the value has to exist before the insert rather than come back from it.
     @Id
     @Column(name = "run_id", nullable = false, updatable = false)
     private UUID runId;
 
     // Separate from run_id because one runbook step is two invocations: a load and the reconcile that
-    // judges it share --tool.batch-id. A retry after a FAILED load is therefore a new run_id under the
-    // same batch_id, and MigrationRunRepository.findByBatchIdOrderByStartedAtAsc still reads the whole
-    // step, failed attempts included, in the order it happened.
+    // judges it share --tool.batch-id, so a retry after a FAILED load is a new run_id under the same
+    // batch_id and the batch still reads as the whole step, failed attempts included.
     @Column(name = "batch_id", nullable = false)
     private UUID batchId;
 
@@ -188,9 +144,9 @@ public class MigrationRun {
     @Column(name = "status", nullable = false, length = 16)
     private Status status;
 
-    // Carried on the run, not just in the document, because runbook Step 1's sign-off criterion includes
-    // characterization_status = 'ACCEPTED'. A DRAFT characterization can still run against fixtures, but
-    // every run it produces records that it was DRAFT, so it can never be accepted against a real export.
+    // Carried on the run, not just in the document, because the runbook's sign-off criterion includes
+    // characterization_status = 'ACCEPTED': a DRAFT characterization still runs against fixtures, but every
+    // run it produces records that it was DRAFT and so can never be accepted against a real export.
     @Enumerated(EnumType.STRING)
     @Column(name = "characterization_status", nullable = false, length = 8)
     private CharacterizationStatus characterizationStatus;
@@ -202,7 +158,6 @@ public class MigrationRun {
     private OffsetDateTime finishedAt;
 
     protected MigrationRun() {
-        // Required by JPA; every application-created instance comes from start(...).
     }
 
     private MigrationRun(UUID runId,
@@ -227,10 +182,13 @@ public class MigrationRun {
      * Opens a run: status {@code RUNNING}, zero counts and no {@code finishedAt} until
      * {@link #finish(Status, int, int, int)} closes it.
      *
-     * <p>Null arguments are rejected with {@link NullPointerException} naming the argument. This is a
-     * tooling entity with no HTTP surface, so it raises no service exception and maps to no status
-     * code: a missing run identifier, batch identifier, mode, source path or characterization status is
-     * a programming error in the caller, not a condition an operator can act on.</p>
+     * @param runId                  the identifier of this invocation
+     * @param batchId                the runbook step this invocation belongs to
+     * @param mode                   the command being executed
+     * @param sourcePath             the export this invocation reads
+     * @param characterizationStatus the acceptance state of the characterization document at start-up
+     * @return the open run, not yet persisted
+     * @throws NullPointerException if any argument is {@code null}
      */
     public static MigrationRun start(UUID runId,
                                      UUID batchId,
@@ -240,7 +198,15 @@ public class MigrationRun {
         return new MigrationRun(runId, batchId, mode, sourcePath, characterizationStatus);
     }
 
-    /** Closes the run with its verdict and its three counts, stamping {@code finishedAt}. */
+    /**
+     * Closes the run, stamping {@code finishedAt}.
+     *
+     * @param finalStatus          the verdict the command reached
+     * @param legacyRecordCount    rows read from the legacy side
+     * @param migratedRecordCount  rows applied or replayed on the target side
+     * @param varianceCount        outstanding {@code VARIANCE} rows, accepted exceptions excluded
+     * @throws NullPointerException if {@code finalStatus} is {@code null}
+     */
     public void finish(Status finalStatus,
                        int legacyRecordCount,
                        int migratedRecordCount,
@@ -253,12 +219,11 @@ public class MigrationRun {
     }
 
     /**
-     * Raises the recorded read and applied counts to the progress a command reached, never lowering either.
+     * Raises the recorded counts to the progress a command reached, never lowering either, because a total
+     * only grows within one run and a lost command's instance is the only statement of how far it got.
      *
-     * <p>Each count is a total the running command has established, and a total only grows within one run, so
-     * the larger of what this row already carries and what the command reported is the figure the run
-     * actually reached. Used when a command is lost: the instance it was mutating is then the only statement
-     * of how far it got, and the row has to say so.</p>
+     * @param reachedLegacyRecordCount   rows the command had read when it was lost
+     * @param reachedMigratedRecordCount rows it had applied or replayed
      */
     public void recordProgress(int reachedLegacyRecordCount, int reachedMigratedRecordCount) {
         this.legacyRecordCount = Math.max(this.legacyRecordCount, reachedLegacyRecordCount);
@@ -266,19 +231,14 @@ public class MigrationRun {
     }
 
     /**
-     * Closes the run {@code FAILED}, keeping the counts it has recorded and taking its variance count from
-     * the evidence that committed.
+     * Closes the run {@code FAILED}, keeping the counts it has already recorded so that no failure path can
+     * reset them, and taking its variance count from the rows that committed: a shadow window's findings
+     * commit individually, so zeroed counters would state that an attempt found nothing while its findings
+     * sit in the table.
      *
      * @param varianceCountFromEvidence the number of {@code VARIANCE} rows persisted under this run, read
      *                                  back from {@code migration_reconciliation}
      */
-    // A FAILED ROW IS THE EVIDENCE OF AN ATTEMPT AND MAY NOT UNDERSTATE ONE. A shadow window's findings each
-    // commit on their own, because the comparator suspends any ambient transaction, so a window lost late
-    // leaves them readable under its run_id and a row closed with zeroed counters would tell the operator who
-    // signs off runbook Step 2 that the attempt found nothing while its findings sit in the table. A load or a
-    // reconcile is one transaction whose findings roll back with it, so the same read then yields zero - also
-    // the truth. The count is therefore always taken from the rows, and the two record counts are preserved
-    // here rather than re-supplied by the caller, so no failure path can reset them.
     public void fail(int varianceCountFromEvidence) {
         finish(Status.FAILED, legacyRecordCount, migratedRecordCount, varianceCountFromEvidence);
     }
@@ -327,6 +287,8 @@ public class MigrationRun {
         return finishedAt;
     }
 
+    // The run row is the operational record of one command rather than an audit event, so it stays
+    // updatable and the schema's append-only trigger guards ledger_entry alone.
     public void setSourcePath(String sourcePath) {
         this.sourcePath = Objects.requireNonNull(sourcePath, "sourcePath");
     }
@@ -357,7 +319,7 @@ public class MigrationRun {
     }
 
     // Identity is the assigned run_id alone: every other attribute is mutated as the command runs, so a
-    // value-based equals would make an opened run unequal to the same row once it is closed.
+    // value-based equality would make an opened run unequal to the same row once it is closed.
     @Override
     public boolean equals(Object other) {
         if (this == other) {
@@ -374,8 +336,8 @@ public class MigrationRun {
         return Objects.hashCode(runId);
     }
 
-    // Deliberately excludes source_path and the counts: this string reaches logs, and an export path is
-    // the location of a full copy of production cash balances.
+    // Excludes source_path deliberately: this string reaches logs, and an export path names the location
+    // of a full copy of production cash balances.
     @Override
     public String toString() {
         return "MigrationRun{runId=" + runId

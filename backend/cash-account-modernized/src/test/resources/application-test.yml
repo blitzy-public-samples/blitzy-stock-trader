@@ -1,26 +1,25 @@
 # Profile "test": a thin overlay of application.yml, which stays the source of truth for every key not below.
-# Only settings whose deployed value would make a test non-deterministic or offline-unsafe are restated here;
-# copying anything else would create a second source of truth that silently diverges from the base.
 
 cashaccount:
   jdbc:
-    # application.yml resolves this as ${JDBC_KIND:postgres}, so an ambient JDBC_KIND would reach
-    # DataSourceGuardConfig's @PostConstruct guard and fail every context; this literal outranks it.
-    # Testcontainers' @ServiceConnection supplies the connection details, so no URL is assembled here.
+    # An ambient JDBC_KIND would otherwise reach DataSourceGuardConfig's guard through ${JDBC_KIND:postgres}
+    # and fail every context; this literal outranks it. Testcontainers' @ServiceConnection supplies the rest.
     kind: postgres
   fx:
-    # Offline by construction: the inherited default is the live endpoint behind a redirect-following client,
-    # while the *IT accounts are USD, where a same-currency rate of exactly 1 short-circuits before any call.
-    # Port 1 refuses instantly, so an unintended cross-currency path fails fast rather than egressing.
-    url: http://127.0.0.1:1/latest
+    # Offline by construction: the *IT accounts are USD, where a same-currency rate of exactly 1 short-circuits
+    # before any call, and port 1 refuses at TCP so an unintended cross-currency path fails fast. https is not
+    # decoration: the client rejects a plaintext endpoint at construction, so an http value here would fail
+    # every *IT context at start-up.
+    url: https://127.0.0.1:1/latest
   security:
-    # The mode the estate already runs in (values.yaml:L20, broker's server.xml:L40), so tests exercise the
-    # deployed RS256 resource-server chain rather than a mechanism invented for them.
+    # The mode the estate already runs in (infra/stocktrader-operator/helm-charts/stocktrader/values.yaml:L20,
+    # backend/broker/src/main/liberty/config/server.xml:L40), so tests exercise the deployed RS256
+    # resource-server chain rather than a mechanism invented for them.
     auth-type: basic
     jwt:
-      # The chart's deployed literals (values.yaml:L207-L209, broker's server.xml:L41-L42), so no second set
-      # of magic strings enters the module. HARD CONTRACT for support/JwtTestTokens, written after this file
-      # and reading it: its tokens must carry exactly these as iss and aud, or every *IT is answered 401.
+      # The chart's deployed literals (.../values.yaml:L207-L209, broker's server.xml:L41-L42), so no second
+      # set of magic strings enters the module. support/JwtTestTokens reads them: its tokens must carry exactly
+      # these as iss and aud, or every *IT is answered 401.
       issuer: http://stock-trader.ibm.com
       audience: stock-trader
   reservation:
@@ -36,16 +35,11 @@ management:
       probes:
         enabled: true
 
-# Absent on purpose, and no later edit may undo any of it:
-#   security.jwt.public-key-location - support/JwtTestTokens injects an ephemeral per-JVM key's PEM with
-#     @DynamicPropertySource; a pinned location defeats that, and no key material belongs in this tree.
-#   security.all-authenticated-hold-stocktrader - stays the deployed true, broker's ALL_AUTHENTICATED_USERS
-#     -> StockTrader parity grant (server.xml:L56-L60); RoleEnforcementIT selects both modes per context.
-#   spring.datasource.url / username / password - from the postgres:12.22-alpine @ServiceConnection container.
-#   spring.datasource.hikari.* - no spring.datasource.* key belongs in this overlay at all; the pool stays at the
-#     framework default because support/PostgresTestSupport raises the shared container's max_connections above the
-#     ceiling every cached *IT context's default pool can reach together, so a cap here would constrain nothing.
-#   spring.sql.init.* (separator ';;'), jpa.hibernate.ddl-auto, jpa.open-in-view, server.port, the actuator
-#     exposure list, the health groups and the Jackson BigDecimal features - inherited; LedgerImmutabilityIT
-#     needs the inherited sql.init to re-apply the schema across a context restart.
-#   tool.* - owned by application-tool.yml.
+# Absent on purpose: security.jwt.public-key-location, because support/JwtTestTokens injects an ephemeral
+# per-JVM key's PEM with @DynamicPropertySource and no key material belongs in this tree;
+# security.all-authenticated-hold-stocktrader, which stays the deployed true parity grant
+# (broker's server.xml:L56-L60) while RoleEnforcementIT selects both modes per context; the datasource keys,
+# which come from the @ServiceConnection container, with the pool left at its default because
+# support/PostgresTestSupport raises the container's max_connections above what every cached context can reach
+# together; and spring.sql.init.*, which LedgerImmutabilityIT needs inherited so the schema re-applies across a
+# context restart.

@@ -1,60 +1,26 @@
-#       Copyright 2025 Kyndryl, All Rights Reserved
-#
-#   Licensed under the Apache License, Version 2.0 (the "License");
-#   you may not use this file except in compliance with the License.
-#   You may obtain a copy of the License at
-#
-#       http://www.apache.org/licenses/LICENSE-2.0
-#
-#   Unless required by applicable law or agreed to in writing, software
-#   distributed under the License is distributed on an "AS IS" BASIS,
-#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#   See the License for the specific language governing permissions and
-#   limitations under the License.
-
 # Profile "tool": the same jar run as an offline migration/reconciliation CLI, overlaying application.yml.
 
 spring:
   main:
-    # A load or a reconcile is an operator-run batch invocation against an export directory, so the
-    # process must not acquire a routable endpoint while it runs. Starting a listener beside it would
-    # expose the new service to callers during a rehearsal, which is exactly the prohibition the
-    # Operational Runbook is built around: no traffic reaches this service until the cutover step
-    # signs off. With no web application type there is no connector, no controller and no security
-    # filter chain to enter, so that property is structural rather than a matter of configuration
-    # discipline. It also keeps the tool's lifetime equal to its work: the runner returns an exit code
-    # (0 clean, 2 variance, 1 error) and the JVM ends, instead of a web context holding the process
-    # open after the last row is written.
+    # A load or a reconcile is an operator-run batch invocation, so the process must not acquire a routable
+    # endpoint while it runs: the Operational Runbook admits no traffic to this service before cutover signs
+    # off, and with no web application type there is no connector, controller or filter chain to enter at all.
+    # It also keeps the tool's lifetime equal to its work - the runner returns its exit code and the JVM ends.
     web-application-type: none
 
     # Quoted deliberately: YAML 1.1 reads bare `off` as the boolean false, which does not convert to
-    # Banner.Mode and would fail start-up.
-    #
-    # Banner and start-up inventory are decoration in an interactive shell and noise in a captured
-    # transcript. What an operator reads out of a tool run is the exit code and the migration_run /
-    # migration_reconciliation rows it wrote, both of which the runbook captures as step evidence;
-    # anything printed before the first record is read competes with that evidence for attention.
-    # Application log levels are left to application.yml so one file remains the authority on them.
+    # Banner.Mode and would fail start-up. What an operator reads out of a tool run is the exit code and the
+    # migration_run / migration_reconciliation rows, which the runbook captures as step evidence; anything
+    # printed before the first record competes with that evidence. Log levels stay in application.yml.
     banner-mode: "off"
     log-startup-info: false
 
-  # Four base-profile settings are deliberately NOT restated here, because the tool has to inherit them
-  # rather than hold an opinion about them:
-  #
-  #   spring.sql.init.*      The rehearsal schema is created by the very same schema/cash-account-schema.sql
-  #                          the service applies. The runbook's Step 1 reset is DROP SCHEMA ... CASCADE,
-  #                          CREATE SCHEMA, then re-run the tool so the script re-applies — a reset that
-  #                          only works while initialization stays enabled in this profile.
-  #   hikari.schema          Left unpinned so the runbook can pass
-  #                          --spring.datasource.hikari.schema=cash_account_rehearsal per invocation.
-  #                          Pinning any schema here would either defeat that isolation or silently
-  #                          redirect a production-schema run.
-  #   jpa.hibernate.ddl-auto Stays `validate`. The tool writes ledger_entry, cash_account and the staging
-  #                          tables directly, so it must be held to the identical schema contract the
-  #                          service validates against; a relaxed setting here could let a tool run
-  #                          create structure the service would then reject at start-up.
-  #   datasource.*           Credentials and the guarded, assembled URL come from the same place in both
-  #                          profiles, so a rehearsal cannot reach a store the service could not.
+  # Four base-profile settings are deliberately NOT restated here, because the tool must inherit them:
+  # spring.sql.init.* stays enabled so the runbook's Step 1 reset (DROP SCHEMA ... CASCADE, CREATE SCHEMA,
+  # re-run) re-applies schema/cash-account-schema.sql; hikari.schema stays unpinned so the runbook can pass
+  # --spring.datasource.hikari.schema=cash_account_rehearsal per invocation; jpa.hibernate.ddl-auto stays
+  # validate so a tool run cannot create structure the service would then reject at start-up; and
+  # datasource.* comes from the same guarded assembly in both profiles.
 
 tool:
   # Intentionally empty. A bare `--spring.profiles.active=tool` would otherwise perform whichever
@@ -76,15 +42,11 @@ tool:
   # that reconciles nothing and looks clean doing it.
   batch-id:
 
-  # legacy-table, because parity can only be judged on identical inputs. The legacy balance came from
-  # the two-decimal RATES column of the staged rate table
-  # (backend/cash-account-cobol/COBOL/CASH00.cbl:L213-L222; COBOL/DCLFRANK.cpy:L12), so expected values
-  # are computed from those same rows and any difference that remains is a genuine target difference.
-  # Judging against a live rate instead would report every intervening ECB fixing as a balance variance.
-  # With `live`, a difference the rate difference fully explains is reclassified RATE_SOURCE /
-  # ACCEPTED_EXCEPTION and anything left over stays BALANCE / VARIANCE. ToolExchangeRateSource selects
-  # its delegate from this value; ReconciliationService and ShadowComparator carry the same default, so
-  # the two can never disagree about which rate produced an expected balance.
+  # legacy-table, because parity can only be judged on identical inputs: the legacy balance came from the
+  # two-decimal RATES column of the staged rate table (backend/cash-account-cobol/COBOL/CASH00.cbl:L213-L222;
+  # COBOL/DCLFRANK.cpy:L12), so judging against a live rate would report every intervening ECB fixing as a
+  # balance variance. With `live`, a difference the rate difference fully explains is reclassified
+  # RATE_SOURCE / ACCEPTED_EXCEPTION and anything left over stays BALANCE / VARIANCE.
   rate-source: legacy-table
 
   # A property rather than a constant because the repository cannot settle it. The database, the
@@ -96,20 +58,18 @@ tool:
   # correctable by configuration in the middle of a migration window rather than by a rebuild.
   legacy-charset: IBM037
 
-  # Same reasoning, same open item. The history stamps are region local time — EXEC CICS FORMATTIME
-  # fills YYYYMMDD and HHMMSS from ASKTIME
-  # (backend/cash-account-cobol/COBOL/CASH00.cbl:L80-L85), written into the record at L40-L41 — and no
-  # artifact here names the region's zone. A wrong zone silently shifts every legacy_history.event_at by
-  # a fixed offset, which would make the shadow step's window boundaries meaningless while every
-  # individual row still looked plausible.
+  # Same reasoning, same open item. The history stamps are region local time — EXEC CICS FORMATTIME fills
+  # YYYYMMDD and HHMMSS from ASKTIME (backend/cash-account-cobol/COBOL/CASH00.cbl:L80-L85), moved into the
+  # record at L112-L113 — and no artifact here names the region's zone. A wrong zone shifts every
+  # legacy_history.event_at by a fixed offset, making the shadow step's window boundaries meaningless while
+  # every individual row still looks plausible.
   legacy-timezone: UTC
 
-  # NOT A tool.* KEY, AND DELIBERATELY SO. The chunk size a bulk load and a bulk reconcile flush by lives
-  # at cashaccount.migration.batch-chunk-size in application.yml, beside the JDBC batch size it has to
-  # match. MigrationToolRunner rejects any tool.* command-line option outside the seven it declares, so a
-  # tuning knob added to this namespace could never be passed on the command line — the one place an
-  # operator sizing a migration window would reach for it. Override it per invocation with
-  # --cashaccount.migration.batch-chunk-size=<rows>, which the runner's typo guard leaves alone.
+  # Deliberately not a tool.* key: the chunk size a bulk load and a bulk reconcile flush by lives at
+  # cashaccount.migration.batch-chunk-size in application.yml, beside the JDBC batch size it must match.
+  # MigrationToolRunner rejects any tool.* command-line option outside the seven it declares, so a knob added
+  # to this namespace could never be passed at the moment an operator sizing a migration window needs it;
+  # --cashaccount.migration.batch-chunk-size=<rows> overrides it and the runner's typo guard leaves it alone.
 
   # Intentionally empty: the one value in this file whose absence of a default IS the requirement.
   # CASH00 writes 57 bytes — the accumulated width of WS-VSAM-RECORD

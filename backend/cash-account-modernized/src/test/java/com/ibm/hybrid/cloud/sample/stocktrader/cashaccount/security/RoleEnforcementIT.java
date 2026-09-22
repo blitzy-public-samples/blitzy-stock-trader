@@ -1,29 +1,19 @@
-/*
-       Copyright 2025 Kyndryl, All Rights Reserved
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
- */
-
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.security;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.util.List;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
+import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.config.CashAccountProperties;
+import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.config.JwtDecoderConfig;
+import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.config.SecurityConfig;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.support.JwtTestTokens;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.support.PostgresTestSupport;
 
@@ -32,67 +22,74 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.client.TestRestTemplate;
+import org.springframework.core.io.DefaultResourceLoader;
+import org.springframework.core.io.ResourceLoader;
+import org.springframework.expression.spel.standard.SpelExpressionParser;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.mock.env.MockEnvironment;
+import org.springframework.security.oauth2.jwt.JwtDecoder;
+import org.springframework.security.web.FilterChainProxy;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.header.HeaderWriterFilter;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.TestPropertySource;
+import org.springframework.test.util.ReflectionTestUtils;
 
-/*
- * The grant this outer class runs under is what broker does today, not a relaxation invented here: the siblings
- * bind the StockTrader security-role to the ALL_AUTHENTICATED_USERS special subject
- * [backend/broker/src/main/liberty/config/server.xml:L56-L60], so any authenticated caller may already write,
- * and config/JwtDecoderConfig reproduces that by granting ROLE_StockTrader to every authenticated principal
- * while cashaccount.security.all-authenticated-hold-stocktrader is true. The verb split the rules below
- * otherwise express - GET to StockViewer or StockTrader, POST/PUT/DELETE to StockTrader alone
- * [backend/broker/src/main/webapp/WEB-INF/web.xml:L19-L51] - is therefore latent in the deployed default and
- * decisive only in strict mode, which is why both modes have to be exercised and neither on its own is proof.
- *
- * Two Spring contexts rather than one parameterized class: that single property is bound into
- * config/CashAccountProperties and read while the filter chain and the authority converter are built, so no
- * running context can be switched between the modes mid-suite. @Nested with its own @SpringBootTest and
- * @TestPropertySource is the mechanism that gets a second, independently configured application on a second
- * random port out of one test class.
- */
 /** Asserts broker's role split on the retail and institutional surfaces in both the deployed and strict grant modes. */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestPropertySource(properties = "cashaccount.security.all-authenticated-hold-stocktrader=true")
 public class RoleEnforcementIT extends PostgresTestSupport {
 
     // Owners are private to this class because support/PostgresTestSupport starts ONE container for the whole test
-    // JVM: an owner shared with another *IT would make each suite's outcome depend on which ran first, and the
-    // account this file creates outlives its own context. All are already uppercase and inside the 1-32 characters
-    // domain/OwnerNormalizer accepts, so the stored owner equals the value sent and can be asserted literally.
+    // JVM: an owner shared with another *IT would make each suite's outcome depend on which ran first. All are
+    // uppercase and within the 1-32 characters domain/OwnerNormalizer accepts, so the stored owner equals the
+    // value sent and can be asserted literally.
     private static final String READ_OWNER = "RBACREAD";
     private static final String WRITE_OWNER = "RBACWRITE";
     private static final String STRICT_WRITE_OWNER = "RBACSTRICTWRITE";
     private static final String INSTITUTIONAL_OWNER = "RBACINSTITUTIONAL";
 
-    // USD is broker's default account currency, and with cashaccount.fx.base-currency also USD a same-currency
-    // operation short-circuits to a rate of exactly 1. That keeps every request below clear of the exchange-rate
-    // client, which src/test/resources/application-test.yml deliberately points at a refused local port.
+    // USD is both broker's default account currency and cashaccount.fx.base-currency, so a same-currency
+    // operation short-circuits to a rate of exactly 1 and no request here reaches the exchange-rate client
+    // application-test.yml points at a refused local port.
     private static final String ACCOUNT_CURRENCY = "USD";
 
-    // Plain decimal TEXT inside a literal JSON body. A Java floating-point literal would put a double on a money
-    // path, which AAP 0.7.1 prohibits outright, and a BigDecimal serialized by a mapper configured differently
-    // from the service's own would test the test's mapper rather than the contract.
+    // Plain decimal TEXT: a Java floating-point literal would put a double on a money path (AAP 0.7.1), and a
+    // BigDecimal serialized by a mapper configured differently from the service's own would test that mapper.
     private static final String SEED_BALANCE = "1000.00";
     private static final String WRITE_BALANCE = "2500.00";
 
+    // The two configuration keys the start-up scenarios below drive. Written out rather than imported because
+    // config/JwtDecoderConfig keeps its copies private; SecurityConfig.AUTH_TYPE_PROPERTY is public and is used
+    // as such, so only the JWKS key needs restating.
+    private static final String JWKS_URL_PROPERTY = "cashaccount.security.jwt.jwks-url";
+
+    // A value no legitimate message, reason or diagnostic could contain, so its appearance anywhere in a
+    // start-up failure can only mean a rejected JWKS URL was reproduced.
+    private static final String CREDENTIAL_SENTINEL = "pa55phrase";
+
+    private static final ResourceLoader RESOURCE_LOADER = new DefaultResourceLoader();
+
     private static final ObjectMapper JSON = new ObjectMapper();
 
-    // TestRestTemplate, not the MicroProfile client of support/BrokerClientFactory: that client throws a
-    // WebApplicationException on a 4xx, so the rejected-request assertions this class exists for could only be
-    // written as exception handling, and the response BODY - the ApiError shape four of these seven scenarios
-    // turn on - would have to be recovered from the exception. TestRestTemplate returns 401 and 403 as ordinary
-    // responses. Driving the real client interface is contract/RetailContractIT's job.
+    // TestRestTemplate, not the MicroProfile client of support/BrokerClientFactory: that client throws on a 4xx,
+    // so every rejection this class exists for would have to be recovered from an exception - including the
+    // ApiError body four of these scenarios turn on. Driving the real client interface is RetailContractIT's job.
     @Autowired
     private TestRestTemplate rest;
+
+    // The built chain itself, so the CVE-2026-22732 workaround can be read off the running application rather
+    // than off config/SecurityConfig's source: an ObjectPostProcessor that never matched would leave the source
+    // looking correct and the flag false.
+    @Autowired
+    private FilterChainProxy securityFilterChain;
 
     @DynamicPropertySource
     static void jwtSignerKey(DynamicPropertyRegistry registry) {
@@ -120,9 +117,11 @@ public class RoleEnforcementIT extends PostgresTestSupport {
     @Test
     void anyAuthenticatedPrincipalWritesUnderTheParityGrant() throws JsonProcessingException {
         // A token carrying NO groups claim at all is what makes this assertion mean something: the principal holds
-        // neither role, so a 200 can only have come from the ALL_AUTHENTICATED_USERS parity grant
-        // [backend/broker/src/main/liberty/config/server.xml:L56-L60] and from nothing the token itself asserted.
-        // "other" is a real registry user in no group [backend/broker/src/main/liberty/config/includes/none.xml:L37].
+        // neither role, so a 200 can only have come from the ALL_AUTHENTICATED_USERS parity grant broker deploys
+        // today [backend/broker/src/main/liberty/config/server.xml:L56-L60]. The verb split
+        // [backend/broker/src/main/webapp/WEB-INF/web.xml:L19-L51] is therefore latent in this mode and decisive
+        // only in the strict one below, which is why neither mode on its own is proof. "other" is a real registry
+        // user in no group [backend/broker/src/main/liberty/config/includes/none.xml:L37].
         String withoutAnyGroup = JwtTestTokens.tokenFor(JwtTestTokens.USER_UNPRIVILEGED);
 
         // A create, never PUT .../debit or .../credit: those two are the only retail operations that consult the
@@ -141,29 +140,169 @@ public class RoleEnforcementIT extends PostgresTestSupport {
         ResponseEntity<String> response = rest.exchange("/cash-account/{owner}", HttpMethod.GET,
                 new HttpEntity<>(jsonHeaders(null)), String.class, READ_OWNER);
 
-        // Spring Security rejects this inside the filter chain, before any controller and therefore beyond the
-        // reach of error/ApiExceptionHandler's @RestControllerAdvice. Asserting the full payload - not just the
-        // status - is what proves error/ApiErrorAuthenticationEntryPoint is wired, because an unwired chain
-        // answers 401 with an empty body and a caller would then need a second parser for authentication
-        // failures and one for every other error (AAP 0.6.2).
+        // Rejected inside the filter chain, beyond the reach of error/ApiExceptionHandler's @RestControllerAdvice,
+        // so the full payload is what proves error/ApiErrorAuthenticationEntryPoint is wired: an unwired chain
+        // answers 401 with an empty body, leaving a caller two payload shapes to parse instead of one (AAP 0.6.2).
         assertApiError(response, HttpStatus.UNAUTHORIZED, "UNAUTHORIZED");
     }
 
-    /** Strict mode: a supported, documented configuration in which only the token's {@code groups} claim decides. */
+    @Test
+    void securityHeadersReachSuccessAndFilterChainErrorResponses() throws JsonProcessingException {
+        // config/SecurityConfig writes Spring Security's default headers EAGERLY as the documented workaround
+        // for CVE-2026-22732, under which a response committed through setHeader/setIntHeader/addIntHeader is
+        // sent without any of the lazily written ones. Both halves are needed because they commit through
+        // different code: the retail 200 is committed by MVC's message converter, while the 401 is committed
+        // inside the filter chain by error/ApiErrorAuthenticationEntryPoint.
+        seedAccount(READ_OWNER);
+
+        ResponseEntity<String> admitted = rest.exchange("/cash-account/{owner}", HttpMethod.GET,
+                new HttpEntity<>(jsonHeaders(JwtTestTokens.stockViewerToken())), String.class, READ_OWNER);
+        assertThat(admitted.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertSecurityHeaders(admitted.getHeaders());
+
+        ResponseEntity<String> unauthenticated = rest.exchange("/cash-account/{owner}", HttpMethod.GET,
+                new HttpEntity<>(jsonHeaders(null)), String.class, READ_OWNER);
+        assertApiError(unauthenticated, HttpStatus.UNAUTHORIZED, "UNAUTHORIZED");
+        assertSecurityHeaders(unauthenticated.getHeaders());
+    }
+
+    @Test
+    void headerWriterFilterWritesEagerlyInEveryBuiltChain() {
+        // The assertions above prove the headers ARRIVE, which they also do unpatched: CVE-2026-22732 only drops
+        // them when the application commits the response through setHeader/setIntHeader/addIntHeader, a path no
+        // endpoint of this service takes. So they cannot distinguish the workaround being engaged from it having
+        // silently failed to apply - and silent failure is the realistic outcome, because the fix is an
+        // ObjectPostProcessor whose type argument SecurityConfigurerAdapter's composite resolves reflectively.
+        // This asserts the state that actually closes the CVE, on the filter the running chain holds.
+        List<SecurityFilterChain> chains = securityFilterChain.getFilterChains();
+        assertThat(chains).isNotEmpty();
+
+        // Every chain, not the first: config/SecurityConfig builds one today, and a second one added later
+        // without the post-processor would reopen the CVE on whatever paths it matched.
+        for (SecurityFilterChain chain : chains) {
+            List<HeaderWriterFilter> headerWriters = chain.getFilters().stream()
+                    .filter(HeaderWriterFilter.class::isInstance)
+                    .map(HeaderWriterFilter.class::cast)
+                    .toList();
+            assertThat(headerWriters).as("HeaderWriterFilter present in chain %s", chain).hasSize(1);
+
+            // Read reflectively because Spring Security exposes only the setter. A rename in a future version
+            // fails this assertion, which is the correct outcome: the workaround would then need re-verifying
+            // against that version rather than being assumed to still hold.
+            Object eagerly = ReflectionTestUtils.getField(headerWriters.get(0), "shouldWriteHeadersEagerly");
+            assertThat(eagerly).as("shouldWriteHeadersEagerly in chain %s", chain).isEqualTo(Boolean.TRUE);
+        }
+    }
+
+    @Test
+    void authTypeDecidesTheDecoderAsTextAndIsNeverEvaluated() {
+        // AUTH_TYPE reaches the pod from a ConfigMap
+        // [infra/stocktrader-operator/helm-charts/stocktrader/templates/cash-account.yaml:L73-L77], so whoever can
+        // write that value must not thereby be able to run code. The payload closes the quote the removed
+        // @ConditionalOnExpression template opened, and evaluating that template shape here is what makes the
+        // assertion below mean something: it proves the value is genuinely executable, by setting the probe.
+        String probe = "cashaccount.test.authtype.expression.probe";
+        String payload = "none') or (T(java.lang.System).setProperty('" + probe
+                + "','executed') == null and 'x' == 'x";
+
+        System.clearProperty(probe);
+        try {
+            Boolean templateResult = new SpelExpressionParser()
+                    .parseExpression("!'none'.equalsIgnoreCase('" + payload + "'.trim())")
+                    .getValue(Boolean.class);
+
+            assertThat(templateResult).isTrue();
+            assertThat(System.getProperty(probe)).isEqualTo("executed");
+
+            // The condition that replaced it reads the same value through the Environment, which resolves
+            // placeholders and evaluates nothing, so the payload decides only by not being the text "none".
+            System.clearProperty(probe);
+            assertThat(JwtDecoderConfig.decoderRequired(
+                    new MockEnvironment().withProperty(SecurityConfig.AUTH_TYPE_PROPERTY, payload))).isTrue();
+            assertThat(System.getProperty(probe)).isNull();
+        } finally {
+            System.clearProperty(probe);
+        }
+
+        // Fail closed, and at start-up: the value is not a mode this service can verify, so both gates that read
+        // it stop the context instead of letting the pod serve traffic (AAP 0.6.5).
+        assertThatThrownBy(() -> SecurityConfig.authenticating(payload))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining(SecurityConfig.AUTH_TYPE_PROPERTY);
+        assertThatThrownBy(() -> new JwtDecoderConfig().jwtDecoder(properties(payload, ""), RESOURCE_LOADER))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining(SecurityConfig.AUTH_TYPE_PROPERTY);
+    }
+
+    @Test
+    void onlyNoneModeOmitsTheDecoderBean() {
+        // The bean's presence IS the none-mode contract - config/SecurityConfig resolves it through an
+        // ObjectProvider and configures no resource server when it is absent - so this mapping, not the mechanism
+        // that computes it, is what had to survive replacing the expression with a Condition.
+        assertThat(decoderRequiredFor(SecurityConfig.MODE_NONE)).isFalse();
+        assertThat(decoderRequiredFor("  NONE  ")).isFalse();
+        assertThat(decoderRequiredFor("basic")).isTrue();
+        assertThat(decoderRequiredFor("ldap")).isTrue();
+        assertThat(decoderRequiredFor("oidc")).isTrue();
+
+        // Unset binds to the chart's own default (.../values.yaml:L20), so a deployment that omits global.auth
+        // still authenticates rather than silently opening the service.
+        assertThat(JwtDecoderConfig.decoderRequired(new MockEnvironment())).isTrue();
+    }
+
+    @Test
+    void oidcVerificationKeysAreAcceptedOnlyFromAnHttpsKeySet() {
+        // In oidc mode the JWKS endpoint is the entire trust anchor
+        // [backend/broker/src/main/liberty/config/includes/oidc.xml:L16-L21]: over cleartext http anyone on the
+        // path answers for it, substitutes signing keys and mints a token this service accepts, StockTrader
+        // included. The transport is therefore a start-up condition, not deployment advice.
+        assertThat(oidcDecoderFor("https://keycloak.example.com/realms/stocktrader/protocol/openid-connect/certs"))
+                .isNotNull();
+
+        // A list rather than separate methods because each entry is one rejection reason of the same gate, and
+        // the AAP's test budget counts scenarios, not assertions (AAP 0.7.6). The last two carry the sentinel
+        // password: one is well formed and one is malformed, because the two take different code paths out of the
+        // validator and only the malformed one ever reached a URI parser whose own message repeats its input.
+        List<String> rejected = List.of(
+                "http://keycloak.example.com/realms/stocktrader/protocol/openid-connect/certs",
+                "HTTP://keycloak.example.com/certs",
+                "keycloak.example.com/certs",
+                "/realms/stocktrader/protocol/openid-connect/certs",
+                "https:///certs",
+                "https://keycloak.example.com/certs#signing",
+                "ht tp://keycloak.example.com/certs",
+                "",
+                "https://operator:" + CREDENTIAL_SENTINEL + "@keycloak.example.com/certs",
+                "https://operator:" + CREDENTIAL_SENTINEL + "@keycloak.example.com/cer ts");
+
+        for (String jwksUrl : rejected) {
+            assertThatThrownBy(() -> oidcDecoderFor(jwksUrl))
+                    .as("JWKS URL '%s' must fail start-up", jwksUrl)
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining(JWKS_URL_PROPERTY)
+                    // Asserted over the rendered stack trace, not the message alone: Spring prints the whole
+                    // cause chain when a context fails to start, so an exception attached beneath the redacted
+                    // message would put the password in pod logs just as surely as the message would.
+                    .satisfies(thrown -> assertThat(rendered(thrown)).doesNotContain(CREDENTIAL_SENTINEL));
+        }
+    }
+
+    /**
+     * Strict mode - where only the token's {@code groups} claim decides - in its own context, because the grant
+     * property is read while the filter chain and authority converter are built and cannot be switched mid-suite.
+     */
     @Nested
     @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
     @ActiveProfiles("test")
     @TestPropertySource(properties = "cashaccount.security.all-authenticated-hold-stocktrader=false")
     class StrictRoleMode extends PostgresTestSupport {
 
-        // Its own template because its own context listens on its own random port; named apart from the enclosing
-        // field so neither reads as the other's.
+        // Its own template because its own context listens on its own random port.
         @Autowired
         private TestRestTemplate strictRest;
 
-        // Declared here as well as in the enclosing class so this context configures itself completely, whatever
-        // a later change does to nested-configuration inheritance. Registering one key twice with the same
-        // supplier is a map write, not a conflict.
+        // Declared here as well as in the enclosing class so this context configures itself completely whatever
+        // a later change does to nested-configuration inheritance; one key registered twice is a map write.
         @DynamicPropertySource
         static void strictJwtSignerKey(DynamicPropertyRegistry registry) {
             registry.add("cashaccount.security.jwt.public-key-location", JwtTestTokens::publicKeyLocation);
@@ -216,12 +355,10 @@ public class RoleEnforcementIT extends PostgresTestSupport {
         @Test
         void headOnTheRetailAccountIsAuthorizedExactlyAsGet() {
             // Spring MVC answers HEAD from the @GetMapping handler, so a HEAD here IS the retail read with its
-            // body suppressed: it has to be admitted and refused on exactly the roles GET is. Two requests in one
-            // method because the parity, not either status alone, is the property under test. A HEAD response
-            // carries no body by definition, so only the status - and the content type the read still declares -
-            // can be asserted; the ApiError payload of a rejection is covered through GET above. Void.class, not
-            // String.class: HttpURLConnection has no stream to offer for a bodiless response, and asking for one
-            // would fail these requests as an I/O error instead of reporting the status they answered with.
+            // body suppressed and has to be admitted and refused on exactly the roles GET is - the parity, not
+            // either status alone, is the property, which is why both requests sit in one method. Void.class
+            // because HttpURLConnection has no stream to offer for a bodiless response and asking for one would
+            // fail these requests as an I/O error instead of reporting the status they answered with.
             String withoutAnyGroup = JwtTestTokens.tokenFor(JwtTestTokens.USER_UNPRIVILEGED);
 
             ResponseEntity<Void> refused = strictRest.exchange("/cash-account/{owner}", HttpMethod.HEAD,
@@ -229,9 +366,8 @@ public class RoleEnforcementIT extends PostgresTestSupport {
 
             assertThat(refused.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
 
-            // Seeded through this context rather than the enclosing one so the request under test and its
-            // precondition are decided by the same filter chain; a conflict is success for the same reason it is
-            // in seedAccount - the container outlives either context.
+            // Seeded through this context so the request under test and its precondition are decided by the same
+            // filter chain; a conflict is success for the same reason it is in seedAccount.
             ResponseEntity<String> seed = strictRest.exchange("/cash-account/{owner}", HttpMethod.POST,
                     new HttpEntity<>(accountBody(READ_OWNER, SEED_BALANCE),
                             jsonHeaders(JwtTestTokens.stockTraderToken())),
@@ -247,6 +383,20 @@ public class RoleEnforcementIT extends PostgresTestSupport {
             assertThat(contentType).isNotNull();
             assertThat(contentType.isCompatibleWith(MediaType.APPLICATION_JSON)).isTrue();
         }
+
+        @Test
+        void securityHeadersReachAForbiddenResponse() throws JsonProcessingException {
+            // A 403 is committed by error/ApiErrorAccessDeniedHandler inside the filter chain, one route
+            // further along than the 401 the enclosing class covers, and strict mode is the only mode in which
+            // the authorization rules can produce one at all.
+            ResponseEntity<String> refused = strictRest.exchange("/cash-account/{owner}", HttpMethod.POST,
+                    new HttpEntity<>(accountBody(STRICT_WRITE_OWNER, SEED_BALANCE),
+                            jsonHeaders(JwtTestTokens.stockViewerToken())),
+                    String.class, STRICT_WRITE_OWNER);
+
+            assertApiError(refused, HttpStatus.FORBIDDEN, "FORBIDDEN");
+            assertSecurityHeaders(refused.getHeaders());
+        }
     }
 
     private void seedAccount(String owner) {
@@ -254,10 +404,37 @@ public class RoleEnforcementIT extends PostgresTestSupport {
                 new HttpEntity<>(accountBody(owner, SEED_BALANCE), jsonHeaders(JwtTestTokens.stockTraderToken())),
                 String.class, owner);
 
-        // Setup, so a conflict is success: the container outlives this context, and an owner already created by an
-        // earlier run in the same JVM is the state this test wants. Any OTHER status is a broken precondition and
-        // is surfaced here rather than mis-read later as an authorization result.
+        // Setup, so a conflict is success: the container outlives this context and an owner created by an earlier
+        // run in the same JVM is the state this test wants. Any other status is a broken precondition, surfaced
+        // here rather than mis-read later as an authorization result.
         assertThat(response.getStatusCode()).isIn(HttpStatus.OK, HttpStatus.CONFLICT);
+    }
+
+    private static boolean decoderRequiredFor(String authType) {
+        return JwtDecoderConfig.decoderRequired(
+                new MockEnvironment().withProperty(SecurityConfig.AUTH_TYPE_PROPERTY, authType));
+    }
+
+    // Calls the bean method directly rather than booting a context per URL: the value is read while the decoder is
+    // built, so a direct call reaches exactly the code a starting pod reaches, and NimbusJwtDecoder resolves a JWKS
+    // endpoint lazily - an accepted URL is therefore never fetched here.
+    private static JwtDecoder oidcDecoderFor(String jwksUrl) {
+        return new JwtDecoderConfig().jwtDecoder(properties("oidc", jwksUrl), RESOURCE_LOADER);
+    }
+
+    // Exactly what a failing context writes to the log, cause chain included, so the assertion reads the text an
+    // operator would actually see rather than the one field the thrower chose.
+    private static String rendered(Throwable thrown) {
+        StringWriter text = new StringWriter();
+        thrown.printStackTrace(new PrintWriter(text));
+        return text.toString();
+    }
+
+    private static CashAccountProperties properties(String authType, String jwksUrl) {
+        CashAccountProperties properties = new CashAccountProperties();
+        properties.getSecurity().setAuthType(authType);
+        properties.getSecurity().getJwt().setJwksUrl(jwksUrl);
+        return properties;
     }
 
     private static HttpHeaders jsonHeaders(String tokenOrNull) {
@@ -296,6 +473,21 @@ public class RoleEnforcementIT extends PostgresTestSupport {
         // of contract that an "is null" assertion would let through.
         assertThat(error.has("owner")).isFalse();
         assertThat(error.has("reservationId")).isFalse();
+    }
+
+    // Spring Security's own defaults, asserted rather than a set this test invents: nothing in
+    // config/SecurityConfig enumerates, disables or replaces a header writer, so these five are exactly what the
+    // framework writes and what the eager-write setting has to keep delivering. Header VALUES are matched by the
+    // substring that carries the guarantee - "no-store" inside the full cache directive - so a framework upgrade
+    // reordering the directive list is not read as a regression while a lost directive still is. RANDOM_PORT and
+    // a real server are what make this provable at all: the headers are written by a servlet filter around a
+    // response the container commits, and a MockMvc slice never commits one.
+    private static void assertSecurityHeaders(HttpHeaders headers) {
+        assertThat(headers.getFirst(HttpHeaders.CACHE_CONTROL)).contains("no-store");
+        assertThat(headers.getFirst(HttpHeaders.PRAGMA)).isEqualTo("no-cache");
+        assertThat(headers.getFirst(HttpHeaders.EXPIRES)).isEqualTo("0");
+        assertThat(headers.getFirst("X-Content-Type-Options")).isEqualTo("nosniff");
+        assertThat(headers.getFirst("X-Frame-Options")).isEqualTo("DENY");
     }
 
     private static JsonNode json(String body) throws JsonProcessingException {

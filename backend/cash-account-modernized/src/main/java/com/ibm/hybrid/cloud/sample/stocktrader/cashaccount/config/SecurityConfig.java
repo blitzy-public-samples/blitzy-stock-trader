@@ -1,19 +1,3 @@
-/*
-       Copyright 2025 Kyndryl, All Rights Reserved
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
- */
-
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.config;
 
 import java.util.Arrays;
@@ -34,6 +18,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
+import org.springframework.security.config.annotation.ObjectPostProcessor;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
@@ -42,38 +27,18 @@ import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.oauth2.jwt.JwtDecoder;
 import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationConverter;
 import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.header.HeaderWriterFilter;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.servlet.HandlerInterceptor;
 import org.springframework.web.servlet.ModelAndView;
 import org.springframework.web.servlet.config.annotation.InterceptorRegistry;
 import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
 
-/*
- * The authorization rules below are broker's own, re-expressed: a GET is allowed to StockViewer and
- * StockTrader, a POST, PUT or DELETE to StockTrader alone
- * [backend/broker/src/main/webapp/WEB-INF/web.xml:L19-L32, L34-L51]. Broker states them as two
- * <security-constraint> blocks over url-pattern /* because it takes its subject as a path parameter, which
- * is exactly this service's shape too - so the split here is by verb over /cash-account/{owner}, not by
- * resource, and no path-by-path table is needed or wanted.
- *
- * The role NAMES carried in a token are not enough on their own to reproduce broker's effective behaviour,
- * because the siblings bind the StockTrader role to the ALL_AUTHENTICATED_USERS special subject
- * <security-role id="StockTrader"><special-subject type="ALL_AUTHENTICATED_USERS" id="IBMid"/></security-role>
- * [backend/broker/src/main/liberty/config/server.xml:L56-L60]: through broker today, ANY authenticated
- * caller may write. config/JwtDecoderConfig therefore grants ROLE_StockTrader to every authenticated
- * principal while cashaccount.security.all-authenticated-hold-stocktrader is true - the deployed default -
- * so cutover changes no caller's effective permissions and the GET-versus-write split written here is
- * latent rather than absent. Setting the property false is the supported, documented strict mode in which
- * only the token's groups claim decides. That is the whole reason the rules below appear once, as the real
- * role split, and never as a second conditional matcher set keyed on the grant: the grant belongs to the
- * authority conversion, and duplicating it as authorization rules would give one behaviour two switches.
- */
 /** The service's single security filter chain and method policy: broker's role split, fail-closed, as ApiError. */
 @Configuration
 @EnableWebSecurity
 public class SecurityConfig {
 
-    /** The configuration key, named in every failure message so the fix is unambiguous. */
     public static final String AUTH_TYPE_PROPERTY = "cashaccount.security.auth-type";
 
     /**
@@ -85,7 +50,6 @@ public class SecurityConfig {
      */
     public static final List<String> SUPPORTED_AUTH_TYPES = List.of("basic", "ldap", "oidc", "none");
 
-    /** The mode in which this service authenticates nothing at all. */
     public static final String MODE_NONE = "none";
 
     private static final String ROLE_STOCK_TRADER = "StockTrader";
@@ -122,8 +86,8 @@ public class SecurityConfig {
      * @param jwtAuthenticationConverterProvider the {@code groups}-to-authorities converter
      * @return the built chain
      * @throws Exception as {@link HttpSecurity#build()} declares
-     * @throws IllegalStateException when the configured auth type is not one of
-     *         {@link #SUPPORTED_AUTH_TYPES}, or when an authenticating mode has no decoder to verify with
+     * @throws IllegalStateException when the configured auth type is unsupported, or when an authenticating
+     *         mode has no decoder to verify with
      */
     @Bean
     public SecurityFilterChain cashAccountSecurityFilterChain(
@@ -168,6 +132,33 @@ public class SecurityConfig {
                 .exceptionHandling(handling -> handling
                         .authenticationEntryPoint(authenticationEntryPoint)
                         .accessDeniedHandler(accessDeniedHandler))
+
+                // Spring Security's default header writers are kept exactly as they are - no writer is
+                // enumerated, disabled or replaced - and only WHEN they run is changed, which is the workaround
+                // CVE-2026-22732 documents. In 6.3.0 through 6.3.14, the version range this module resolves
+                // inside, OnCommittedResponseWrapper tracks Content-Length through addHeader() alone and not
+                // through setHeader(), setIntHeader() or addIntHeader(), so a response committed through one of
+                // those paths is sent with NONE of the lazily written headers - no Cache-Control: no-store on a
+                // balance or ledger body, no nosniff, no DENY. Upgrading is not available here: Maven Central's
+                // 6.3 line ends at 6.3.10, the 6.3.15 fix ships only through commercial support, and the OSS
+                // fixes 6.5.9/7.0.4 require Spring Framework 6.2 while the mandated Boot 3.3 line ships 6.1
+                // (see the parent comment above; AAP 0.11.2 keeps 3.3.13 an open item rather than a bump).
+                // Writing eagerly has one documented behavioural consequence: an application-written header then
+                // overrides that single header instead of suppressing Spring Security's whole cache-header set.
+                // This service writes no cache headers of its own anywhere, so the caveat costs it nothing.
+                //
+                // An anonymous class, not a lambda: ObjectPostProcessor declares the generic method
+                // <O extends T> O postProcess(O) and is therefore not a functional interface, and even were it
+                // one, SecurityConfigurerAdapter's composite resolves each processor's type argument with
+                // GenericTypeResolver - an erased lambda type resolves to null and the processor would be applied
+                // to every object in the chain instead of the one filter meant here.
+                .headers(headers -> headers.addObjectPostProcessor(new ObjectPostProcessor<HeaderWriterFilter>() {
+                    @Override
+                    public <O extends HeaderWriterFilter> O postProcess(O headerWriterFilter) {
+                        headerWriterFilter.setShouldWriteHeadersEagerly(true);
+                        return headerWriterFilter;
+                    }
+                }))
 
                 .authorizeHttpRequests(registry -> authorize(registry, authenticating));
 
@@ -217,24 +208,16 @@ public class SecurityConfig {
         };
     }
 
-    /*
-     * Spring MVC answers OPTIONS itself for any mapped path, with 200 and an Allow header, without consulting a
-     * controller. Left alone that is a verb this service's contract does not carry being answered as though it
-     * had succeeded, while AAP 0.6.2 promises 405 UNSUPPORTED_METHOD for exactly that case - a mapped path
-     * reached with an unimplemented verb. Failing closed here is what replaces the legacy dispatcher's missing
-     * WHEN OTHER, whose unrecognized request codes returned a success-looking status and the caller's own input
-     * [backend/cash-account-cobol/COBOL/CASH00.cbl:L89-L108].
-     *
-     * postHandle rather than preHandle, deliberately: by then MVC's metadata handler has computed the accurate
-     * per-path Allow and written it to a response that is not yet committed, so the 405 can carry exactly the
-     * verbs that path implements. Rejecting in preHandle would mean either a 405 with no Allow at all or a second
-     * copy of the routing table inside this guard. The service maps no OPTIONS handler of its own, so that
-     * metadata handler is the only handler that can have run before this point and it mutates nothing but the
-     * header. HEAD is deliberately NOT rejected: MVC answers it from the retail read handler, so it is part of
-     * the contract surface and is authorized exactly as GET is above.
+    /**
+     * Fails closed the OPTIONS that Spring MVC would otherwise answer 200 on any mapped path, since a verb this
+     * contract does not carry must arrive as 405 UNSUPPORTED_METHOD rather than as an apparent success.
      */
     private static final class UnsupportedMethodGuard implements HandlerInterceptor {
 
+        // postHandle, not preHandle: by now MVC's metadata handler has computed the accurate per-path Allow on a
+        // response that is not yet committed, so the 405 can name exactly the verbs that path implements without a
+        // second copy of the routing table here. HEAD is deliberately not rejected - MVC answers it from the retail
+        // read handler, so it is contract surface and is authorized exactly as GET is.
         @Override
         public void postHandle(HttpServletRequest request, HttpServletResponse response, Object handler,
                 ModelAndView modelAndView) throws HttpRequestMethodNotSupportedException {
@@ -264,36 +247,10 @@ public class SecurityConfig {
         }
     }
 
-    /*
-     * Rule order is the behaviour, not a formatting choice: Spring Security applies the FIRST matching rule, so a
-     * broader pattern placed above a narrower one silently becomes the only one that ever decides.
-     *
-     * Two places in this sequence are load-bearing beyond the obvious top-to-bottom reading.
-     *
-     * The institutional space is claimed AFTER the retail matchers, which is the order AAP 0.7.5 fixes. Every
-     * retail matcher is method-specific and covers exactly one path segment after /cash-account, while every
-     * genuine institutional route carries four or more - /cash-account/institutional/accounts/{owner}, that path
-     * plus /holds or /ledger, /cash-account/institutional/reservations/{id} and that path plus /settle or
-     * /release - so no institutional route can be absorbed by a retail pattern. The only paths the retail
-     * matchers take from the institutional wildcard are /cash-account/institutional itself and
-     * /cash-account/institutional/debit|credit, and those are precisely the paths Spring MVC dispatches to the
-     * retail controller as an account owned by the owner named INSTITUTIONAL. Claiming the wildcard first
-     * instead authorized those paths by a reading no handler applies, so a strict-mode StockViewer's valid
-     * retail read of that owner was answered 403 rather than by the retail rule.
-     *
-     * The /cash-account/** rule that follows is authenticated(), never denyAll(). An authenticated caller asking
-     * for a path or a verb this service does not implement MUST reach Spring MVC, because that is what produces
-     * the 404 UNSUPPORTED_PATH or 405 UNSUPPORTED_METHOD ApiError; only an unauthenticated one is refused here,
-     * with a 401. That pairing is the deliberate improvement on the legacy dispatcher, whose EVALUATE WS-REQ
-     * carried no WHEN OTHER: an unrecognized request code executed no SQL, left SQLCODE untouched so the return
-     * field looked like success, and echoed the caller's own amount back as the balance
-     * [backend/cash-account-cobol/COBOL/CASH00.cbl:L89-L108]. Here an unsupported operation is named as such.
-     *
-     * anyRequest().denyAll() closes everything outside this service's path space, in every mode including none.
-     * It is the analogue of broker's <deny-uncovered-http-methods /> [.../WEB-INF/web.xml:L33]: whatever is added
-     * to this application later is denied until a rule above admits it, rather than inheriting whatever the
-     * framework's default happens to be.
-     */
+    // Broker's own split, re-expressed by verb over /cash-account/{owner} because broker takes its subject as a
+    // path parameter too [backend/broker/src/main/webapp/WEB-INF/web.xml:L19-L32, L34-L51]. Rule order is the
+    // behaviour: Spring Security applies the FIRST matching rule, so a broader pattern above a narrower one
+    // silently becomes the only one that ever decides.
     private static void authorize(
             AuthorizeHttpRequestsConfigurer<HttpSecurity>.AuthorizationManagerRequestMatcherRegistry registry,
             boolean authenticating) {
@@ -310,13 +267,19 @@ public class SecurityConfig {
         registry.requestMatchers(ACTUATOR_SPACE, METRICS_PATH).permitAll();
 
         if (authenticating) {
+            // These write rules stay latent while cashaccount.security.all-authenticated-hold-stocktrader is true
+            // (the deployed default): config/JwtDecoderConfig then grants StockTrader to every authenticated
+            // caller, mirroring the siblings' ALL_AUTHENTICATED_USERS binding
+            // [backend/broker/src/main/liberty/config/server.xml:L56-L60], so cutover changes no caller's
+            // effective permissions. The grant belongs to the authority conversion alone - duplicating it as a
+            // second matcher set here would give one behaviour two switches.
             registry
                     .requestMatchers(HttpMethod.GET, RETAIL_ACCOUNT_PATH)
                             .hasAnyRole(ROLE_STOCK_VIEWER, ROLE_STOCK_TRADER)
                     // HEAD carries the same roles as GET because Spring MVC answers a HEAD from the @GetMapping
-                    // handler - it IS the retail read, returning only the response metadata - so any weaker rule
-                    // authorizes the read itself. Left to rule (5) authenticated() below, as a GET-only matcher
-                    // leaves it, a strict-mode principal holding neither role executed the read handler.
+                    // handler - it is the retail read, returning only the response metadata - so any weaker rule
+                    // authorizes that read: under rule (5) authenticated() alone, which is where a GET-only
+                    // matcher leaves it, a strict-mode principal holding neither role reaches the read handler.
                     // requestMatchers takes one method per call, so the parity is a second chained matcher.
                     .requestMatchers(HttpMethod.HEAD, RETAIL_ACCOUNT_PATH)
                             .hasAnyRole(ROLE_STOCK_VIEWER, ROLE_STOCK_TRADER)
@@ -324,7 +287,18 @@ public class SecurityConfig {
                     .requestMatchers(HttpMethod.PUT, RETAIL_ACCOUNT_PATH, RETAIL_DEBIT_PATH, RETAIL_CREDIT_PATH)
                             .hasRole(ROLE_STOCK_TRADER)
                     .requestMatchers(HttpMethod.DELETE, RETAIL_ACCOUNT_PATH).hasRole(ROLE_STOCK_TRADER)
+                    // Claimed after the retail matchers, the order AAP 0.7.5 fixes: every genuine institutional
+                    // route carries four or more segments, so none is absorbed above, while the only paths the
+                    // retail matchers take from this wildcard are /cash-account/institutional and its
+                    // debit|credit - which MVC dispatches to the retail controller as the owner INSTITUTIONAL, so
+                    // claiming the wildcard first answers a strict-mode StockViewer's valid read of it 403.
                     .requestMatchers(INSTITUTIONAL_SPACE).hasRole(ROLE_STOCK_TRADER)
+                    // authenticated(), never denyAll(): an authenticated caller asking for a path or verb this
+                    // service does not implement must reach Spring MVC, which is what produces the 404
+                    // UNSUPPORTED_PATH or 405 UNSUPPORTED_METHOD ApiError. Only an unauthenticated one is
+                    // refused here. The legacy dispatcher's EVALUATE WS-REQ carried no WHEN OTHER, so an
+                    // unrecognized code left SQLCODE untouched and echoed the caller's own amount back as the
+                    // balance [backend/cash-account-cobol/COBOL/CASH00.cbl:L89-L108].
                     .requestMatchers(SERVICE_SPACE).authenticated();
         } else {
             // auth-type=none disables authentication entirely, and the service's own path space has to open with
@@ -340,6 +314,9 @@ public class SecurityConfig {
             registry.requestMatchers(SERVICE_SPACE).permitAll();
         }
 
+        // Closes everything outside this service's path space in every mode, none included - the analogue of
+        // broker's <deny-uncovered-http-methods /> [backend/broker/src/main/webapp/WEB-INF/web.xml:L33]: whatever
+        // is added to this application later is denied until a rule above admits it.
         registry.anyRequest().denyAll();
     }
 

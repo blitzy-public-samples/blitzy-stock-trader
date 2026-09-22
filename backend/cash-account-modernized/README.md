@@ -209,9 +209,9 @@ owner — and never part of a cash-account cutover.
 
 ### How the JDBC URL is assembled
 
-`spring.datasource.url` is not a static property. `DataSourceGuardConfig` assembles
-`jdbc:postgresql://<host>:<port>/<database>` and, when `JDBC_SSL=true`, appends `?ssl=true&sslmode=verify-ca` plus
-**exactly one** trust source:
+`spring.datasource.url` is not a static property, and it is not an accepted input either. `DataSourceGuardConfig`
+assembles `jdbc:postgresql://<host>:<port>/<database>` and, when `JDBC_SSL=true`, appends `?ssl=true&sslmode=verify-ca`
+plus **exactly one** trust source:
 
 - `&sslrootcert=<file>` when `cert_defaultTrustStore` carries PEM text. The PEM is written to a private temporary
   file and pgJDBC's default `LibPQFactory` verifies the server chain against it.
@@ -221,8 +221,30 @@ owner — and never part of a cash-account cutover.
 These are the same properties `backend/portfolio/src/main/liberty/config/includes/postgres.xml` uses
 (`ssl`, `sslMode=verify-ca`, `sslfactory=org.postgresql.ssl.DefaultJavaSSLFactory`), with Liberty's `cert_*` keystore
 import convention replaced by pgJDBC's `sslrootcert` file — the chart delivers the certificate as PEM text, not as a
-keystore, and only one of the two mechanisms may appear in a URL. `DataSourceGuardConfigTest` covers both shapes and
-the guard.
+keystore, and only one of the two mechanisms may appear in a URL.
+
+A `spring.datasource.url` arriving from any other property source — `SPRING_DATASOURCE_URL` in the container
+environment, a system property, a command-line argument — is **never** honoured as written, because that one value
+would otherwise decide the dialect, the host, the credentials and the TLS mode together, none of which the
+`JDBC_KIND` guard can see:
+
+- While `JDBC_HOST` or `JDBC_DB` carries a value — every chart deployment, since both come from non-optional
+  configMap keys — a supplied URL is **refused** and start-up fails naming both sources. Change
+  `database.host`/`.port`/`.db` in the release values instead.
+- While `JDBC_SSL=true`, a supplied URL is **refused** whatever it says. `sslmode=verify-ca` validates the server's
+  certificate chain but not its hostname — that is what `verify-full` adds — so under TLS the host is itself a trust
+  decision: a URL naming its own host could reach a different server presenting any certificate the same CA ever
+  signed, and the connection would still verify. Where TLS is demanded the host comes from `JDBC_HOST`, `JDBC_PORT`
+  and `JDBC_DB` alone.
+- A run that carries no chart variables and no TLS (a hand-started process, or `LedgerImmutabilityIT`'s second
+  application context) keeps the URL's **host, port and database only**. The scheme must be `jdbc:postgresql://`;
+  `user:password@host` user information, a `user=` or `password=` parameter, any `ssl*` parameter, more than one
+  host, extra path segments and any parameter outside `ApplicationName`, `assumeMinServerVersion`, `connectTimeout`,
+  `currentSchema`, `defaultRowFetchSize`, `loggerFile`, `loggerLevel`, `loginTimeout`, `reWriteBatchedInserts`,
+  `socketTimeout` and `tcpKeepAlive` are refused by name, so a supplied URL can neither weaken nor claim TLS.
+- No refusal message quotes the URL or a parameter value, because either may be the credential it was refused for.
+
+`DataSourceGuardConfigTest` covers both TLS shapes, the `JDBC_KIND` guard and every refusal above.
 
 ### Properties with no environment binding
 
@@ -833,11 +855,38 @@ Two mechanics are worth knowing before editing that file:
 
 Spring Boot was chosen for this rather than Flyway or Liquibase because neither appears in any `pom.xml` in this
 checkout, `backend/portfolio` hand-applies its `createTables.ddl`, and the mechanism is part of the mandated framework.
-The same file can be applied by hand:
+The same file can be applied by hand — under the DDL-owning role of the hardened posture below — with the
+connection's coordinates in the environment and the password reaching `psql` through its own prompt or a `0600` file:
 
 ```bash
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f src/main/resources/schema/cash-account-schema.sql
+# The non-secret coordinates are environment variables, so no part of the connection is a command-line argument.
+export PGHOST='<host>' PGPORT=5432 PGDATABASE='<database>' PGUSER='<ddl-owning-role>'
+export PGSSLMODE=verify-ca PGSSLROOTCERT='<ca-bundle.pem>'   # omit both only for a local throwaway database
+
+# Interactive: psql asks for the password itself, so it reaches neither argv nor HISTFILE.
+psql -v ON_ERROR_STOP=1 -f src/main/resources/schema/cash-account-schema.sql
+
+# Non-interactive (a pipeline step): the password lives in a 0600 file that psql opens itself.
+umask 077
+IFS= read -rsp "password for $PGUSER: " CA_DDL_PW; echo
+printf '%s:%s:%s:%s:%s\n' "$PGHOST" "$PGPORT" "$PGDATABASE" "$PGUSER" "$CA_DDL_PW" > ca-ddl.pgpass
+unset CA_DDL_PW
+PGPASSFILE=./ca-ddl.pgpass psql -w -v ON_ERROR_STOP=1 -f src/main/resources/schema/cash-account-schema.sql
+shred -u ca-ddl.pgpass 2>/dev/null || rm -f ca-ddl.pgpass
 ```
+
+**Never hand `psql` a connection URI — `psql "postgres://user:password@host/db"`, or the `$DATABASE_URL` such a URI is
+conventionally kept in.** The shell expands it before `psql` runs, so the password becomes part of `psql`'s `argv`,
+where `ps -o args=` shows it to every process on the host for the life of the command, and an interactive shell keeps
+the same string in `HISTFILE` long afterwards. The variables above carry only the non-secret coordinates;
+`PGPASSFILE` names a file `psql` opens by itself (`~/.pgpass` is its default location), and `psql` **ignores** that
+file unless its permissions are `0600` or tighter — which is what `umask 077` guarantees. Escape any `:` or `\` in
+the password with a backslash there, since `:` is the field separator. `PGPASSWORD` would also keep the secret out of
+`argv`, but a process environment is readable through `ps -e` or `/proc` on some systems, so the file is the safer of
+the two; `-w` keeps the non-interactive form from blocking on a prompt when that file is missing or rejected, so the
+step fails loudly instead of hanging. `PGSSLMODE=verify-ca` with `PGSSLROOTCERT` is libpq's spelling of the TLS
+posture this service's own JDBC URL carries, so the hand-applied path verifies the same server chain rather than a
+weaker one.
 
 `psql` tolerates the `;;` terminators (the second semicolon is an empty statement), so the one file serves both the
 start-up initializer and the hand-applied path — and running it twice changes nothing.

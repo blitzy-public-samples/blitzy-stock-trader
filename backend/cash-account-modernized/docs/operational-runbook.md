@@ -29,9 +29,9 @@ it, because a paraphrase is the copy that goes stale.
 
 | Role | Holds |
 | --- | --- |
-| Platform operator | The change window; the Helm/operator values and the StockTrader CR; broker and portfolio restart authority; the on-call rollback decision |
+| Platform operator | The change window; the Helm/operator values and the StockTrader CR; broker and portfolio restart authority; the on-call rollback decision; custody of the sealed values/CR snapshot and every other release-configuration artifact of the restricted class |
 | Mainframe operator | CICS transaction enable/disable; DB2 utility and IDCAMS execution; the `FREE`/`DROP`/`DELETE` retirement actions; the replay of a rollback file through the existing transaction |
-| Cash-account data owner | Acceptance of every reconciliation variance; the catalog baseline; the final load and pre-routing validation |
+| Cash-account data owner | Acceptance of every reconciliation variance; the catalog baseline; the final load and pre-routing validation; custody of every owner-level artifact of the restricted class, and the party who reads them |
 | Product owner | Acceptance of the dual-run result and of the post-cutover state |
 | Risk / compliance | Joint authorization of decommission, with the data owner and the platform owner |
 | Platform owner | The release's relational store (the PostgreSQL move), `vault.enabled`, and joint decommission authorization |
@@ -81,6 +81,7 @@ missing.
   | `<dir>`, `<window-dir>` | The directory holding that run's export or shadow files |
   | `<export-pvc>`, `<job-name>` | The read-only volume claim that carries the frozen final export the scheduled reconcile of Step 3 reads, and the name of one of that schedule's jobs |
   | `<n>` | The sequence number of a repeated evidence file — `step3-reconcile-1.txt`, then `-2`, and so on |
+  | `<restricted-dir>`, `<evidence-store-locator>`, `<custodian>` | The 0700 local staging directory restricted-class evidence is produced in, the store locator a pointer line names, and the custodian role from [Roles](#roles) — all three fixed by the evidence-handling determination, see [Evidence handling and classification](#evidence-handling-and-classification) |
   | `<OWNER>`, `<reservationId>` | Named in prose only. In a command they arrive as **data** from a file, never substituted into it — see [Operator command safety](#operator-command-safety). A bearer token is likewise never substituted; it reaches `curl` from a protected config file |
   | `<broker-host>` | The broker service host, for the one post-cutover read through broker |
   | `<hlq>`, `<sequential-dataset>`, `<wlm-env>`, `<db2-ssid>` | z/OS high-level qualifier, target data set, WLM environment and DB2 subsystem — site values supplied by the mainframe team |
@@ -95,9 +96,14 @@ missing.
 - **Tool database access.** The `tool` profile needs the same `JDBC_KIND`, `JDBC_HOST`, `JDBC_PORT`,
   `JDBC_DB`, `JDBC_ID`, `JDBC_PASSWORD` environment as a normal run — see the configuration map in
   [`../README.md`](../README.md).
-- **Evidence register.** Every item listed under *Evidence to capture* is attached to the change record
-  for its step, named `step<N>-<item>`, before that step's sign-off is requested. Evidence captured
-  after a sign-off is not evidence for it.
+- **Evidence register.** Every item listed under *Evidence to capture* is **registered** for its step —
+  named `step<N>-<item>`, with the class its table's **Class** column gives it — before that step's
+  sign-off is requested. Registering and attaching are not the same act: a change-record-class item is
+  attached to the change record, while a restricted-class item is sealed into the restricted evidence
+  store and only its pointer line is attached. Which is which, and why the distinction is not
+  negotiable per item, is [Evidence handling and
+  classification](#evidence-handling-and-classification). Evidence captured after a sign-off is not
+  evidence for it.
 - **Schema qualification.** Steps 1 and 2 qualify every relation with `cash_account_rehearsal.`,
   because the rehearsal schema is deliberately not on the default search path — an unqualified query
   there would silently read production. Steps 3 and 4 run against the default search path, which by
@@ -158,9 +164,14 @@ unset JDBC_PASSWORD PGPASSWORD
 shred -u ca-db.env ca-auth.conf 2>/dev/null || rm -f ca-db.env ca-auth.conf
 ```
 
-**No evidence file carries a secret.** The evidence register is attached to a change record that many
-people read, so a credential is recorded by where it came from — "the `database.password` key of the
-release secret, read at 14:05 by the platform operator" — and never by its value.
+**No change-record evidence carries a secret.** What is attached to a change record is read by everyone
+who can read the change, so a credential is recorded by where it came from — "the `database.password`
+key of the release secret, read at 14:05 by the platform operator" — and never by its value. One
+artifact in this document unavoidably embeds credentials, because a rollback has to restore them
+byte-for-byte: Step 0's verbatim values/CR snapshot. It is the reason the restricted class exists, it
+is sealed rather than attached, and what the change record gets in its place is a redacted structural
+derivation and a pointer — see [Evidence handling and
+classification](#evidence-handling-and-classification) and [Step 0 action 2](#actions).
 
 The whole environment is never captured and filtered. A denylist (`env | grep -vE 'PASSWORD|TOKEN'`)
 passes every secret whose name it did not anticipate — `AWS_SECRET_ACCESS_KEY`, `DOCKER_AUTH_CONFIG`,
@@ -183,7 +194,8 @@ newline) into a **NUL-delimited** list, because a newline-delimited list cannot 
 contains a newline:
 
 ```bash
-python3 - "<dir>/cashaccounty.csv" > step3-owners.nul <<'PY'
+umask 077
+python3 - "<dir>/cashaccounty.csv" > <restricted-dir>/step3-owners.nul <<'PY'
 import csv, sys
 with open(sys.argv[1], newline='') as f:
     for row in csv.DictReader(f):
@@ -205,6 +217,91 @@ Define `ca_urlencode` once in the session (or in a helper file the session sourc
 assumes it. Each consuming loop then reads `while IFS= read -r -d '' owner`, encodes, and puts the
 result inside a quoted URL.
 
+That list is itself customer data — it is the set of every owner the legacy system holds — so it is
+written under `umask 077` into `<restricted-dir>` and handled as [Evidence handling and
+classification](#evidence-handling-and-classification) requires, as is every file a loop over it
+produces.
+
+### Evidence handling and classification
+
+What makes an artifact evidence — it came out of the release, or out of the database — is also what
+makes publishing it a disclosure. A change record is read by everyone who can read the change:
+approvers, auditors, operators of other services, in most estates the whole platform group. Neither
+source system has that readership. A value snapshot's secrets are readable in the release only by a
+principal who can read the release Secret, which the chart renders from those very values
+(`infra/stocktrader-operator/helm-charts/stocktrader/templates/credentials.yaml:L20-L47`); an owner's
+balance is readable only through a privilege granted on `cash_account` and `ledger_entry`. Copying
+either into the change record grants it to everyone who can read the change — and after the fact, a
+disclosure through the evidence register is indistinguishable from a disclosure through the system
+itself.
+
+Every item in every *Evidence to capture* table therefore carries a **Class**, decided by what the item
+contains and never by what is convenient to attach:
+
+| Class | What it holds | Where it goes |
+| --- | --- | --- |
+| **Change record** | Counts, checksums, run and batch ids, gate verdicts, exit codes, timestamps, role names, redacted structure | Attached to the change record for its step, named `step<N>-<item>` |
+| **Restricted** | Anything carrying a secret — a credential, a token, a key — or customer data: an owner identifier, a balance, a reservation id, an order reference, a ledger row | Sealed into the restricted evidence store and **never attached**; the change record carries a pointer line instead |
+
+A restricted item is still evidence and is still read in full: the cash-account data owner adjudicates
+variance rows one at a time, and the platform operator applies the sealed snapshot at gate (e). It is
+read **in the store**, by a named role, with the read recorded. A derived file inherits the class of
+what it came from — a percent-encoded owner is still an owner, and a diff of two value snapshots still
+carries the values that differ — and no item changes class because a reviewer would find it easier to
+have attached.
+
+The pointer line is what the change record carries in a restricted item's place, one line per artifact:
+
+```text
+step3-validation.tsv  restricted  sha256=<hex>  store=<evidence-store-locator>  custodian=<custodian>  read-by=<named parties>
+```
+
+It exists so that a sealed artifact is provably present, unaltered and reachable without being copied:
+the checksum ties the sealed bytes to what the step produced, the custodian is a role from the
+[Roles](#roles) table, and `read-by` names the parties the determination admits. A store nobody can
+name is not retention, and a custodian nobody holds is not access control.
+
+The store is whatever the requesting organization already uses for restricted records, and it must
+provide:
+
+- **Encryption at rest**, because the reader this class has to be protected from is a reader of the
+  storage rather than a reader of the change.
+- **Access by named least-privilege roles taken from the [Roles](#roles) table** — owner-level artifacts
+  to the cash-account data owner, release-configuration artifacts to the platform operator and platform
+  owner — and to nobody by default.
+- **A recorded read**: reader, artifact, time. Without one, an authorized read and an unauthorized copy
+  leave the same trace, which is none.
+- **Secret material in the organization's secret manager, not in a file store.** A file store's unit of
+  access is the file, while a rotation's unit is the credential, and the question after an exposure is
+  always "which credentials", never "which files".
+
+Local working copies follow the same discipline as the credential files of [Operator command
+safety](#operator-command-safety): created under `umask 077` so they are `0600` from their first byte,
+checksummed, sealed, and destroyed before the step closes.
+
+```bash
+umask 077                                                   # 0600 at creation, not chmod'ed afterwards
+mkdir -p <restricted-dir>                                   # 0700 under the same umask
+sha256sum <restricted-dir>/<artifact> | tee -a step<N>-restricted.sha256
+# Seal <artifact> into <evidence-store-locator> and confirm it is there, then remove the local copy:
+shred -u <restricted-dir>/<artifact> 2>/dev/null || rm -f <restricted-dir>/<artifact>
+```
+
+A restricted artifact is never pasted into a ticket comment, a chat message or mail. Each of those
+copies it into a system with its own readership and its own retention, and the evidence-handling
+determination governs neither.
+
+**Retention and disposal are answered by the requesting organization, in writing.** No period, duration
+or default appears anywhere in this document, for the reason standing prohibition 4 gives: this
+repository holds no retention policy, so a period written here would read as an answer while carrying
+no authority. The written answer must cover the evidence of every step on the same questions as the
+[Step 4 precondition](#preconditions-4) — which artifacts are retained, for how long, on what medium
+and under whose control, who may read them and how access is recorded, and when and how they are
+disposed of and who authorizes disposal — and that step's question table names the Steps 0-3 artifacts
+explicitly so they cannot fall outside the answer. Until the answer exists, restricted evidence stays
+in the store and nothing is disposed of; the `shred -u` above destroys a *local working copy* whose
+sealed original remains, which is hygiene and not a disposal decision.
+
 ### Step index
 
 | Step | Name | Executed by | Signed off by |
@@ -224,6 +321,19 @@ depends on; discovering it missing mid-cutover means discovering it during a cha
 traffic on the line.
 
 ### Preconditions
+
+- **A restricted evidence store, a secret-manager location, and the requesting organization's written
+  evidence-handling determination — all three in place before the first artifact of any step is
+  captured.** What each must provide is [Evidence handling and
+  classification](#evidence-handling-and-classification); the determination is what fixes
+  `<restricted-dir>`, `<evidence-store-locator>` and `<custodian>`, names the parties who may read each
+  class, and names the access-controlled channel the Step 3 rollback file travels on.
+
+  The ordering is the whole point. Action 2 below captures a file that embeds every credential in the
+  release, and Step 1's first query returns owner identifiers and balances; a classification decided
+  after the capture is a decision taken after the disclosure it existed to prevent, and no later
+  re-filing recalls a value somebody has already read. An absent determination blocks Step 0 exactly as
+  an absent `CREATE SCHEMA` identity does.
 
 - **The release's relational store is PostgreSQL 12 or later**, with `database.kind: postgres` and the
   `database.*` values pointing at it.
@@ -284,17 +394,305 @@ traffic on the line.
    validated" and "the image the pod runs" the same statement. This command only answers after the
    push: a locally built image carries no `RepoDigests` entry.
 
-2. **Capture the live values / CR snapshot.** This repository holds chart *defaults*, not the live
-   release's state, so the defaults are not a rollback target. Every later instruction to "restore"
-   means restoring **this** snapshot verbatim:
+2. **Capture the live values / CR snapshot, seal it, and attach only its structure.** This repository
+   holds chart *defaults*, not the live release's state, so the defaults are not a rollback target.
+   Every later instruction to "restore" means restoring **this** snapshot verbatim, which is why it is
+   captured whole and not summarized.
+
+   **That snapshot is the release's credential set.** `helm get values --all` returns the values the
+   chart was installed with, and those values *are* the credentials: `database.password`
+   (`infra/stocktrader-operator/helm-charts/stocktrader/values.yaml:L79`), `oidc.clientSecret`
+   (`…/values.yaml:L212`), `watson.passwordOrApiKey` (`…/values.yaml:L227`), `odm.password`
+   (`…/values.yaml:L231`), and the mq, cloudant, openwhisk, redis, kafka, twitter, mongo and S3
+   credentials beside them — the release Secret is rendered *from* exactly these keys
+   (`…/templates/credentials.yaml:L20-L47`). On the operator path the same is true inline: the
+   StockTrader CRD marks `spec.database.password` and both `spec.oidc.clientId` and
+   `spec.oidc.clientSecret` `format: password`
+   (`infra/stocktrader-operator/config/crd/bases/operators.ibm.com_stocktraders.yaml:L229-L231,
+   L782-L789`), so `kubectl get stocktrader <name> -o yaml` prints them. The capture is therefore
+   restricted-class from the moment it exists, and the change record gets a derived structural file
+   instead — [Evidence handling and classification](#evidence-handling-and-classification).
+
+   Capture whichever one governs the release, and both if both exist. Both output forms of the same
+   object are taken **back to back**: the YAML is the restore artifact, and the JSON is what the
+   redactor below reads with nothing but the standard library. Step 0 runs outside any change window,
+   so nothing is applying values between the two commands; if a later capture disagrees with the sealed
+   one, that is the finding gate 3(c) reports, not an artifact of this ordering.
 
    ```bash
+   umask 077                                        # every capture below is 0600 from creation
+   mkdir -p <restricted-dir>
+   cd <restricted-dir>
    helm get values <release> -n <namespace> --all -o yaml > step0-values-snapshot.yaml
+   helm get values <release> -n <namespace> --all -o json > step0-values-snapshot.json
    # or, where the StockTrader operator owns the release:
    kubectl get stocktrader <name> -n <namespace> -o yaml > step0-cr-snapshot.yaml
+   kubectl get stocktrader <name> -n <namespace> -o json > step0-cr-snapshot.json
    ```
 
-   Capture whichever one governs the release, and both if both exist.
+   ```bash
+   # Checksum whatever was actually captured - either path may be absent - and refuse an empty set.
+   set --
+   for f in step0-values-snapshot.yaml step0-values-snapshot.json \
+            step0-cr-snapshot.yaml step0-cr-snapshot.json; do
+     if [ -f "$f" ]; then set -- "$@" "$f"; fi
+   done
+   if [ "$#" -eq 0 ]; then
+     echo 'no snapshot was captured: capture whichever of the two governs the release' >&2
+     exit 1
+   fi
+   sha256sum "$@" | tee ../step0-snapshot.sha256
+   ```
+
+   **The redactor is an allowlist**, for the same reason the environment capture above is: a denylist
+   passes every secret whose name it did not anticipate, and this file's key set is the whole chart's.
+   Every leaf becomes a presence marker and only deliberately named non-secret cutover keys keep their
+   literal value. No `oidc.*` value is kept — the CRD marks even `clientId` `format: password`
+   (`…/operators.ibm.com_stocktraders.yaml:L782-L785`), so it is treated as a secret here whatever it
+   is elsewhere.
+
+   The allowlist is a file rather than a constant in each script, because two copies of it drift — and
+   a drifted allowlist either redacts a cutover key a gate has to read or prints one it must not:
+
+   ```bash
+   cat > ca-keep.txt <<'KEEP'
+   # The cutover keys, and only them: each is a non-secret value a later gate has to compare, which is
+   # why it is here. Anything absent from this file is redacted whether or not it looks like a secret.
+   # Read by ca-structure.py and ca-compare.py; a `spec.` prefix is stripped before matching, so one
+   # list serves the values shape and the CR shape.
+   cashAccount.enabled
+   cashAccount.url
+   cashAccount.image.repository
+   cashAccount.image.tag
+   cashAccount.exchangeRateUrl
+   database.kind
+   database.ssl
+   vault.enabled
+   global.auth
+   global.specifyCerts
+   jwt.issuer
+   jwt.audience
+   KEEP
+   ```
+
+   ```bash
+   cat > ca-structure.py <<'PY'
+   """Derive a change-record-class structural snapshot from a values or CR capture.
+
+   Input: the -o json form of the capture. Output: one sorted `key.path=value` line per leaf, where
+   `value` is a presence marker unless the path is allowlisted in ca-keep.txt. Usage:
+
+       python3 ca-structure.py step0-values-snapshot.json > step0-values-structure.txt
+   """
+   import json
+   import sys
+
+
+   def allowlist():
+       """ca-keep.txt from the working directory, which is <restricted-dir> for every gate that runs
+       these scripts."""
+       with open('ca-keep.txt', encoding='utf-8') as handle:
+           return {line.strip() for line in handle
+                   if line.strip() and not line.startswith('#')}
+
+
+   def unqualified(path):
+       """The CR carries the same keys under `spec.`; strip it so one allowlist serves both shapes."""
+       return path[5:] if path.startswith('spec.') else path
+
+
+   def marker(value):
+       """Presence only, and never a hash: `database.password` is short and low-entropy, so a
+       published digest of it is an offline-guessable copy - a wordlist recovers the password without
+       touching the release. A length would leak for the same reason."""
+       if isinstance(value, list):
+           return '<list:%d>' % len(value)
+       if value is None or value == '' or value == {}:
+           return '<empty>'
+       return '<set>'
+
+
+   def walk(node, path, keep, out):
+       if isinstance(node, dict) and node:
+           for key in node:
+               walk(node[key], path + [str(key)], keep, out)
+           return
+       # A list's elements are not walked: a list of maps in a values file is as likely to hold a
+       # credential as a scalar is, and its length is the only structural fact the change record needs.
+       dotted = '.'.join(path)
+       if unqualified(dotted) in keep and not isinstance(node, (dict, list)):
+           # json.dumps, so `false` is never confused with the string "false".
+           out.append('%s=%s' % (dotted, json.dumps(node)))
+       else:
+           out.append('%s=%s' % (dotted, marker(node)))
+
+
+   def main():
+       with open(sys.argv[1], encoding='utf-8') as handle:
+           document = json.load(handle)
+       lines = []
+       walk(document, [], allowlist(), lines)
+       # Sorted, so two captures of the same release diff to nothing and a real change is the diff.
+       sys.stdout.write(''.join(line + '\n' for line in sorted(lines)))
+
+
+   if __name__ == '__main__':
+       main()
+   PY
+
+   # The `if` form, not `[ -f … ] && …`: either capture may be absent, and the short-circuit form
+   # returns non-zero for a missing one, which would abort a session running under `set -e`.
+   for src in step0-values-snapshot.json step0-cr-snapshot.json; do
+     if [ -f "$src" ]; then
+       python3 ca-structure.py "$src" > "../${src%-snapshot.json}-structure.txt"
+     fi
+   done
+   ```
+
+   The structural file answers what the change record legitimately needs: which keys this release sets,
+   which it leaves empty, how long its lists are, and the literal value of each cutover key gate 3(e)
+   will change. It cannot answer what any secret is, and it is written outside `<restricted-dir>`
+   because it is the change-record item.
+
+   **What it equally cannot answer is whether a redacted value changed** — a rotated `database.password`
+   reads `<set>` before and `<set>` after — and gates 3(c) and 3(e) turn on exactly that question. So
+   the comparison the gates make is a second script, run on the captures themselves inside the store,
+   which compares every path at full value fidelity and emits **paths and verdicts only**:
+
+   ```bash
+   cat > ca-compare.py <<'PY'
+   """Compare two captures of one source inside the restricted store; print paths, never a secret.
+
+       python3 ca-compare.py <baseline.json> <current.json> [expected.tsv]
+
+   Both arguments are the -o json form of the same source - values against values, CR against CR.
+   Every path is compared at full value fidelity, so a change to a field the structural derivation
+   redacts is still detected; the value itself is printed only for an allowlisted cutover path
+   (ca-keep.txt), so the output is change-record class whatever changed.
+
+   Without an expectations file every difference is a failure, which is gate (c)'s condition. With one
+   - a TSV of `path<TAB>json-value`, the authorized change set - each difference is verdicted EXPECTED,
+   UNAUTHORIZED_VALUE or UNAUTHORIZED_PATH and an authorized path that did not change is reported
+   NOT_APPLIED, which is gate (e)'s condition. Exit 0 when nothing differs or every difference is
+   EXPECTED, 1 otherwise, so a gate is a command status rather than a reading.
+   """
+   import json
+   import sys
+
+
+   def allowlist():
+       with open('ca-keep.txt', encoding='utf-8') as handle:
+           return {line.strip() for line in handle
+                   if line.strip() and not line.startswith('#')}
+
+
+   def unqualified(path):
+       return path[5:] if path.startswith('spec.') else path
+
+
+   def flatten(node, path, out):
+       """Path -> canonical JSON text of the value. A list is compared whole rather than element by
+       element: a reordered list is a change, and a list is never printed anyway."""
+       if isinstance(node, dict) and node:
+           for key in node:
+               flatten(node[key], path + [str(key)], out)
+           return
+       out['.'.join(path)] = json.dumps(node, sort_keys=True)
+
+
+   def load(path):
+       with open(path, encoding='utf-8') as handle:
+           flat = {}
+           flatten(json.load(handle), [], flat)
+           return flat
+
+
+   def expectations(path):
+       want = {}
+       with open(path, encoding='utf-8') as handle:
+           for line in handle:
+               if not line.strip() or line.startswith('#'):
+                   continue
+               key, _, value = line.rstrip('\n').partition('\t')
+               want[key.strip()] = value.strip()
+       return want
+
+
+   def main():
+       keep = allowlist()
+       base, current = load(sys.argv[1]), load(sys.argv[2])
+       want = expectations(sys.argv[3]) if len(sys.argv) > 3 else {}
+
+       differences = []
+       for path in sorted(set(base) | set(current)):
+           before, after = base.get(path), current.get(path)
+           if before == after:
+               continue
+           kind = 'ADDED' if before is None else 'REMOVED' if after is None else 'CHANGED'
+           differences.append((path, kind, after if unqualified(path) in keep else None))
+
+       failures = 0
+       print('changed=%d' % len(differences))
+       for path, kind, shown in differences:
+           if want:
+               expected = want.get(unqualified(path))
+               if expected is None:
+                   verdict = 'UNAUTHORIZED_PATH'
+               elif kind == 'REMOVED':
+                   verdict = 'UNAUTHORIZED_VALUE'
+               elif json.loads(expected) == json.loads(current[path]):
+                   verdict = 'EXPECTED'
+               else:
+                   # The path is authorized and the value is not: a mistyped digest lands here.
+                   verdict = 'UNAUTHORIZED_VALUE'
+           else:
+               verdict = kind
+           if verdict != 'EXPECTED':
+               failures += 1
+           print('%s\t%s%s' % (path, verdict, '\t' + shown if shown is not None else ''))
+
+       changed_paths = {unqualified(path) for path, _, _ in differences}
+       for path in sorted(set(want) - changed_paths):
+           # Not a failure by itself: cashAccount.url need not change when the snapshot already holds
+           # the default. Which of these may legitimately read NOT_APPLIED is stated at gate (e).
+           print('%s\tNOT_APPLIED' % path)
+
+       return 1 if failures else 0
+
+
+   if __name__ == '__main__':
+       sys.exit(main())
+   PY
+   ```
+
+   `ca-keep.txt`, `ca-structure.py` and `ca-compare.py` stay in `<restricted-dir>` beside the captures,
+   and the gates run from that directory because both scripts read the allowlist from it. A derivation
+   or a comparison produced by a differently worded copy would differ for reasons that have nothing to
+   do with the release, so a later gate running on another host re-creates all three from this action
+   rather than rewriting them.
+
+   Seal the captures and destroy the local copies as the closing action of this step.
+   `step0-snapshot.sha256` is written beside the structural file rather than inside
+   `<restricted-dir>` because it is change-record class: a digest over a whole capture is not guessable
+   the way a digest of one short password field is, and it is what the pointer line and every later
+   comparison quote.
+
+   ```bash
+   # After the captures are sealed into <evidence-store-locator> and confirmed present there.
+   # The sealed YAML is what Step 3's post-(e) restore reads and applies; the sealed JSON is what
+   # gates 3(c) and 3(e) restore, compare against, and destroy again.
+   shred -u step0-values-snapshot.yaml step0-values-snapshot.json \
+             step0-cr-snapshot.yaml step0-cr-snapshot.json 2>/dev/null \
+     || rm -f step0-values-snapshot.yaml step0-values-snapshot.json \
+              step0-cr-snapshot.yaml step0-cr-snapshot.json
+   ls step0-values-snapshot.* step0-cr-snapshot.* 2>/dev/null || true   # must print nothing
+   cd -
+   ```
+
+   Then write the pointer line the change record carries in the snapshot's place, in the shape
+   [Evidence handling and classification](#evidence-handling-and-classification) defines, taking each
+   checksum from `step0-snapshot.sha256` and the custodian from the [Roles](#roles) table — the
+   platform operator, who holds the values and the rollback decision.
 
 3. **Run the pre-cutover catalog query** against the selected database, in a session with **no
    `search_path` override**, as the identity that owns the schema — so that what the query cannot see
@@ -442,13 +840,16 @@ traffic on the line.
 
 ### Evidence to capture
 
-| Item | What it is |
-| --- | --- |
-| `step0-values-snapshot.yaml` / `step0-cr-snapshot.yaml` | The live values or CR, verbatim. The rollback target for Step 3 |
-| `step0-image-digest.txt` | The pushed image digest from `docker inspect`, and the `cashAccount.image.repository` / `.tag` values it splits into, which gate 3(e) applies verbatim |
-| `step0-catalog-baseline.txt` | Both catalog queries' output, schema-qualified: `cash_account` absent from every schema, `cashaccount` as the estate created it, and which schema reports `on_search_path = t` |
-| `step0-memory-fit.txt` | The readiness status code and the heap line under `--memory=2g --cpus=1`, **naming the throwaway instance it ran against** and recording that it was destroyed. A memory-fit record that names the release's store is a Step 0 failure, not evidence |
-| `step0-store.txt` | The effective `database.kind` and the server version reported by `SELECT version();` |
+| Item | Class | What it is |
+| --- | --- | --- |
+| `step0-values-structure.txt` / `step0-cr-structure.txt` | change record | The redacted structural derivation of the live values or CR: one sorted line per key path, a presence marker for every value except the named non-secret cutover keys. This is what stands in the change record for the snapshot |
+| `step0-snapshot.sha256` | change record | The SHA-256 of each capture that was taken, and the value every later comparison is made against |
+| `step0-snapshot-pointer.txt` | change record | The pointer line for the sealed snapshot: file name, class, checksum from `step0-snapshot.sha256`, store locator, custodian and named readers |
+| `step0-values-snapshot.yaml` / `step0-cr-snapshot.yaml`, with their `-o json` counterparts | **restricted** | The live values or CR, verbatim — the rollback target Step 3's post-(e) restore applies byte-for-byte. It embeds `database.password`, `oidc.clientId`/`clientSecret` and every other credential the release carries, so it is sealed and never attached |
+| `step0-image-digest.txt` | change record | The pushed image digest from `docker inspect`, and the `cashAccount.image.repository` / `.tag` values it splits into, which gate 3(e) applies verbatim |
+| `step0-catalog-baseline.txt` | change record | Both catalog queries' output, schema-qualified: `cash_account` absent from every schema, `cashaccount` as the estate created it, and which schema reports `on_search_path = t`. Catalog metadata only — relation, column and type names, no row of either table |
+| `step0-memory-fit.txt` | change record | The readiness status code and the heap line under `--memory=2g --cpus=1`, **naming the throwaway instance it ran against** and recording that it was destroyed. A memory-fit record that names the release's store is a Step 0 failure, not evidence |
+| `step0-store.txt` | change record | The effective `database.kind` and the server version reported by `SELECT version();` |
 
 ### Sign-off required
 
@@ -456,6 +857,11 @@ traffic on the line.
   pointing at it) and `vault.enabled: false`, each as a change completed in its own right.
 - **Cash-account data owner** — the catalog-query baseline, because they are the party who must later
   be able to say that `cashaccount` was never touched.
+- **Platform owner and cash-account data owner** — the evidence-handling determination, the restricted
+  store and the secret-manager location, and that the snapshot reached the store rather than the change
+  record: the platform owner for the release-configuration class they are custodian of, the data owner
+  for the owner-level class every step below produces. This sign-off is what makes the classification a
+  decision somebody made rather than a convention somebody followed.
 
 ### Rollback criterion
 
@@ -470,10 +876,25 @@ is a **block**: any unmet prerequisite stops every step below from beginning. In
 - a memory-fit check run against the release's store rather than the throwaway instance, which creates
   exactly that `cash_account` and voids the baseline;
 - `vault.enabled` true;
-- no `CREATE SCHEMA` identity, which makes Step 1's isolation impossible.
+- no `CREATE SCHEMA` identity, which makes Step 1's isolation impossible;
+- **no restricted evidence store, no secret-manager location, or no written evidence-handling
+  determination** — which blocks every step below rather than only this one, because the first thing
+  action 2 captures is a file holding the release's credentials and the first thing Step 1 queries is a
+  set of owner balances. There is nowhere to put either until those three exist.
 
 Resolve the item and re-capture the affected evidence. Do not proceed with a noted exception: each of
 these is load-bearing for a later gate, and a step whose gate cannot be evaluated has failed.
+
+**A raw values or CR snapshot attached to the change record is a Step 0 failure in its own right**, and
+re-filing it afterwards does not undo it: the readers who had the change open have already had the
+values. The remedy is the disclosure remedy, not a correction — remove the attachment, record what was
+exposed and to which readership, and treat every credential the snapshot carried as **disclosed**:
+`database.password`, `oidc.clientId` and `oidc.clientSecret`, `watson.passwordOrApiKey`,
+`odm.password`, and the mq, cloudant, openwhisk, redis, kafka, twitter, mongo and S3 keys that the
+release Secret is rendered from (`…/templates/credentials.yaml:L20-L47`). Each is rotated with its
+owning team before the cutover proceeds, and `database.password` is rotated by the platform owner
+because portfolio reads the same value — the same reason the PostgreSQL move is its own signed-off
+change. Then re-capture per action 2, and re-sign Step 0.
 
 ---
 
@@ -725,7 +1146,10 @@ the artifacts in this repository and must be reconciled with the deployed catalo
    few bytes when it is wrong.
 
 3. **Transfer, convert and checksum.** Copy each data set into a USS file first, then move it to the
-   landing host:
+   landing host. This is where the legacy system's customer data first sits in bulk on a
+   general-purpose host, so the landing directory is created `0700` under `umask 077` and everything in
+   it is held and destroyed as restricted material ([Evidence handling and
+   classification](#evidence-handling-and-classification)); only the checksums below ever leave it:
 
    ```bash
    # On z/OS UNIX. -B suppresses code-page translation; use it for the binary history only.
@@ -768,6 +1192,7 @@ the artifacts in this repository and must be reconciled with the deployed catalo
    ```bash
    # On the landing host. <region-ccsid> is the CCSID obtained as a precondition (for example IBM-037);
    # it is not assumed here for the same reason the tool does not assume it.
+   umask 077                    # every file below is an owner set with its balances, in the clear
    iconv -f <region-ccsid> -t UTF-8 cashaccounty.ebcdic | tr -d '\r' > cashaccounty.body
    { echo 'owner,balance,currencyc'; cat cashaccounty.body; } > cashaccounty.csv
    iconv -f <region-ccsid> -t UTF-8 frankfurt1.ebcdic   | tr -d '\r' > frankfurt1.body
@@ -902,16 +1327,38 @@ SELECT r.mode, v.owner, v.variance_kind, v.status,
  ORDER BY v.owner, v.variance_kind;
 ```
 
-| Item | What it is |
-| --- | --- |
-| `step1-migration-run.txt` | The `migration_run` rows for the batch, including `characterization_status` |
-| `step1-variances.txt` | Every `migration_reconciliation` row with status other than `MATCHED`, with the data owner's written disposition beside each |
-| `step1-exit-codes.txt` | The `load` and `reconcile` exit codes |
-| `step1-transfer.sha256` | Tier-1 checksums over the pre-conversion transferred artifacts, beside the source-side values they are compared with |
-| `step1-tool-input.sha256` | Tier-2 checksums over the files the tool opened — never compared with a source-side value, and the reference a re-run is proved against |
-| `step1-record-counts.txt` | The row count each unload reported, beside the `wc -l` of the converted body it produced |
-| `step1-catalog-after.txt` | Both catalog queries re-run, and their diff against the Step 0 baseline: `cash_account` in `cash_account_rehearsal` only, `cashaccount` unchanged |
-| `step1-tool-settings.txt` | The `tool.history-record-length`, `tool.legacy-charset` and `tool.legacy-timezone` used, and the file definition / region configuration they came from |
+**That second query returns owner-level rows** — an owner identifier, the legacy and migrated balances
+and the difference between them — while the first returns only ids, counts and status. Its output is
+therefore restricted-class evidence ([Evidence handling and
+classification](#evidence-handling-and-classification)), written under `umask 077` into
+`<restricted-dir>` and sealed, and the change record gets the roll-up below: the same counts the gate
+is read from, with no owner and no balance among them.
+
+```sql
+SELECT v.variance_kind, v.status, count(*) AS row_count
+  FROM cash_account_rehearsal.migration_reconciliation v
+  JOIN cash_account_rehearsal.migration_run r ON r.run_id = v.run_id
+ WHERE r.batch_id = '<uuid>'
+   AND v.status <> 'MATCHED'
+ GROUP BY v.variance_kind, v.status
+ ORDER BY v.variance_kind, v.status;
+```
+
+| Item | Class | What it is |
+| --- | --- | --- |
+| `step1-migration-run.txt` | change record | The `migration_run` rows for the batch, including `characterization_status` |
+| `step1-variances.txt` | **restricted** | Every `migration_reconciliation` row with status other than `MATCHED`, with the data owner's written disposition beside each. One owner identifier and two balances per row, which is why it is sealed and read in the store rather than attached |
+| `step1-variance-summary.txt` | change record | The roll-up query's output — row counts by `variance_kind` × `status` — the SHA-256 of `step1-variances.txt` as it was read, and the data owner's acceptance statement naming that checksum |
+| `step1-exit-codes.txt` | change record | The `load` and `reconcile` exit codes |
+| `step1-transfer.sha256` | change record | Tier-1 checksums over the pre-conversion transferred artifacts, beside the source-side values they are compared with |
+| `step1-tool-input.sha256` | change record | Tier-2 checksums over the files the tool opened — never compared with a source-side value, and the reference a re-run is proved against |
+| `step1-record-counts.txt` | change record | The row count each unload reported, beside the `wc -l` of the converted body it produced |
+| `step1-catalog-after.txt` | change record | Both catalog queries re-run, and their diff against the Step 0 baseline: `cash_account` in `cash_account_rehearsal` only, `cashaccount` unchanged. Catalog metadata only, no row of either table |
+| `step1-tool-settings.txt` | change record | The `tool.history-record-length`, `tool.legacy-charset` and `tool.legacy-timezone` used, and the file definition / region configuration they came from — together with the `step1-tool-settings.env` emission of [Operator command safety](#operator-command-safety), whose field list is an allowlist of named non-credentials for exactly this reason |
+
+The exports themselves — `cashaccounty.csv`, `frankfurt1.csv` and the history file — are the legacy
+system's customer data in bulk. They are working input rather than evidence, only their checksums are
+registered above, and they are held and destroyed exactly as restricted evidence is.
 
 `characterization_status` must read `ACCEPTED` on every row of the batch. It is copied from the
 `Status` field of [`legacy-characterization.md`](legacy-characterization.md) at run time, so a `DRAFT`
@@ -919,11 +1366,15 @@ baseline is visible in the evidence rather than discoverable only by asking.
 
 ### Sign-off required
 
-**The cash-account data owner** accepts the batch. Acceptance means every row in `step1-variances.txt`
-is either resolved — the cause found and the run repeated clean — or reclassified
-`ACCEPTED_EXCEPTION` **with a written reason** recorded beside it. An unexplained `VARIANCE` row is not
-acceptable at any count: the point of the rehearsal is that each one is cheap to investigate now and
-expensive to investigate in Step 3.
+**The cash-account data owner** accepts the batch, reading `step1-variances.txt` **inside the
+restricted store** — row by row, because acceptance is per row and every row carries an owner and two
+balances. Acceptance means each row is either resolved — the cause found and the run repeated clean —
+or reclassified `ACCEPTED_EXCEPTION` **with a written reason** recorded beside it in that store. What
+reaches the change record is `step1-variance-summary.txt`: the counts by `variance_kind` and `status`,
+the checksum of the artifact that was read, and the acceptance statement naming that checksum — so the
+acceptance is tied to exactly the rows the data owner saw, and a later re-read can prove it was those
+bytes. An unexplained `VARIANCE` row is not acceptable at any count: the point of the rehearsal is that
+each one is cheap to investigate now and expensive to investigate in Step 3.
 
 ### Rollback criterion
 
@@ -1034,11 +1485,28 @@ SELECT v.owner, v.variance_kind, v.status,
  ORDER BY v.variance_kind, v.owner;
 ```
 
-| Item | What it is |
-| --- | --- |
-| `step2-windows.txt` | One `migration_run` row per window, in capture order, with `variance_count` and exit code |
-| `step2-review.txt` | Every `RATE_SOURCE` and `REJECTED_BY_TARGET` row, each either accepted with a written reason or traced to a defect with its defect reference |
-| `step2-window-definition.txt` | The agreed window boundaries and the agreed number of consecutive clean windows, recorded before the first window ran |
+As in Step 1, the second query's rows are **per owner** and the first's are per window, so the review
+listing is sealed and the change record carries the roll-up:
+
+```sql
+SELECT v.variance_kind, v.status, count(*) AS row_count
+  FROM cash_account_rehearsal.migration_reconciliation v
+  JOIN cash_account_rehearsal.migration_run r ON r.run_id = v.run_id
+ WHERE r.batch_id = '<uuid>'
+ GROUP BY v.variance_kind, v.status
+ ORDER BY v.variance_kind, v.status;
+```
+
+| Item | Class | What it is |
+| --- | --- | --- |
+| `step2-windows.txt` | change record | One `migration_run` row per window, in capture order, with `variance_count` and exit code |
+| `step2-review.txt` | **restricted** | Every `RATE_SOURCE` and `REJECTED_BY_TARGET` row, each either accepted with a written reason or traced to a defect with its defect reference. Per-owner variance rows, read in the store by the reviewer |
+| `step2-review-summary.txt` | change record | The roll-up query's counts by `variance_kind` × `status`, the SHA-256 of `step2-review.txt` as it was reviewed, and the review's verdict per kind — the acceptances and the defect references, without the owners they were found on |
+| `step2-window-definition.txt` | change record | The agreed window boundaries and the agreed number of consecutive clean windows, recorded before the first window ran |
+
+The captured `transactions.csv` / `legacy-responses.csv` streams are the same class as the Step 1
+exports: real requests for real owners, working input rather than evidence, held and destroyed as
+restricted material and never attached to a window's review.
 
 The pass condition is **zero `VARIANCE` rows across the agreed number of consecutive windows.**
 `RATE_SOURCE` and `REJECTED_BY_TARGET` rows are not automatically failures and are not automatically
@@ -1048,9 +1516,11 @@ where this service answers `422 INSUFFICIENT_FUNDS` — and confirming that is w
 
 ### Sign-off required
 
-**Product owner and risk**, jointly. Product owner for the behavioural result; risk because the
-accepted exceptions recorded here are the documented differences between the two systems' answers, and
-those differences outlive this step.
+**Product owner and risk**, jointly, on the rows themselves: `step2-review.txt` is read in the
+restricted store and the verdict is recorded in `step2-review-summary.txt` against that file's
+checksum. Product owner for the behavioural result; risk because the accepted exceptions recorded here
+are the documented differences between the two systems' answers, and those differences outlive this
+step.
 
 ### Rollback criterion
 
@@ -1077,7 +1547,8 @@ actions in a fixed order, and it is the last point at which rollback is cheap.
 
 ### Preconditions
 
-- **Steps 0, 1 and 2 signed off**, with their evidence attached to the change record.
+- **Steps 0, 1 and 2 signed off**, with their evidence registered: each change-record-class item
+  attached and each restricted-class item sealed with its pointer in the change record.
 - **The platform operator holds the change window** and the authority to restart broker and portfolio.
 - **The mainframe team holds the CICS transaction-disable authority** and has the replay procedure of
   the rollback regime below in hand *before* the window opens. A rollback that first has to negotiate
@@ -1112,7 +1583,7 @@ actions in a fixed order, and it is the last point at which rollback is cheap.
   | Batch id | A fresh one per run, generated by the run and echoed into its log, so each run's `migration_run` and `migration_reconciliation` rows are attributable to it |
   | Runs owned by | The on-call platform operator, who holds the schedule, its evidence, and the rollback decision |
   | Output adjudicated by | The cash-account data owner, per run, with the three checks of gate (g) — (g1) export against the state at `W`, (g2) every reported difference against the ledger, (g3) the run itself |
-  | Evidence | Per run: `step3-run-<n>.txt` (the completed-run check), `step3-asof-w-<n>.txt` ((g1), which must be empty), `step3-reconcile-<n>.txt` ((g2) with every row's verdict), and the job's log line carrying the batch id and the tool's numeric exit code |
+  | Evidence | Per run: `step3-run-<n>.txt` (the completed-run check), `step3-asof-w-<n>.txt` ((g1), which must be empty) and `step3-reconcile-<n>.txt` ((g2) with every row's verdict) — the latter two written into `<restricted-dir>`, because a row of either names an owner and its balances — plus `step3-reconcile-summary-<n>.txt`, the roll-up that carries the run into the change record with the job's log line, its batch id and the tool's numeric exit code |
   | A missed run | A gap in the evidence, not a clean run. The window counts as clean only if the cadence held: "no variance was reported" by a job that never ran is not a measurement |
   | Retired | When the rollback window closes, before Step 4's first retirement action, with the removal recorded |
 
@@ -1359,8 +1830,12 @@ by whether gate (e) has been applied.
    ```
 
    The ConfigMap and Secret names are the chart's defaults (`global.configMapName` and
-   `global.secretName` render `<release>-config` and `<release>-credentials`); if the Step 0 snapshot
-   shows overrides, use the snapshot's names. Add `cert_defaultTrustStore` from ConfigMap key
+   `global.secretName` render `<release>-config` and `<release>-credentials`). Whether this release
+   overrides them is visible in `step0-values-structure.txt` as a set marker on those keys, and the
+   override names themselves are read from the cluster (`kubectl -n <namespace> get configmap,secret
+   -o name`) rather than from the snapshot: the structural file records that a key is set, not what it
+   is set to, and a name is cheaper to read from the release than to justify a restricted read for. Add
+   `cert_defaultTrustStore` from ConfigMap key
    `ssl.certs` if the release sets `global.specifyCerts`, and an `imagePullSecrets` entry naming
    `global.pullSecretName` if it sets `global.pullSecret` — the same two conditions the chart applies to
    the real Deployment. The readiness probe is the chart's own path, which is what makes
@@ -1375,14 +1850,16 @@ by whether gate (e) has been applied.
    the deployed Deployment. `TRACE_SPEC`, `REDIS_URL`, `KAFKA_*` and `CQRS_ENABLED` are absent because
    this service does not consume them at all.
 
-   Extract the owner set from the final export's `cashaccounty.csv` into `step3-owners.nul` with the
-   CSV reader in [Operator command safety](#operator-command-safety), and take the token from the
-   `curl` config file defined there. An owner may legitimately contain `/`, `;`, `&`, `?`, `#` or `%`,
-   so an owner pasted into a URL is an owner that can change the request being made:
+   Extract the owner set from the final export's `cashaccounty.csv` into
+   `<restricted-dir>/step3-owners.nul` with the CSV reader in [Operator command
+   safety](#operator-command-safety), and take the token from the `curl` config file defined there. An
+   owner may legitimately contain `/`, `;`, `&`, `?`, `#` or `%`, so an owner pasted into a URL is an
+   owner that can change the request being made:
 
    ```bash
    kubectl port-forward -n <namespace> pod/cash-account-cutover-validation 8080:8080 &
-   : > step3-validation.tsv
+   umask 077                            # the comparison is owner-level from its first line
+   : > <restricted-dir>/step3-validation.tsv
    while IFS= read -r -d '' owner; do
      seg=$(ca_urlencode "$owner")
      body=$(curl -sS --config ./ca-auth.conf \
@@ -1390,8 +1867,8 @@ by whether gate (e) has been applied.
                  -w '\n%{http_code}') || body=$'\n000'
      status=${body##*$'\n'}
      json=$(printf '%s' "${body%$'\n'*}" | tr -d '\n\t')
-     printf '%s\t%s\t%s\n' "$seg" "$status" "$json" >> step3-validation.tsv
-   done < step3-owners.nul
+     printf '%s\t%s\t%s\n' "$seg" "$status" "$json" >> <restricted-dir>/step3-validation.tsv
+   done < <restricted-dir>/step3-owners.nul
    ```
 
    The loop records a line per owner instead of stopping at the first failure, so a single `404`
@@ -1399,6 +1876,68 @@ by whether gate (e) has been applied.
    `availableBalance`, `reservedBalance` and `totalBalance`. The owner is written in its encoded form
    and the body is stripped of tabs and newlines, so one owner is exactly one record — a raw owner or a
    reformatted body could otherwise split a line and silently drop an owner from the comparison.
+
+   **The encoding is not a redaction.** `ca_urlencode` exists so an owner cannot alter a request, and
+   `urllib.parse.unquote` reverses it exactly; a file of encoded owners each beside its balance is a
+   file of owners and balances. So this file is restricted-class, and the change record gets counts:
+
+   ```bash
+   python3 - "<dir>/cashaccounty.csv" "<restricted-dir>/step3-validation.tsv" \
+     > step3-validation-summary.txt <<'PY'
+   """Roll gate (c)'s per-owner comparison up into the four numbers the gate is read from.
+
+   Emits counts and one checksum. No owner and no balance appears in the output, by construction:
+   which owners mismatched is read from step3-validation.tsv inside the restricted store.
+   """
+   import csv
+   import decimal
+   import hashlib
+   import json
+   import sys
+   import urllib.parse
+
+   # The export is the authority for both the owner set and the expected balance.
+   export = {}
+   with open(sys.argv[1], newline='', encoding='utf-8') as handle:
+       for row in csv.DictReader(handle):
+           owner = (row['owner'] or '').strip().upper()
+           if owner:
+               export[owner] = (row['balance'] or '').strip()
+
+   compared = equal = mismatched = 0
+   with open(sys.argv[2], newline='', encoding='utf-8') as handle:
+       for line in handle:
+           if not line.strip():
+               continue
+           seg, status, body = line.rstrip('\n').split('\t', 2)
+           owner = urllib.parse.unquote(seg).upper()
+           compared += 1
+           try:
+               document = json.loads(body)
+               ok = (status == '200'
+                     and owner in export
+                     and decimal.Decimal(str(document['totalBalance']))
+                         == decimal.Decimal(export[owner])
+                     and decimal.Decimal(str(document['reservedBalance'])) == 0)
+           except (ValueError, KeyError, TypeError, decimal.InvalidOperation):
+               # A non-JSON body, a missing field or an unparseable figure is a mismatch, never a pass.
+               ok = False
+           equal += 1 if ok else 0
+           mismatched += 0 if ok else 1
+
+   print('owners_in_export=%d' % len(export))
+   print('owners_compared=%d' % compared)
+   print('owners_equal=%d' % equal)
+   print('owners_mismatched=%d' % mismatched)
+   with open(sys.argv[2], 'rb') as handle:
+       print('sha256_step3_validation_tsv=%s' % hashlib.sha256(handle.read()).hexdigest())
+   PY
+   ```
+
+   `owners_compared` must equal `owners_in_export` — a smaller count means the drive list was
+   truncated, not that the target is clean — and `owners_mismatched` must be `0`. A non-zero count
+   fails the gate; **which** owners it names is read in the store by the data owner, who signs the gate
+   off on the rows themselves.
 
    Delete the pod as the closing action of this gate, before (e) is applied — a validation pod left
    running would still be holding a database connection and answering requests after the real
@@ -1410,9 +1949,83 @@ by whether gate (e) has been applied.
    ```
 
    *Gate:* for every owner, `totalBalance` equals the exported balance and `reservedBalance` is `0.00`;
-   the owner set matches the export exactly, with no extra and no missing owner; the validation pod is
-   gone; and `helm get values <release>` (or the CR) still matches `step0-values-snapshot.yaml`
-   verbatim, proving the validation changed nothing a caller can reach.
+   the owner set matches the export exactly, with no extra and no missing owner;
+   `step3-validation-summary.txt` reads `owners_mismatched=0`; the validation pod is gone; and the
+   release's live values still match the sealed Step 0 snapshot, proving the validation changed nothing
+   a caller can reach.
+
+   That check is a **full path-and-value comparison against the sealed snapshot, performed inside the
+   restricted store** — the change record receives the changed paths and the verdict, never the values.
+   Comparing only the redacted structure would not do: a rotated credential reads `<set>` on both sides,
+   so a structural comparison passes a release whose secrets changed. Comparing raw YAML in the change
+   record would not do either — that diff carries exactly the values that differ, which is the Step 0
+   disclosure by another route.
+
+   The comparison runs against whichever source Step 0 sealed, values or CR or both, because the loop
+   is driven by the baselines that exist rather than by one hard-coded command. Restoring them is an
+   authorized, recorded read by their custodian:
+
+   ```bash
+   umask 077
+   cd <restricted-dir>
+   # Restore the sealed step0-*-snapshot.{yaml,json} baselines here from <evidence-store-locator> -
+   # a recorded read by the platform operator - then prove they are the sealed bytes before comparing.
+   sha256sum -c ../step0-snapshot.sha256
+
+   : > ../step3-values-unchanged.txt
+   for src in values cr; do
+     if [ ! -f "step0-${src}-snapshot.json" ]; then continue; fi
+     case "$src" in
+       values) helm get values <release> -n <namespace> --all -o yaml > "recheck-${src}.yaml"
+               helm get values <release> -n <namespace> --all -o json > "recheck-${src}.json" ;;
+       cr)     kubectl get stocktrader <name> -n <namespace> -o yaml  > "recheck-${src}.yaml"
+               kubectl get stocktrader <name> -n <namespace> -o json  > "recheck-${src}.json" ;;
+     esac
+     comparison=clean
+     # Braces, not a subshell, so the assignment inside survives the redirection.
+     {
+       printf 'source=%s\n' "$src"
+       if cmp -s "step0-${src}-snapshot.yaml" "recheck-${src}.yaml"; then
+         printf 'bytes_match_sealed_snapshot=yes\n'
+       else
+         printf 'bytes_match_sealed_snapshot=no\n'
+       fi
+       # No expectations file, so any difference at any path - redacted or not - exits non-zero.
+       if python3 ca-compare.py "step0-${src}-snapshot.json" "recheck-${src}.json"; then
+         printf 'comparison=clean\n'
+       else
+         comparison=DIFFERS
+         printf 'comparison=DIFFERS\n'
+       fi
+     } >> ../step3-values-unchanged.txt
+
+     # A difference is examined after the window, so the capture that produced it is sealed BEFORE the
+     # local copy goes - the one ordering mistake that would leave a finding with no artifact behind it.
+     if [ "$comparison" = DIFFERS ]; then
+       sha256sum "recheck-${src}.yaml" "recheck-${src}.json" | tee -a ../step3-recheck.sha256
+       echo "seal recheck-${src}.{yaml,json} into <evidence-store-locator> before continuing"
+     fi
+     shred -u "recheck-${src}.yaml" "recheck-${src}.json" 2>/dev/null \
+       || rm -f "recheck-${src}.yaml" "recheck-${src}.json"
+   done
+
+   shred -u step0-values-snapshot.yaml step0-values-snapshot.json \
+             step0-cr-snapshot.yaml step0-cr-snapshot.json 2>/dev/null \
+     || rm -f step0-values-snapshot.yaml step0-values-snapshot.json \
+              step0-cr-snapshot.yaml step0-cr-snapshot.json
+   # `|| true`: ls exits 1 when a glob matches nothing, which is the passing case here and would
+   # abort a session running under `set -e` on success.
+   ls step0-*-snapshot.* recheck-* 2>/dev/null || true       # must print nothing
+   cd -
+   ```
+
+   The pass condition is `comparison=clean` for every source, which is `changed=0` at full value
+   fidelity. `bytes_match_sealed_snapshot` is beside it to separate the two ways a re-capture can
+   differ: `no` with `comparison=clean` is a serialization difference — a different client version
+   marshalling identical values — and the gate survives it; `comparison=DIFFERS` is a values change
+   applied inside the window that this cutover did not record, and it is a no-go whatever the byte
+   comparison says. The changed paths in the output name what to investigate; their values stay in the
+   store, in the sealed recheck capture, for the custodian who investigates.
 
 4. **(d) Record the ledger watermark.**
 
@@ -1420,7 +2033,10 @@ by whether gate (e) has been applied.
    SELECT COALESCE(MAX(entry_id), 0) AS w FROM ledger_entry;
    ```
 
-   Store the value as `W` **with the Step 0 snapshot**, in the change record. `W` is the boundary
+   Store the value as `W` in the change record, **beside the Step 0 snapshot pointer.** `W` is a bare
+   integer — a ledger position, carrying no owner, no balance and no credential — so it is
+   change-record class, while the snapshot it is read alongside is not; the pointer is what ties the
+   two together without moving either. `W` is the boundary
    between "state the migration put here" and "state a caller put here", and every later judgement —
    the scheduled reconcile's adjudication and the rollback's replay range — is expressed relative to
    it. It has to be read before gate (e): once callers are writing, `MAX(entry_id)` keeps moving and no
@@ -1429,7 +2045,10 @@ by whether gate (e) has been applied.
    *Gate:* `W` is recorded in the change record, not only in a terminal.
 
 5. **(e) Apply the cutover value set.** This is the action that routes traffic. Apply it against the
-   Step 0 snapshot, not against the chart defaults:
+   Step 0 snapshot, not against the chart defaults — which is an authorized read of the sealed snapshot
+   by the platform operator, its custodian, and the store records it like any other read. The applied
+   set stays inside `<restricted-dir>` for the same reason the snapshot does: it is the snapshot plus
+   the rows below:
 
    | Value | Set to | Why |
    | --- | --- | --- |
@@ -1443,8 +2062,72 @@ by whether gate (e) has been applied.
 
    No chart **template** is edited, at this gate or any other.
 
-   *Gate:* the applied values diff against the snapshot contains **only** the rows above; the
+   *Gate:* the applied values differ from the sealed snapshot in **only** the rows above; the
    **rendered** image is the digest form, not the two values that produced it —
+
+   The first half is **asserted, not read**: the applied capture is compared with the sealed snapshot at
+   full value fidelity against the authorized change set, so a change to any other path — including one
+   whose value the change record never prints — fails the gate rather than disappearing into a
+   presence marker. Write the change set first, from `step0-image-digest.txt` and the table above:
+
+   ```bash
+   umask 077
+   cd <restricted-dir>
+   # Restore the sealed step0-*-snapshot.json baselines here again, and prove them, as at gate (c).
+   sha256sum -c ../step0-snapshot.sha256
+
+   # The authorized change set: JSON values, so `true` is the boolean and a string carries its quotes.
+   # cashAccount.url is the value as applied - for the chart default that is the literal string with
+   # its `{{ .Release.Name }}` expression, because `helm get values` reports values, not rendered output.
+   cat > expected-cutover.tsv <<'TSV'
+   cashAccount.enabled	true
+   cashAccount.image.repository	"<registry>/cash-account@sha256"
+   cashAccount.image.tag	"<hex>"
+   cashAccount.url	"http://{{ .Release.Name }}-cash-account-service:8080/cash-account"
+   TSV
+
+   : > ../step3-values-diff.txt
+   for src in values cr; do
+     if [ ! -f "step0-${src}-snapshot.json" ]; then continue; fi
+     case "$src" in
+       values) helm get values <release> -n <namespace> --all -o json > "applied-${src}.json" ;;
+       cr)     kubectl get stocktrader <name> -n <namespace> -o json  > "applied-${src}.json" ;;
+     esac
+     {
+       printf 'source=%s\n' "$src"
+       if python3 ca-compare.py "step0-${src}-snapshot.json" "applied-${src}.json" \
+                                expected-cutover.tsv; then
+         printf 'gate=pass\n'
+       else
+         printf 'gate=FAIL\n'
+       fi
+     } >> ../step3-values-diff.txt
+
+     # The applied capture is the state callers are about to reach, so it is sealed as restricted
+     # evidence in its own right before the local copy is destroyed.
+     sha256sum "applied-${src}.json" | tee -a ../step3-applied.sha256
+     shred -u "applied-${src}.json" 2>/dev/null || rm -f "applied-${src}.json"
+   done
+
+   shred -u step0-values-snapshot.yaml step0-values-snapshot.json \
+             step0-cr-snapshot.yaml step0-cr-snapshot.json expected-cutover.tsv 2>/dev/null \
+     || rm -f step0-values-snapshot.yaml step0-values-snapshot.json \
+              step0-cr-snapshot.yaml step0-cr-snapshot.json expected-cutover.tsv
+   ls step0-*-snapshot.* applied-* 2>/dev/null || true       # must print nothing; see gate (c)
+   cd -
+   ```
+
+   `gate=pass` requires every difference to be `EXPECTED`. An `UNAUTHORIZED_PATH` line is a value this
+   cutover did not authorize — a `database.*`, `oidc.*` or any other key — and an `UNAUTHORIZED_VALUE`
+   line is an authorized key set to something other than the recorded value, which is where a mistyped
+   digest lands. `cashAccount.enabled` and the two image fields must each read `EXPECTED`;
+   `cashAccount.url` may read `NOT_APPLIED`, which means the snapshot already held the value and there
+   was nothing to change. `step3-values-diff.txt` is the change-record evidence of the apply: changed
+   paths, verdicts, and literal values only for the cutover keys the change record is entitled to.
+
+   The loop records every sealed source before the gate is judged rather than aborting at the first
+   failure — the same reason gate (c)'s owner comparison runs to the end — so the verdict is read from
+   the file and a single `gate=FAIL` line is a no-go however the block itself exited.
 
    ```bash
    kubectl get deployment <release>-cash-account -n <namespace> \
@@ -1473,13 +2156,18 @@ by whether gate (e) has been applied.
    `{owner}` path segment is no more forgiving of an unencoded `/` than this service's:
 
    ```bash
-   IFS= read -r -d '' owner < step3-owners.nul
+   umask 077                            # the response names an owner and states that owner's balance
+   IFS= read -r -d '' owner < <restricted-dir>/step3-owners.nul
    curl -sS --config ./ca-auth.conf \
-        --url "http://<broker-host>:9080/broker/$(ca_urlencode "$owner")"
+        --url "http://<broker-host>:9080/broker/$(ca_urlencode "$owner")" \
+     > <restricted-dir>/step3-routing.txt
    ```
 
    The `cashAccountBalance` and `cashAccountCurrency` fields in broker's response are populated from
-   this service's `balance` and `currency`, so a correct value proves the whole path.
+   this service's `balance` and `currency`, so a correct value proves the whole path. The response is
+   one named owner's balance, so it is sealed exactly as gate (c)'s comparison is, and the change record
+   carries the verdict — that the figure matched the final export for the owner read — beside the file's
+   checksum.
 
    Then let the first scheduled reconcile run, and adjudicate it with the **three** checks below. They
    answer different questions and none of them is optional: (g1) was the migration correct at the
@@ -1650,6 +2338,7 @@ by whether gate (e) has been applied.
 
    ```bash
    set -euo pipefail
+   umask 077                    # (g1) and (g2) emit owner rows whenever they are not clean
    PSQL="psql -h <host> -p <port> -U <id> -d <database> -v ON_ERROR_STOP=1 -q -At"
 
    # (g3) first: exactly one completed reconcile run for this batch, on an ACCEPTED baseline.
@@ -1660,12 +2349,12 @@ by whether gate (e) has been applied.
    test "$(cat step3-run-<n>.txt)" = 1
 
    # (g1) the export against the state at W: no rows at all.
-   $PSQL -f step3-asof-w.sql > step3-asof-w-<n>.txt
-   test ! -s step3-asof-w-<n>.txt
+   $PSQL -f step3-asof-w.sql > <restricted-dir>/step3-asof-w-<n>.txt
+   test ! -s <restricted-dir>/step3-asof-w-<n>.txt
 
    # (g2) every reported difference explained by the ledger: no other verdict.
-   $PSQL -f step3-adjudicate.sql > step3-reconcile-<n>.txt
-   test "$(grep -cv 'LEDGER_EXPLAINED$' step3-reconcile-<n>.txt || true)" = 0
+   $PSQL -f step3-adjudicate.sql > <restricted-dir>/step3-reconcile-<n>.txt
+   test "$(grep -cv 'LEDGER_EXPLAINED$' <restricted-dir>/step3-reconcile-<n>.txt || true)" = 0
    ```
 
    Under `set -e` a failing `test` stops the block and names the check that failed, and because no
@@ -1674,33 +2363,73 @@ by whether gate (e) has been applied.
    write `CREATE TABLE` and `COPY <n>` onto standard output, and `step3-asof-w-<n>.txt` would never be
    empty even on a clean run. Repeat the block for every later scheduled run, numbering the three files.
 
+   Both query outputs are written into `<restricted-dir>`: each row of either carries an owner with its
+   balances, and (g2)'s rows carry the reconciler's legacy and migrated figures as well. The change
+   record gets the run count — which is already a bare `1` — and the roll-up below, whose counts and
+   checksums are what the criteria in [Rollback criteria, each
+   executable](#rollback-criteria-each-executable) are evaluated from:
+
+   ```bash
+   { printf 'completed_runs=%s\n' "$(cat step3-run-<n>.txt)"
+     printf 'asof_w_rows=%s\n'    "$(wc -l < <restricted-dir>/step3-asof-w-<n>.txt)"
+     printf 'reconcile_rows=%s\n' "$(wc -l < <restricted-dir>/step3-reconcile-<n>.txt)"
+     # psql -At delimits with '|', so the verdict is the last field of each row.
+     awk -F'|' 'NF { count[$NF]++ }
+                END { for (v in count) printf "verdict_%s=%d\n", v, count[v] }' \
+         <restricted-dir>/step3-reconcile-<n>.txt | sort
+     sha256sum <restricted-dir>/step3-asof-w-<n>.txt \
+               <restricted-dir>/step3-reconcile-<n>.txt
+   } > step3-reconcile-summary-<n>.txt
+   ```
+
+   A clean run rolls up to `asof_w_rows=0` and `verdict_LEDGER_EXPLAINED` as the only verdict line, so
+   the change record still carries the whole verdict; a failing run's rows are read in the store by the
+   data owner, who adjudicates them per run.
+
    One note on the reconciler's rows, for reading (g2): its balance and currency checks are
    **independent** and each writes at most one row, so an owner may appear twice; each row is judged the
    same way, against that owner's latest ledger event, so two rows for one owner agree by construction.
 
 ### Evidence to capture
 
-| Item | What it is |
-| --- | --- |
-| `step3-freeze.txt` | The time the CICS transaction was disabled and by whom |
-| `step3-export.sha256` | Checksums of the fresh final export — both tiers of Step 1, since gate (b) reuses that procedure: the raw transfer hashes compared with the source side, and the tool-input hashes that are compared with nothing |
-| `step3-migration-run.txt` | The `migration_run` and `migration_reconciliation` rows for gate (b)'s batch, and both exit codes |
-| `step3-catalog-after.txt` | Both catalog queries re-run at gate (b), diffed against the Step 0 baseline, with the schema each relation was found in |
-| `step3-validation.tsv` | Gate (c): one record per owner — encoded owner, status, response body — compared against the exported balance, with the owner-set comparison. Its companion `step3-owners.nul` is the owner list it was driven from, together with the image reference the validation pod ran and the `NotFound` confirming it was deleted before (e) |
-| `step3-watermark.txt` | `W`, stored with the Step 0 snapshot |
-| `step3-values-diff.txt` | The applied values diffed against `step0-values-snapshot.yaml` / `step0-cr-snapshot.yaml` |
-| `step3-routing.txt` | The broker read from gate (g), confirming the path end to end |
-| `step3-run-<n>.txt` | Gate (g3) per scheduled reconcile: the completed-run count, which must read `1`. Numbered from `1`, the run gate (g) observed |
-| `step3-asof-w-<n>.txt` | Gate (g1) per scheduled reconcile: the frozen export against the state at `W`, which must be empty |
-| `step3-reconcile-<n>.txt` | Gate (g2) per scheduled reconcile: every `VARIANCE` row of that run with its verdict, all of which must read `LEDGER_EXPLAINED`; with the job's `batch_id` and `exit=` log line |
-| `step3-characterization.sha256` | The checksum of the `ACCEPTED` characterization document the schedule was given, tying its runs to the revision the data owner signed off |
-| `step3-schedule.txt` | The scheduled reconcile as it was actually set up: cadence, realization (CronJob or host scheduler), input and baseline mounts with their checksum files, owner, and the time it was retired |
+| Item | Class | What it is |
+| --- | --- | --- |
+| `step3-freeze.txt` | change record | The time the CICS transaction was disabled and by whom |
+| `step3-export.sha256` | change record | Checksums of the fresh final export — both tiers of Step 1, since gate (b) reuses that procedure: the raw transfer hashes compared with the source side, and the tool-input hashes that are compared with nothing |
+| `step3-migration-run.txt` | change record | The `migration_run` rows for gate (b)'s batch, both exit codes and `variance_count`. Gate (b) passes only at **zero** `migration_reconciliation` rows, so a passing file carries no owner; a failing run's per-owner variance listing is restricted and is handled exactly as Step 1's `step1-variances.txt`, with its counts rolled up here |
+| `step3-catalog-after.txt` | change record | Both catalog queries re-run at gate (b), diffed against the Step 0 baseline, with the schema each relation was found in. Catalog metadata only |
+| `step3-validation.tsv` | **restricted** | Gate (c): one record per owner — encoded owner, status, response body with all three balances — compared against the exported balance. The encoding is not a redaction, so this file is sealed and the data owner reads it in the store |
+| `step3-owners.nul` | **restricted** | The owner list gate (c)'s loop was driven from: the final export's complete owner set |
+| `step3-validation-summary.txt` | change record | Gate (c)'s roll-up: `owners_in_export`, `owners_compared`, `owners_equal`, `owners_mismatched` and the checksum of `step3-validation.tsv`, beside the image reference the validation pod ran and the `NotFound` confirming it was deleted before (e) |
+| `step3-values-unchanged.txt` | change record | Gate (c)'s other half, per sealed source: `bytes_match_sealed_snapshot`, then the full-fidelity comparison of the re-capture against the sealed snapshot performed inside the store — `changed=0` and `comparison=clean` is the pass; any changed path is listed by path, with a value only where the path is an allowlisted cutover key |
+| `step3-recheck.sha256` | change record | The checksum of a gate (c) re-capture that did **not** compare clean, sealed for the custodian's investigation. Absent on a clean gate, which is itself the statement that there was nothing to investigate |
+| `step3-watermark.txt` | change record | `W`, recorded beside the Step 0 snapshot pointer |
+| `step3-values-diff.txt` | change record | Gate (e), per sealed source: the applied capture compared with the sealed snapshot at full value fidelity against `expected-cutover.tsv`, and the `gate=pass` / `gate=FAIL` status that comparison exited with. Every changed path appears with its verdict — `EXPECTED`, `UNAUTHORIZED_PATH` or `UNAUTHORIZED_VALUE` — carrying a literal value only for the cutover keys. The values themselves are compared inside the store, never printed into the change record |
+| `step3-applied.sha256` | change record | The checksums of the applied captures gate (e) sealed — the state callers are about to reach, tied to the comparison that passed it |
+| `recheck-<src>.{yaml,json}`, `applied-<src>.json` | **restricted** | The gate (c) and gate (e) captures themselves — a re-capture is sealed only when its comparison was not clean, an applied capture always. Same content as the Step 0 snapshot and the same class: they are where a changed value is read, by the custodian, in the store |
+| `step3-routing.txt` | **restricted** | The broker read from gate (g): one named owner's `cashAccountBalance` and `cashAccountCurrency`. The change record carries the verdict — that the value matched the final export for the owner read — this file's checksum and its pointer |
+| `step3-run-<n>.txt` | change record | Gate (g3) per scheduled reconcile: the completed-run count, which must read `1`. Numbered from `1`, the run gate (g) observed |
+| `step3-asof-w-<n>.txt` | **restricted** | Gate (g1) per scheduled reconcile: the frozen export against the state at `W`, which **must be empty**. It is sealed on its class rather than on its contents on the day — a clean run's file is empty, a failing run's names owners with their balances, and the class cannot depend on which one a reader is about to open. The change record carries `asof_w_rows` from `step3-reconcile-summary-<n>.txt`, and `0` is the gate |
+| `step3-reconcile-<n>.txt` | **restricted** | Gate (g2) per scheduled reconcile: every `VARIANCE` row of that run with its verdict, all of which must read `LEDGER_EXPLAINED`. Owner, the reconciler's legacy and migrated figures, and the latest ledger row per line |
+| `step3-reconcile-summary-<n>.txt` | change record | The per-run roll-up: `completed_runs`, `asof_w_rows`, `reconcile_rows`, one `verdict_<name>` count per verdict, and the checksums of the two restricted files — with the job's `batch_id` and `exit=` log line |
+| `step3-characterization.sha256` | change record | The checksum of the `ACCEPTED` characterization document the schedule was given, tying its runs to the revision the data owner signed off |
+| `step3-schedule.txt` | change record | The scheduled reconcile as it was actually set up: cadence, realization (CronJob or host scheduler), input and baseline mounts with their checksum files, owner, and the time it was retired |
+
+The post-(e) rollback regime produces its own artifacts, all restricted; they are listed where they are
+derived, under [After (e) — a state hand-back, not a repoint](#after-e--a-state-hand-back-not-a-repoint).
 
 ### Sign-off required
 
 - **Platform operator and cash-account data owner** at gates **(b)** and **(c)** — the data gates. Both
   sign before gate (e) is applied.
 - **Product owner** after gate **(g)**, on the confirmed routing and the adjudicated reconcile.
+
+Both data gates are signed on the rows themselves, read **inside the restricted store**: gate (b)'s
+variance listing if it produced one, and gate (c)'s `step3-validation.tsv` owner by owner. What the
+change record carries is the summary and the checksum of the artifact that was read —
+`step3-validation-summary.txt` reading `owners_mismatched=0`, `step3-values-unchanged.txt` with its
+verdict, and gate (b)'s zero-variance run rows. Each signature therefore names the bytes it was given
+and can be re-tied to them afterwards, without the owners having been attached to anything.
 
 ### Rollback criterion
 
@@ -1716,7 +2445,20 @@ place or clear the schema at leisure; neither choice affects a caller.
 #### After (e) — a state hand-back, not a repoint
 
 The target has accepted writes, so those writes exist nowhere else. Restoring routing without handing
-the state back would silently discard them. In order:
+the state back would silently discard them.
+
+Every artifact this regime produces is **restricted-class** — `step3-held.nul`, `step3-releases.txt`,
+`step3-ledger-above-watermark.csv` and `step3-rollback-replay.csv`. That is not a judgement about
+sensitivity in the abstract: the ledger export carries an owner, a balance and an `order_reference` on
+every line, the replay file carries one owner and one absolute balance per line, and the two
+reservation files carry reservation ids. So the whole regime is run with `<restricted-dir>` as the
+working directory and `umask 077` set — the file names below are unchanged and relative to it, because
+the derivations and the replay-file contract are fixed — and every artifact is sealed and its local
+copy destroyed once the rollback closes. What the change record carries is `step3-rollback.sha256`, the
+row counts and the gate verdicts. A rollback is the moment when the temptation to paste a file into a
+ticket is highest, and the urgency changes nothing about who reads that ticket.
+
+In order:
 
 1. **Release every `HELD` reservation, and confirm none remain.** Do this **before** the restore
    begins. The replay file carries one absolute available balance per owner and legacy has no
@@ -1737,6 +2479,7 @@ the state back would silently discard them. In order:
    never from `argv`:
 
    ```bash
+   umask 077                            # both files below name reservations of named owners
    psql -h <host> -p <port> -U <id> -d <database> -tAc \
         "SELECT reservation_id FROM cash_reservation WHERE state = 'HELD'" \
      | tr '\n' '\0' > step3-held.nul
@@ -1755,9 +2498,12 @@ the state back would silently discard them. In order:
    state, so a reservation released twice answers `200` with its current state rather than failing —
    which is what makes "release everything, then re-run the queries" a safe loop.
 
-2. **Restore the snapshot values and roll broker and portfolio.** Restore
-   `step0-values-snapshot.yaml` (or the CR snapshot) **verbatim**, then roll both callers so they read
-   the restored environment.
+2. **Restore the snapshot values and roll broker and portfolio.** Read `step0-values-snapshot.yaml`
+   (or the CR snapshot) out of the restricted store — verify it against `step0-snapshot.sha256` first,
+   because a restore is the one action that has to be byte-exact — restore it **verbatim**, then roll
+   both callers so they read the restored environment. The read is recorded; the copy is destroyed
+   afterwards as [Evidence handling and
+   classification](#evidence-handling-and-classification) requires.
 
    **The trap, stated plainly: `cashAccount.enabled: false` alone does not restore legacy routing.**
    It stops the new service from being deployed and sets broker's `CASH_ACCOUNT_ENABLED` to `false`,
@@ -1803,6 +2549,7 @@ the state back would silently discard them. In order:
 4. **Export the closed range above the watermark and checksum it.**
 
    ```bash
+   umask 077                            # owner, balance and order_reference on every line
    psql -h <host> -p <port> -U <id> -d <database> -v ON_ERROR_STOP=1 -q \
         > step3-ledger-above-watermark.csv <<'SQL'
    COPY (SELECT entry_id, owner, incarnation_id, event_type, amount, currency,
@@ -1826,7 +2573,9 @@ the state back would silently discard them. In order:
    of expanding to nothing.
 
    This export is the audit record of everything the target accepted while it was live. It is evidence
-   in its own right, independent of the replay file derived from it.
+   in its own right, independent of the replay file derived from it — and it is the most concentrated
+   customer-data artifact this document produces, so it is sealed and only its checksum, its line count
+   and the `<W>` it starts above reach the change record.
 
 5. **Derive the absolute-state replay file.** The contract is fixed and is asserted in this repository
    by `RollbackReplayFileTest` against
@@ -1884,8 +2633,8 @@ the state back would silently discard them. In order:
 
    The script below implements the contract against the production schema. Check its output against
    the table above before handing it to the mainframe team: it is a convenience, and the contract is
-   the authority. Run it from the evidence directory, with `cashaccounty.csv` of gate (b)'s **final**
-   export present there; every object it creates is `TEMP`, so the production schema is unchanged by
+   the authority. Run it from `<restricted-dir>`, with `cashaccounty.csv` of gate (b)'s **final**
+   export staged there; every object it creates is `TEMP`, so the production schema is unchanged by
    it, and both `\copy` commands are client-side like step 4's `TO STDOUT` — no database file-write
    privilege is involved and the file lands where the operator is working. Substitute three recorded
    values before running: `<W>` from `step3-watermark.txt`, and the accepted final load's run id and
@@ -2055,6 +2804,13 @@ the state back would silently discard them. In order:
    line, using each line's `op`, `balance` and `currency`. The replay is a mainframe-operator action
    under their own procedure, prepared before the window opened.
 
+   The file reaches them over the **access-controlled channel the evidence-handling determination
+   names**, and over no other: it holds one owner and that owner's balance per line, so mail, chat and a
+   ticket attachment are each excluded — they would copy the whole owner set into a system with its own
+   readership. The handover is recorded like a read of the store, naming the recipient, the time and the
+   checksum from `step3-rollback.sha256`; that checksum is what the mainframe team verifies the file
+   against before replaying it, and it is the only part of the file the change record holds.
+
 7. **Reconcile a fresh legacy export against the target** as of the export watermark.
 
    *Gate:* zero `VARIANCE` rows. This is the proof that the hand-back landed: the legacy system now
@@ -2110,6 +2866,7 @@ preconditions are hard for that reason.
   | Question | Why it must be answered before anything is retired |
   | --- | --- |
   | Which artifacts are retained — the DB2 tables, the KSDS, `ledger_entry`, the reservation rows, the reconciliation rows | Determines the scope of the immutable export below |
+  | The **evidence** artifacts of Steps 0-3 as well: the sealed values/CR snapshot, the owner-level variance, validation and adjudication files, the ledger export above the watermark, and the rollback replay file — each with its class from [Evidence handling and classification](#evidence-handling-and-classification) | They are the record of how the migration was judged, they carry credentials and customer data, and they are already in the restricted store awaiting exactly this answer. Left out of it, they are held indefinitely by default — the outcome prohibition 4 exists to prevent |
   | For how long | After the first retirement action the exports are the only copy; the period decides how long that copy must survive |
   | On what medium, in what location, under whose control | An export nobody can locate is not retention |
   | Who may read it, and how access is recorded | Financial records usually carry access constraints of their own |
@@ -2117,15 +2874,21 @@ preconditions are hard for that reason.
 
   Until that answer exists in writing, **this step does not begin.** Waiting costs nothing: this step is
   reached only after a cutover that is already complete and stable, with every earlier step's evidence
-  attached to its own change record, and nothing decays while the answer is obtained.
+  registered against its own change record — attached or sealed with its pointer, by class — and
+  nothing decays while the answer is obtained.
 
 - **An immutable export of the final legacy state**, stored as the retention answer requires:
   `UNLOAD` of `STOCKTRD.CASHACCOUNTY` and `STOCKTRD.FRANKFURT1` and `REPRO` of
   `SYSD.STOCK.HISTORY`, exactly as in Step 1, with checksums recorded.
 
-- **An export of the target's audit state**, covering the ledger and the rows that reference it:
+- **An export of the target's audit state**, covering the ledger and the rows that reference it. All
+  three files are restricted-class — they are the complete owner, balance and ledger history of the
+  service — so they are produced under `umask 077` in `<restricted-dir>`, sealed as the retention
+  answer directs, and represented in the change record by `step4-target-export.sha256`:
 
   ```bash
+  umask 077
+  cd <restricted-dir>
   PG="-h <host> -p <port> -U <id> -d <database> -v ON_ERROR_STOP=1 -q"
 
   psql $PG -c "COPY (SELECT * FROM ledger_entry ORDER BY entry_id) TO STDOUT WITH (FORMAT csv, HEADER true)" > step4-ledger-entry.csv
@@ -2134,8 +2897,10 @@ preconditions are hard for that reason.
   ```
 
   ```bash
+  # The checksum file is the change-record item, so it is written beside the restricted directory.
   sha256sum step4-ledger-entry.csv step4-cash-reservation.csv step4-cash-account.csv \
-    | tee step4-target-export.sha256
+    | tee ../step4-target-export.sha256
+  cd -
   ```
 
 - **The agreed post-cutover rollback window has elapsed** with clean scheduled reconciles throughout.
@@ -2146,7 +2911,10 @@ preconditions are hard for that reason.
   (e) called for — **with no run missing** — the three files of [Step 3(g)](#actions-3) exist and each
   passes its own gate: `step3-run-<n>.txt` reads `1`, so the run completed on an `ACCEPTED` baseline;
   `step3-asof-w-<n>.txt` is **empty**, so the frozen export still matches the state at `W`; and every
-  row of `step3-reconcile-<n>.txt` carries the verdict `LEDGER_EXPLAINED`. An empty adjudication from a
+  row of `step3-reconcile-<n>.txt` carries the verdict `LEDGER_EXPLAINED`. The last two are restricted,
+  so the window is assembled from each run's `step3-reconcile-summary-<n>.txt` — `asof_w_rows=0` and
+  `verdict_LEDGER_EXPLAINED` as the only verdict line say the same thing in counts — and any run whose
+  roll-up is not clean is read in the store before the window is judged. An empty adjudication from a
   run that did not happen counts as a missing run, not a clean one. The scheduled reconcile is then
   retired, before the first retirement action below, and the time of its removal is recorded with the
   rest of its evidence.
@@ -2220,14 +2988,15 @@ never modified, here or anywhere else in this migration. Nothing under
 
 ### Evidence to capture
 
-| Item | What it is |
-| --- | --- |
-| `step4-retention-answer.*` | The written retention requirement from the requesting organization, as received |
-| `step4-legacy-export.sha256` | Checksums of the final `UNLOAD` and `REPRO` exports |
-| `step4-target-export.sha256` | Checksums of the `ledger_entry`, `cash_reservation` and `cash_account` exports |
-| `step4-retention-location.txt` | Where each retained artifact is stored, under whose control, and its expiry date per the answer above |
-| `step4-retirements.txt` | Per-asset retirement confirmation, in execution order with timestamps: CICS transaction, plan, package, each table, the cluster |
-| `step4-reconciles.txt` | The window's roll-up of the Step 3(g) evidence: one line per scheduled run with its batch id, exit code, completed-run check, (g1) row count and (g2) verdict counts — showing the cadence held with no run missing, every (g1) file empty and every (g2) row `LEDGER_EXPLAINED`; with the time the schedule was retired |
+| Item | Class | What it is |
+| --- | --- | --- |
+| `step4-retention-answer.*` | change record | The written retention requirement from the requesting organization, as received. It is the authority every other row here cites, and the answer that closes the Steps 0-3 evidence question above |
+| `step4-legacy-export.sha256` | change record | Checksums of the final `UNLOAD` and `REPRO` exports |
+| `step4-target-export.sha256` | change record | Checksums of the `ledger_entry`, `cash_reservation` and `cash_account` exports |
+| `step4-ledger-entry.csv`, `step4-cash-reservation.csv`, `step4-cash-account.csv` | **restricted** | The exports themselves: every ledger row with its owner, amounts and `order_reference`, every reservation, and every account balance. Sealed under the retention answer; the change record holds their checksums and nothing else |
+| `step4-retention-location.txt` | change record | Where each retained artifact is stored, under whose control, and the disposal date the answer above sets for it |
+| `step4-retirements.txt` | change record | Per-asset retirement confirmation, in execution order with timestamps: CICS transaction, plan, package, each table, the cluster |
+| `step4-reconciles.txt` | change record | The window's roll-up of the Step 3(g) evidence: one line per scheduled run with its batch id, exit code, completed-run check, (g1) row count and (g2) verdict counts — showing the cadence held with no run missing, every (g1) file empty and every (g2) row `LEDGER_EXPLAINED`; with the time the schedule was retired. Counts and verdicts only, taken from each run's `step3-reconcile-summary-<n>.txt` |
 
 ### Sign-off required
 

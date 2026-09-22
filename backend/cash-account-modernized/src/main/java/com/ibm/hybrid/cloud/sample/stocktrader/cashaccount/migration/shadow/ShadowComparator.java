@@ -1,19 +1,3 @@
-/*
-       Copyright 2025 Kyndryl, All Rights Reserved
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
- */
-
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.migration.shadow;
 
 import java.math.BigDecimal;
@@ -31,7 +15,10 @@ import java.util.UUID;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.context.properties.bind.Bindable;
+import org.springframework.boot.context.properties.bind.Binder;
+import org.springframework.core.env.ConfigurableEnvironment;
+import org.springframework.core.env.Environment;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
@@ -57,24 +44,6 @@ import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.persistence.Migration
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.retail.CashAccountResponse;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.retail.RetailCashAccountService;
 
-/*
- * NEVER POINTED AT THE LIVE LEGACY SYSTEM (AAP 0.3.2). This class reads two ordinary delimited files and
- * replays them into whatever database the operator configured; it opens no socket, speaks to no CICS
- * region, names no DB2 table and reads no VSAM data set. Its proof is src/test/resources/fixtures/shadow
- * only. A live dual-run needs capture infrastructure, sign-off and a rollback plan that belongs to
- * docs/operational-runbook.md step 2, which this deliverable documents and does not execute.
- *
- * THE REPLAY GOES THROUGH THE SERVICE LAYER, NEVER OVER HTTP. What a shadow window compares is business
- * outcomes - the balance an operation leaves behind and the condition it raises - not transport. Going in
- * through the retail web endpoint, a servlet test harness or any HTTP client would put serialization and
- * status mapping inside the thing under comparison, so a divergence in either of them would read as a
- * ledger divergence. Nothing in this package may depend on a controller in any case (AAP 0.8.2).
- *
- * NO @Profile, mirroring reconcile/ReconciliationService's recorded decision, so that
- * migration.MigrationToolRunner (which carries @Profile("tool")) and ShadowComparatorIT can both inject it
- * whichever profile they run under. Leaving it un-profiled is inert in the deployed web context: no request
- * mapping, no @Scheduled work, no constructor side effect, and nothing on the request path injects it.
- */
 /** Replays a captured legacy transaction stream through the service layer and records every difference as a row. */
 @Service
 public class ShadowComparator {
@@ -85,13 +54,10 @@ public class ShadowComparator {
     // still needs a grouping key; this is the one used when nothing usable survives stripping.
     private static final String UNUSABLE_OWNER_KEY = "UNUSABLE_OWNER";
 
-    /*
-     * The dispatch table of EVALUATE WS-REQ (CASH00.cbl:L89-L102), which is the one thing a set-membership
-     * test cannot supply: classifying a code needs LegacyExportFormat.REQUEST_CODES, but ROUTING one needs
-     * code identity, and LegacyExportFormat declares the accepted set without declaring its members
-     * individually. Rather than restate the six codes as a second, free-to-diverge authority, the enum is
-     * cross-checked against that set at class initialization (see operationsByCode), so a change there
-     * fails this class loudly instead of silently leaving a code unroutable.
+    /**
+     * The dispatch table of {@code EVALUATE WS-REQ} (CASH00.cbl:L89-L102), which routing needs and a
+     * set-membership test cannot supply, cross-checked against {@code LegacyExportFormat.REQUEST_CODES} at
+     * class initialization so that a change there cannot silently leave a code unroutable.
      */
     private enum ReplayOperation {
         ADD("A"),
@@ -114,20 +80,10 @@ public class ShadowComparator {
 
     private static final Map<String, ReplayOperation> OPERATIONS_BY_CODE = operationsByCode();
 
-    /*
-     * The closed table of AAP 0.4.6 / 0.14.2: the deliberate behavioural improvements the user authorized,
-     * and nothing else. A target rejection listed here is the authorized replacement for a legacy behaviour
-     * and is recorded as an ACCEPTED_EXCEPTION; any other code has no authorization behind it and is a
-     * VARIANCE for review, so a real target defect can never be signed off as an accepted difference.
-     *
-     *   INSUFFICIENT_FUNDS         unsigned WS-CALC stored the absolute value (CASH00.cbl:L17, L256)
-     *   AMOUNT_OUT_OF_RANGE        high-order digits dropped, no ON SIZE ERROR (CASH00.cbl:L222, L256)
-     *   EXCHANGE_RATE_UNAVAILABLE  a missing rate row committed undefined arithmetic under SQLCODE 0
-     *                              (CASH00.cbl:L214-L231)
-     *   INVALID_CURRENCY           nullable, blank-padded CHAR(8) currency accepted (CASH00.cbl:L57)
-     *   INVALID_OWNER              owner silently truncated to 15 characters (CASH00.cbl:L55)
-     *   UNSUPPORTED_PATH/METHOD    the catch-all-free EVALUATE fell through as success (CASH00.cbl:L89-L102)
-     */
+    // The closed set of authorized deviations from the legacy behaviour (AAP 0.14.2): a rejection carrying
+    // one of these codes is the sanctioned replacement for something the legacy program did silently and
+    // records an ACCEPTED_EXCEPTION, while any other code is a VARIANCE for review - so a real target
+    // defect can never be signed off as an accepted difference.
     private static final Set<CashAccountErrorCode> AUTHORIZED_DEVIATIONS = Set.of(
             CashAccountErrorCode.INSUFFICIENT_FUNDS,
             CashAccountErrorCode.AMOUNT_OUT_OF_RANGE,
@@ -137,6 +93,15 @@ public class ShadowComparator {
             CashAccountErrorCode.UNSUPPORTED_PATH,
             CashAccountErrorCode.UNSUPPORTED_METHOD);
 
+    // The rate source in force for a window, and the default application-tool.yml ships: parity can only be judged
+    // on identical inputs, so an operator who passes nothing gets the legacy-table gate.
+    private static final String RATE_SOURCE_PROPERTY = "tool.rate-source";
+
+    private static final String DEFAULT_RATE_SOURCE = "legacy-table";
+
+    // The replay goes through the service layer and never over HTTP: a window compares business outcomes -
+    // the balance an operation leaves and the condition it raises - so driving it through a controller would
+    // put serialization and status mapping inside the thing under comparison.
     private final RetailCashAccountService retailService;
 
     private final ReconciliationService reconciliationService;
@@ -149,43 +114,61 @@ public class ShadowComparator {
 
     private final CashAccountRepository accounts;
 
-    // Held as MigrationRun.RateSource rather than as raw text, because that type is the one place
-    // tool.rate-source is canonicalized: fx/ToolExchangeRateSource chooses the delegate that prices the replay
-    // from the same property after trimming and folding its case, so comparing the raw value here could leave a
-    // live-priced window classified as the legacy-table parity gate - where a difference cannot be a rate
-    // difference by definition (AAP 0.12.5) - and the window's rows would contradict the rates behind them.
+    // Held as the canonicalized type rather than as raw text: the delegate that prices the replay reads the
+    // same property, so comparing the raw value here could leave a live-priced window classified as the
+    // legacy-table parity gate, whose rows would then contradict the rates behind them.
     private final MigrationRun.RateSource rateSource;
 
     // Constructed, not injected: DelimitedExportReader carries no Spring stereotype, holds no state and is
-    // thread-safe, so a bean definition would add a wiring dependency that buys nothing - and declaring one
-    // would mean reaching into config, which this package may not depend on (AAP 0.8.2).
+    // thread-safe.
     private final DelimitedExportReader exportReader;
 
+    /**
+     * Container constructor.
+     *
+     * @param retailService         the service layer a window's transactions are replayed through
+     * @param reconciliationService the shared classification the findings are written with
+     * @param reconciliations       {@code migration_reconciliation} rows
+     * @param runs                  {@code migration_run} rows
+     * @param legacyRates           the staged rate rows a legacy expected balance is priced from
+     * @param accounts              the target account rows a replayed balance is read back from
+     * @param environment           source of {@code tool.rate-source}, read through {@link Binder}
+     */
+    // Binder, never a @Value placeholder: a placeholder's RESOLVED TEXT is then handed to Spring's expression
+    // resolver, so a rate source written as #{...} would execute while this comparator was being created. Binder
+    // resolves ${...} and converts, evaluating nothing, so an unusable value is refused by RateSource.of below.
     public ShadowComparator(RetailCashAccountService retailService,
                             ReconciliationService reconciliationService,
                             MigrationReconciliationRepository reconciliations,
                             MigrationRunRepository runs,
                             LegacyRateTableRepository legacyRates,
                             CashAccountRepository accounts,
-                            @Value("${tool.rate-source:legacy-table}") String rateSource) {
+                            Environment environment) {
         this.retailService = Objects.requireNonNull(retailService, "retailService");
         this.reconciliationService = Objects.requireNonNull(reconciliationService, "reconciliationService");
         this.reconciliations = Objects.requireNonNull(reconciliations, "reconciliations");
         this.runs = Objects.requireNonNull(runs, "runs");
         this.legacyRates = Objects.requireNonNull(legacyRates, "legacyRates");
         this.accounts = Objects.requireNonNull(accounts, "accounts");
-        this.rateSource = MigrationRun.RateSource.of(rateSource);
+        this.rateSource = MigrationRun.RateSource.of(rateSourceFrom(environment));
         this.exportReader = new DelimitedExportReader();
     }
 
+    // A non-configurable Environment exposes no property sources, so it takes the default an unset key would give -
+    // legacy-table, the parity gate application-tool.yml documents.
+    private static String rateSourceFrom(Environment environment) {
+        if (!(environment instanceof ConfigurableEnvironment)) {
+            return DEFAULT_RATE_SOURCE;
+        }
+        return Binder.get(environment)
+                .bind(RATE_SOURCE_PROPERTY, Bindable.of(String.class))
+                .orElse(DEFAULT_RATE_SOURCE);
+    }
+
     /**
-     * Compares one shadow window read from a directory of captured files.
-     *
-     * <p>The directory must hold the two delimited captures named by
+     * Compares one shadow window read from a directory holding the two delimited captures named by
      * {@link LegacyExportFormat#SHADOW_TRANSACTIONS_FILE} and
-     * {@link LegacyExportFormat#SHADOW_LEGACY_RESPONSES_FILE}, in the column shapes
-     * {@link LegacyExportFormat#SHADOW_TRANSACTION_COLUMNS} and
-     * {@link LegacyExportFormat#SHADOW_LEGACY_RESPONSE_COLUMNS} declare.</p>
+     * {@link LegacyExportFormat#SHADOW_LEGACY_RESPONSES_FILE}.
      *
      * @param run            the {@code SHADOW} run this window's findings belong to, already persisted by its
      *                       caller - {@code migration_reconciliation.run_id} references {@code migration_run}
@@ -199,19 +182,27 @@ public class ShadowComparator {
         Objects.requireNonNull(run, "run");
         Objects.requireNonNull(inputDirectory, "inputDirectory");
 
-        Path transactionsFile = inputDirectory.resolve(LegacyExportFormat.SHADOW_TRANSACTIONS_FILE);
-        Path responsesFile = inputDirectory.resolve(LegacyExportFormat.SHADOW_LEGACY_RESPONSES_FILE);
+        // Resolved through LegacyExportFormat rather than by Path.resolve, and opened relative to one
+        // approval taken here, so a captured window is two ordinary files inside the directory that was
+        // validated and can never be a symbolic link - nor a file in some other directory the name leads to
+        // by the time it is read. A link here would be replayed against live target state and its content
+        // echoed into the window's findings (AAP 0.3.2).
+        LegacyExportFormat.ApprovedDirectory approved =
+                LegacyExportFormat.approveInputDirectory(inputDirectory);
+        LegacyExportFormat.resolveInputFile(inputDirectory, LegacyExportFormat.SHADOW_TRANSACTIONS_FILE);
+        LegacyExportFormat.resolveInputFile(inputDirectory, LegacyExportFormat.SHADOW_LEGACY_RESPONSES_FILE);
+        LegacyExportFormat.ExportFile transactionsFile = LegacyExportFormat.ExportFile
+                .inApprovedDirectory(approved, LegacyExportFormat.SHADOW_TRANSACTIONS_FILE);
+        LegacyExportFormat.ExportFile responsesFile = LegacyExportFormat.ExportFile
+                .inApprovedDirectory(approved, LegacyExportFormat.SHADOW_LEGACY_RESPONSES_FILE);
 
         return compare(run, readTransactions(transactionsFile), readLegacyResponses(responsesFile));
     }
 
     /**
-     * Compares one shadow window already in memory: the core of the dual-run mechanism.
-     *
-     * <p>Every difference becomes a {@code migration_reconciliation} row and the three count fields of
-     * {@code run} are set from what was actually read, replayed and persisted. The run's own verdict,
-     * {@code finishedAt} and the process exit code stay with {@code migration.MigrationToolRunner}, which
-     * opened the row and closes it.</p>
+     * Compares one shadow window already in memory: the core of the dual-run mechanism, which sets the three
+     * count fields of {@code run} while leaving its verdict and {@code finishedAt} to the runner that opened
+     * the row.
      *
      * @param run             the {@code SHADOW} run this window's findings belong to, already persisted
      * @param transactions    the captured requests, in any order; replayed in ascending sequence number
@@ -220,14 +211,10 @@ public class ShadowComparator {
      * @throws IllegalArgumentException when a sequence number repeats within a capture, or when the two
      *                                  captures disagree about the owner at one sequence number
      */
-    // NOT ONE TRANSACTION FOR THE WINDOW, and deliberately not plain @Transactional. RetailCashAccountService's
-    // methods are @Transactional and CashAccountException is unchecked, so a replay joined to one outer
-    // transaction would be marked rollback-only by the first deliberate rejection - the seeded over-debit that
-    // must come back 422 INSUFFICIENT_FUNDS - and the whole window would then die at commit with
-    // UnexpectedRollbackException, destroying every row of evidence it had gathered. NOT_SUPPORTED suspends any
-    // inherited transaction so each replay step gets its own (the service's REQUIRED starts it) and each
-    // evidence row is written independently of the replay outcome beside it: ReconciliationService.record is
-    // itself unannotated, so its save runs in the repository's own transaction and commits on its own.
+    // Not one transaction for the window: the replayed service methods are transactional and their
+    // rejections are unchecked, so a single outer transaction would be marked rollback-only by the first
+    // deliberate rejection and die at commit, destroying the evidence gathered. NOT_SUPPORTED suspends any
+    // inherited transaction, so each replay step and each evidence row commits on its own.
     @Transactional(propagation = Propagation.NOT_SUPPORTED)
     public int compare(MigrationRun run,
                        List<ShadowTransaction> transactions,
@@ -236,11 +223,10 @@ public class ShadowComparator {
         Objects.requireNonNull(transactions, "transactions");
         Objects.requireNonNull(legacyResponses, "legacyResponses");
 
-        // JOIN ON THE SEQUENCE NUMBER PLUS THE NORMALIZED OWNER, never on file order or ordinal position:
-        // EBCDIC and UTF-8 collate differently (AAP 0.12.2), so two exports of one window can arrive in
-        // different orders and a position-wise pairing would compare unrelated lines. A TreeMap because the
-        // capture is a time series - replaying a stream out of order produces different balances, so ascending
-        // sequence order is a correctness requirement and not a presentation choice.
+        // Joined on the sequence number plus the normalized owner, never on file order or ordinal position:
+        // EBCDIC and UTF-8 collate differently, so two exports of one window can arrive in different orders
+        // and a position-wise pairing would compare unrelated lines. A TreeMap because the capture is a time
+        // series: replaying it out of order produces different balances, so ascending order is correctness.
         Map<Long, ShadowTransaction> transactionsBySeq = indexTransactions(transactions);
         Map<Long, ShadowLegacyResponse> responsesBySeq = indexLegacyResponses(legacyResponses);
         requireOwnersAgree(transactionsBySeq, responsesBySeq);
@@ -248,31 +234,23 @@ public class ShadowComparator {
         LOGGER.info("Shadow window {}: replaying {} captured transactions against {} captured replies",
                 run.runId(), transactionsBySeq.size(), responsesBySeq.size());
 
-        // THE COUNTS ARE RECORDED AS THEY BECOME TRUE, NOT AT THE END. Every evidence row below commits on its
-        // own (see the propagation note above), so a window that dies part-way leaves its findings in the table
-        // while this instance is the only statement of how far the replay got - and MigrationToolRunner writes
-        // that statement onto the FAILED row. Setting the counts after the last step would close such a row
-        // with zeros beside committed findings, which reads as "the attempt found nothing".
-        //
-        // The number of captured replies is final the moment the capture is indexed, and it is set here rather
-        // than after the lookup below because that lookup queries the database and can fail: a window that has
-        // read and joined its whole capture must never be recorded as one that read nothing.
+        // The counts are recorded as they become true, not at the end: every evidence row below commits on
+        // its own, so a window that dies part-way leaves its findings in the table while this instance is
+        // the only statement of how far the replay got. Set before the lookup below, which queries the
+        // database and can fail: a window that has joined its whole capture must not read as one that
+        // read nothing.
         run.setLegacyRecordCount(responsesBySeq.size());
 
         // Resolved once, and only where it can be used: the staged rate table is read exclusively by the
-        // live-mode explanation below, so the default parity gate spends no query on it at all. One lookup up
-        // front is also what keeps this class free of a mutable per-instance cache, which a @Service shared
-        // across tool invocations must not carry.
+        // live-mode explanation below, so the default parity gate spends no query on it, and a shared
+        // @Service carries no mutable per-invocation cache.
         UUID stagingLoadRunId = rateSource.isLive() ? latestLoadRunId(run.batchId()) : null;
 
         int replayed = 0;
         for (Map.Entry<Long, ShadowTransaction> entry : transactionsBySeq.entrySet()) {
-            // RAISED BEFORE THE LINE IS TAKEN UP, NOT AFTER IT IS CLASSIFIED. The replay and the row that
-            // records its outcome commit in separate transactions, so a line whose target operation committed
-            // and whose evidence insert then failed has really happened and must appear in this count;
-            // incrementing afterwards would omit exactly that line and understate what the target did.
-            // Attempted, not accepted, which is the same rule as before: a line the target refused was still
-            // taken up, and its refusal is recorded as its own row rather than as a shortfall here.
+            // Raised before the line is taken up, because the replay and the row recording its outcome
+            // commit separately: a line whose operation committed and whose evidence insert then failed has
+            // really happened. Attempted, not accepted - a refusal is its own row, not a shortfall here.
             run.setMigratedRecordCount(++replayed);
             replayAndClassify(run, entry.getKey(), entry.getValue(),
                     responsesBySeq.get(entry.getKey()), stagingLoadRunId);
@@ -280,51 +258,40 @@ public class ShadowComparator {
 
         recordTransactionCounts(run, transactionsBySeq, responsesBySeq);
 
-        // One authority for the number, read back from the rows themselves rather than accumulated in a local,
-        // so the count MigrationToolRunner turns into exit code 2 is the count that actually reached the
-        // database. Only VARIANCE is counted: an ACCEPTED_EXCEPTION records an authorized difference and must
-        // never inflate the run's variance count or change its exit code.
+        // Read back from the rows rather than accumulated locally, so the count the runner turns into an
+        // exit code is the count that actually reached the database. Only VARIANCE is counted: an
+        // ACCEPTED_EXCEPTION records an authorized difference and must not change the exit code.
         int varianceCount = Math.toIntExact(
                 reconciliations.countByRunIdAndStatus(run.runId(), ReconciliationStatus.VARIANCE));
 
-        // Exactly three fields of the run, and nothing else - the two above as the window progressed, this one
-        // now that the rows are in. The verdict, finishedAt, sourcePath, batchId and characterizationStatus
-        // belong to MigrationToolRunner, which opened this row as SHADOW/RUNNING and is the single closer of
-        // it; a second writer would let the row's status and its rows disagree. The row itself is deliberately
-        // not saved here for the same reason, which is why a lost window's counts reach the database through
-        // the runner's failure path (MigrationRun.recordProgress) rather than through a save of this instance.
+        // Three fields of the run and nothing else, and the row is deliberately not saved here: the runner
+        // that opened it is its single closer, and a second writer would let the row's status and its
+        // findings disagree.
         run.setVarianceCount(varianceCount);
 
         LOGGER.info("Shadow window {}: {} variance rows persisted", run.runId(), varianceCount);
         return varianceCount;
     }
 
-    /**
-     * Replays one captured transaction and records at most one row for it.
-     */
-    // A MATCHING SEQUENCE NUMBER GETS NO ROW AT ALL - not even a MATCHED one. The acceptance criteria are
-    // "zero VARIANCE rows" for the matched stream and "exactly the seeded rows" for the seeded one, asserted
-    // over the set findByRunIdOrderByReconciliationIdAsc returns; a row per agreeing line would bury the
-    // seeded rows in it and tie both assertions to the window's size.
+    // Replays one captured line and records at most one row for it: an agreeing line gets no row at all,
+    // not even a MATCHED one, because the acceptance criteria are "zero variance rows" and "exactly the
+    // seeded rows", which a row per agreeing line would tie to the window's size.
     private void replayAndClassify(MigrationRun run,
                                    long seq,
                                    ShadowTransaction transaction,
                                    ShadowLegacyResponse legacyResponse,
                                    UUID stagingLoadRunId) {
         String owner = joinKey(transaction.owner());
-        // The null is tested here rather than handed to the map: an immutable Map rejects a null key with a
-        // NullPointerException, and a capture line that carries no request code at all is an unrecognized
-        // code to be classified, never a failure that ends the window.
+        // Null is tested rather than handed to the map, which rejects a null key: a capture line carrying no
+        // request code is an unrecognized code to classify, never a failure that ends the window.
         String requestCode = LegacyExportFormat.trimPadding(transaction.req());
         ReplayOperation operation = requestCode == null ? null : OPERATIONS_BY_CODE.get(requestCode);
 
         if (operation == null) {
-            // FAIL CLOSED ON AN UNRECOGNIZED CODE, and without calling the service at all. EVALUATE WS-REQ has
-            // no WHEN OTHER (CASH00.cbl:L89-L102), so an unknown code - a lowercase 'a' included, the EVALUATE
-            // being case-sensitive - executed no SQL, left the SQLCA untouched, echoed the caller's own COMMAREA
-            // back as the reply and still wrote a history record. The target has no such path (AAP 0.4.3,
-            // 0.12.4), which is an authorized deviation rather than a defect, so the row is an accepted
-            // exception naming the status the target would answer with.
+            // Fail closed on an unrecognized code, without calling the service at all: the legacy EVALUATE
+            // had no WHEN OTHER (CASH00.cbl:L89-L102), so such a code executed no SQL and still echoed a
+            // success-looking reply. The target has no such path, which is an authorized deviation, so the
+            // row is an accepted exception naming the status the target would answer with.
             reconciliationService.record(run, owner, VarianceKind.REJECTED_BY_TARGET,
                     ReconciliationStatus.ACCEPTED_EXCEPTION,
                     legacySideText(legacyResponse), CashAccountErrorCode.UNSUPPORTED_PATH.name(),
@@ -342,18 +309,16 @@ public class ShadowComparator {
         // The try brackets the replay step alone, never the classification of its outcome: a defect in the
         // rules below is a programming error that must surface, not a comparison result to be recorded.
         try {
-            // OwnerNormalizer.normalize sits inside the try for two reasons: it produces the owner the
-            // service is called with, and where the capture's owner is one the target refuses it raises
-            // exactly the INVALID_OWNER the service would raise, so that rejection is classified, not lost.
+            // The normalization sits inside the try because an owner the target refuses raises exactly the
+            // INVALID_OWNER the service would raise, so that rejection is classified rather than lost.
             response = dispatch(operation, OwnerNormalizer.normalize(transaction.owner()), transaction);
         } catch (CashAccountException rejected) {
             classifyTargetRejection(run, owner, legacyResponse, rejected);
             return;
         } catch (RuntimeException unexpected) {
-            // A ROW, NOT AN ABORTED WINDOW. One bad step must not cost a window its evidence, and an
-            // unexplained failure is exactly the kind of divergence a dual-run exists to surface - so it is
-            // recorded as an outstanding variance and the replay continues. Error is deliberately not caught:
-            // a JVM-level failure is not a comparison outcome.
+            // A row, not an aborted window: one bad step must not cost a window its evidence, and an
+            // unexplained failure is the kind of divergence a dual-run exists to surface. Error is
+            // deliberately not caught - a JVM-level failure is not a comparison outcome.
             LOGGER.warn("Shadow window {}: capture line {} failed unexpectedly", run.runId(), seq, unexpected);
             reconciliationService.record(run, owner, VarianceKind.REJECTED_BY_TARGET,
                     ReconciliationStatus.VARIANCE,
@@ -366,17 +331,11 @@ public class ShadowComparator {
                 before, stagingLoadRunId);
     }
 
-    /*
-     * THE AMOUNT MEANS TWO DIFFERENT THINGS AND THE DISTINCTION IS LOAD-BEARING. On A and U the captured
-     * amount is the ABSOLUTE balance the caller supplied: the legacy INSERT and UPDATE bound the COMMAREA
-     * field straight into the row (CASH00.cbl:L155 insert, L176-L177 update). On C and D it is the DELTA that
-     * the stored rate multiplies - MOVE WS-BALANCE TO BALANC-RATE then
-     * COMPUTE WS-CALC = BALANCE +/- (RATES * BALANC-RATE) (CASH00.cbl:L221-L222 credit, L255-L256 debit).
-     * Reading one as the other reproduces a number the legacy never computed.
-     *
-     * The captured currency is passed through exactly as captured, null included, so the service applies its
-     * own base-currency default; defaulting it here would hide a capture that carried no currency.
-     */
+    // The captured amount means two different things: on A and U it is the absolute balance the caller
+    // supplied, which the legacy INSERT and UPDATE bound straight into the row (CASH00.cbl:L155, L176-L177),
+    // while on C and D it is the delta the stored rate multiplies (CASH00.cbl:L221-L222, L255-L256). Reading
+    // one as the other reproduces a number the legacy never computed. The currency passes through as
+    // captured, null included, so the service applies its own default and a currency-less capture stays visible.
     private CashAccountResponse dispatch(ReplayOperation operation, String owner, ShadowTransaction transaction) {
         return switch (operation) {
             case READ -> retailService.read(owner);
@@ -388,9 +347,7 @@ public class ShadowComparator {
         };
     }
 
-    /**
-     * Classifies a capture line the target processed successfully.
-     */
+    /** Classifies a capture line the target processed successfully. */
     private void classifyTargetSuccess(MigrationRun run,
                                        String owner,
                                        ReplayOperation operation,
@@ -399,31 +356,26 @@ public class ShadowComparator {
                                        CashAccountResponse response,
                                        CashAccount before,
                                        UUID stagingLoadRunId) {
-        // NO PER-LINE ROW WHERE THE LEGACY REPLY WAS A FAILURE AND THE TARGET SUCCEEDED. MOVE SQLCODE TO
-        // WS-RETCODE renders the absolute digits and drops the sign (CASH00.cbl:L104), always carrying the
-        // LAST statement's code, so the exact legacy condition is unknowable and a per-line verdict would be
-        // invented; the asymmetry surfaces in the per-owner count instead, where a target excess is expected.
+        // No per-line row where the legacy reply failed and the target succeeded: the sign-dropped retcode
+        // carries only the last statement's code (CASH00.cbl:L104), so the exact legacy condition is
+        // unknowable and a per-line verdict would be invented. The asymmetry surfaces in the per-owner count.
         if (!isLegacySuccess(legacyResponse)) {
             return;
         }
 
         BigDecimal capturedBalance = capturedBalance(legacyResponse);
         if (capturedBalance == null) {
-            // A success reply that carried no balance leaves nothing to compare, so the line fails closed
-            // rather than being skipped silently - and the row has to say WHICH side was missing, or a reader
-            // cannot tell a malformed capture from a comparison the tool botched. The value columns of a
-            // BALANCE row are rendered by MigrationReconciliation.balance from the balances themselves, which
-            // is why the two value arguments are null here as they are for every BALANCE row: that factory
-            // writes MigrationReconciliation.ABSENT_IN_CAPTURE into legacy_value whenever the legacy balance
-            // is absent, leaving legacy_balance and the variance null because neither is knowable.
+            // A success reply carrying no balance leaves nothing to compare, so the line fails closed rather
+            // than being skipped silently. The value arguments are null as on every BALANCE row, because
+            // MigrationReconciliation.balance renders them and names the absent side ABSENT_IN_CAPTURE.
             reconciliationService.record(run, owner, VarianceKind.BALANCE, ReconciliationStatus.VARIANCE,
                     null, null, null, response.balance());
             return;
         }
 
         BigDecimal targetBalance = response.balance();
-        // compareTo, never equals: 1250.5 and 1250.50 are the same amount of money and differ only in scale,
-        // which BigDecimal.equals reports as a difference an operator would have to triage as one.
+        // compareTo, never equals: 1250.5 and 1250.50 are the same money and differ only in scale, which
+        // BigDecimal.equals would report as a difference an operator then has to triage.
         if (capturedBalance.compareTo(targetBalance) == 0) {
             return;
         }
@@ -431,11 +383,9 @@ public class ShadowComparator {
         if (stagingLoadRunId != null
                 && isRateScaled(operation)
                 && rateDifferenceExplains(stagingLoadRunId, operation, transaction, before, capturedBalance)) {
-            // LIVE MODE ONLY (AAP 0.12.5). Re-deriving the step with the STAGED legacy rate reproduces the
-            // captured balance exactly, so the whole difference is attributable to the rate the target priced
-            // with and none of it to the ledger: an accepted exception the runbook's live shadow step reads for
-            // information, never a parity failure. The variance column stays null because an accepted
-            // exception leaves no signed difference outstanding - both balances are on the row beside it.
+            // Live mode only: re-deriving the step with the staged legacy rate reproduces the captured
+            // balance exactly, so the whole difference is attributable to the rate the target priced with
+            // and none of it to the ledger - an accepted exception rather than a parity failure.
             reconciliationService.record(run, owner, VarianceKind.RATE_SOURCE,
                     ReconciliationStatus.ACCEPTED_EXCEPTION,
                     capturedBalance.toPlainString(), targetBalance.toPlainString(),
@@ -443,23 +393,18 @@ public class ShadowComparator {
             return;
         }
 
-        // The parity gate's verdict, and the fallback for every live-mode difference the rate cannot explain:
-        // a genuine balance divergence. record derives the two renderings and the signed variance
-        // (migrated - legacy) from the balances themselves, so the sign convention has one home.
+        // The parity gate's verdict, and the fallback for a live-mode difference the rate cannot explain.
         reconciliationService.record(run, owner, VarianceKind.BALANCE, ReconciliationStatus.VARIANCE,
                 null, null, capturedBalance, targetBalance);
     }
 
-    /**
-     * Classifies a capture line the target refused with an explicit business condition.
-     */
+    /** Classifies a capture line the target refused with an explicit business condition. */
     private void classifyTargetRejection(MigrationRun run,
                                          String owner,
                                          ShadowLegacyResponse legacyResponse,
                                          CashAccountException rejected) {
-        // BOTH SIDES REFUSED IS AGREEMENT, AND GETS NO ROW. The retcode is sign-dropped and carries only the
-        // last statement's code (CASH00.cbl:L104), so the legacy condition cannot be compared with the
-        // target's; "both refused" is the strongest statement the evidence supports (AAP 0.12.3).
+        // Both sides refused is agreement and gets no row: the sign-dropped retcode cannot be compared with
+        // the target's condition, so "both refused" is the strongest statement the evidence supports.
         if (!isLegacySuccess(legacyResponse)) {
             return;
         }
@@ -469,19 +414,15 @@ public class ShadowComparator {
                 ? ReconciliationStatus.ACCEPTED_EXCEPTION
                 : ReconciliationStatus.VARIANCE;
 
-        // The error code's constant NAME is the wire code the target answers with, so the row carries the
-        // same token an operator sees in an ApiError payload.
+        // The constant's name is the wire code the target answers with, so the row carries the same token
+        // an operator sees in an ApiError payload.
         reconciliationService.record(run, owner, VarianceKind.REJECTED_BY_TARGET, status,
                 legacySideText(legacyResponse), code.name(), capturedBalance(legacyResponse), null);
     }
 
-    /**
-     * Records the per-owner transaction-count comparison for the window.
-     */
-    // THE ONLY MODE THAT EMITS TRANSACTION_COUNT. After a bulk load the target holds one MIGRATION_LOAD ledger
-    // row per account and no per-transaction history, so reconcile mode has no target count to compare against
-    // and ReconciliationService never writes this kind; a shadow window is the one place both sides processed
-    // the same stream (AAP 0.10.3).
+    // The per-owner count comparison, which only a shadow window can make: after a bulk load the target
+    // holds one MIGRATION_LOAD row per account and no per-transaction history, so reconcile mode has no
+    // target count to compare against and never writes this kind.
     private void recordTransactionCounts(MigrationRun run,
                                          Map<Long, ShadowTransaction> transactionsBySeq,
                                          Map<Long, ShadowLegacyResponse> responsesBySeq) {
@@ -491,9 +432,9 @@ public class ShadowComparator {
                 continue;
             }
             ShadowTransaction paired = transactionsBySeq.get(legacyResponse.seq());
-            // Q is excluded because a read changed no state, so there is nothing on the target side to count it
-            // against (AAP 0.4.6, characterization 4.2). An UNPAIRED success is counted: it is evidence of a
-            // legacy state change the target never saw, which is the whole point of the count.
+            // Q is excluded because a read changed no state, so there is nothing on the target side to count
+            // it against. An unpaired success is counted: it is evidence of a legacy state change the target
+            // never saw, which is the whole point of the count.
             if (paired != null && !isCounted(paired.req())) {
                 continue;
             }
@@ -502,10 +443,8 @@ public class ShadowComparator {
 
         Map<String, Integer> targetCounts = new TreeMap<>();
         for (ShadowTransaction transaction : transactionsBySeq.values()) {
-            // ATTEMPTED, NOT ACCEPTED, and this is load-bearing: a line the target refused already carries its
-            // own REJECTED_BY_TARGET row, so counting it as a shortfall here as well would report one
-            // divergence twice and would turn the seeded over-debit into two rows instead of the one row the
-            // acceptance criteria fix (AAP 0.10.3).
+            // Attempted, not accepted: a line the target refused already carries its own REJECTED_BY_TARGET
+            // row, so counting it as a shortfall here would report one divergence twice.
             if (isCounted(transaction.req())) {
                 increment(targetCounts, joinKey(transaction.owner()));
             }
@@ -522,11 +461,10 @@ public class ShadowComparator {
                 continue;
             }
 
-            // THE ASYMMETRY IS THE LEGACY'S, NOT A PREFERENCE (AAP 0.11.1). EXEC CICS IGNORE CONDITION DUPREC
-            // (CASH00.cbl:L124) discarded a second history record whose 29-byte key already existed, and the
-            // key's only time component is a whole second - so two requests for one owner inside one second
-            // left a single record and legacy counts are a LOWER BOUND. A target excess is therefore expected
-            // and accepted; a target shortfall cannot be explained that way and is a real loss.
+            // The asymmetry is the legacy's, not a preference: IGNORE CONDITION DUPREC (CASH00.cbl:L124)
+            // discarded a second history record whose 29-byte key already existed, and that key's only time
+            // component is a whole second, so legacy counts are a lower bound. A target excess is therefore
+            // expected and accepted; a target shortfall cannot be explained that way and is a real loss.
             ReconciliationStatus status = targetCount > legacyCount
                     ? ReconciliationStatus.ACCEPTED_EXCEPTION
                     : ReconciliationStatus.VARIANCE;
@@ -538,12 +476,9 @@ public class ShadowComparator {
         }
     }
 
-    /**
-     * Whether re-deriving the replayed step with the staged legacy rate reproduces the captured balance exactly.
-     */
-    // Deliberately narrow and conservative: only a difference the staged RATES re-derives to the cent is
-    // attributed to the exchange rate, because accepting one that no arithmetic reproduces would sign off a
-    // defect. A missing or NULL staged rate explains nothing and therefore explains nothing away.
+    // Deliberately narrow: only a difference the staged RATES re-derives to the cent is attributed to the
+    // exchange rate, because accepting one that no arithmetic reproduces would sign off a defect. A missing
+    // or null staged rate therefore explains nothing away.
     private boolean rateDifferenceExplains(UUID stagingLoadRunId,
                                            ReplayOperation operation,
                                            ShadowTransaction transaction,
@@ -567,34 +502,29 @@ public class ShadowComparator {
         return capturedBalance.compareTo(expectedLegacy.amount()) == 0;
     }
 
-    /**
-     * The staged rate table's owning run: the latest load of this batch that did not fail.
-     */
-    // Resolved from the batch rather than from this run because the rate table was staged by the batch's LOAD
-    // invocation and a shadow window is a different run under the same batch id (AAP 0.6.3). The repository
-    // returns the batch in start order and the enum filtering happens here, exactly as
-    // MigrationRunRepository's contract prescribes.
+    // The staged rate table's owning run, resolved from the batch rather than from this run: the table was
+    // staged by the batch's LOAD invocation, and a shadow window is a different run_id under the same
+    // batch_id. MigrationRunRepository's shared selector admits only CLEAN and VARIANCE, so a window, a
+    // reconcile of the same batch and fx/LegacyRateTableSource price against one run and a newer RUNNING
+    // attempt that staged nothing cannot stand in for it. null rather than a throw for a batch with no
+    // completed load, so the window reports the difference as an outstanding VARIANCE instead of absorbing it.
     private UUID latestLoadRunId(UUID batchId) {
         if (batchId == null) {
             return null;
         }
-        UUID resolved = null;
-        for (MigrationRun candidate : runs.findByBatchIdOrderByStartedAtAsc(batchId)) {
-            if (candidate.mode() == MigrationRun.Mode.LOAD && candidate.status() != MigrationRun.Status.FAILED) {
-                resolved = candidate.runId();
-            }
-        }
-        return resolved;
+        return runs.findLatestCompletedLoad(batchId)
+                .map(MigrationRun::runId)
+                .orElse(null);
     }
 
-    private List<ShadowTransaction> readTransactions(Path file) {
+    private List<ShadowTransaction> readTransactions(LegacyExportFormat.ExportFile file) {
         List<DelimitedExportReader.DelimitedRow> rows =
                 exportReader.readRows(file, LegacyExportFormat.SHADOW_TRANSACTION_COLUMNS);
         List<ShadowTransaction> transactions = new ArrayList<>(rows.size());
         for (DelimitedExportReader.DelimitedRow row : rows) {
             // Values reach the carrier exactly as captured - unnormalized owner, un-uppercased request code,
-            // unrescaled amount - because both records are deliberately raw and every judgement about them
-            // belongs to the classification below or to the service layer.
+            // unrescaled amount - because every judgement about them belongs to the classification below or
+            // to the service layer.
             transactions.add(new ShadowTransaction(
                     row.requireLong(LegacyExportFormat.SHADOW_TRANSACTION_SEQ_COLUMN),
                     row.requireText(LegacyExportFormat.SHADOW_TRANSACTION_OWNER_COLUMN),
@@ -605,7 +535,7 @@ public class ShadowComparator {
         return List.copyOf(transactions);
     }
 
-    private List<ShadowLegacyResponse> readLegacyResponses(Path file) {
+    private List<ShadowLegacyResponse> readLegacyResponses(LegacyExportFormat.ExportFile file) {
         List<DelimitedExportReader.DelimitedRow> rows =
                 exportReader.readRows(file, LegacyExportFormat.SHADOW_LEGACY_RESPONSE_COLUMNS);
         List<ShadowLegacyResponse> responses = new ArrayList<>(rows.size());
@@ -643,8 +573,8 @@ public class ShadowComparator {
         return bySeq;
     }
 
-    // A malformed capture is an INPUT ERROR, not a variance: a repeated sequence number makes the join
-    // ambiguous and a variance row written from an ambiguous pairing would be evidence of nothing.
+    // A malformed capture is an input error, not a variance: a repeated sequence number makes the join
+    // ambiguous, and a row written from an ambiguous pairing would be evidence of nothing.
     private static IllegalArgumentException duplicateSequence(String capture, long seq) {
         return new IllegalArgumentException("The capture " + capture + " repeats "
                 + LegacyExportFormat.SHADOW_TRANSACTION_SEQ_COLUMN + " " + seq
@@ -681,8 +611,8 @@ public class ShadowComparator {
         return legacyResponse == null ? null : legacyResponse.balance();
     }
 
-    // What the legacy side of a non-balance row carries: the reply's balance where it had one, and otherwise
-    // the raw return code, which is the only other thing the reply stated.
+    // The reply's balance where it had one, and otherwise the raw return code, which is the only other
+    // thing the reply stated.
     private static String legacySideText(ShadowLegacyResponse legacyResponse) {
         if (legacyResponse == null) {
             return null;
@@ -692,8 +622,8 @@ public class ShadowComparator {
                 : LegacyExportFormat.trimPadding(legacyResponse.retcode());
     }
 
-    // Null-guarded for the same reason the dispatch lookup is: an immutable Set rejects a null probe, and a
-    // capture line without a request code counts as no state change on either side.
+    // Null-guarded like the dispatch lookup: a capture line without a request code counts as no state
+    // change on either side.
     private static boolean isCounted(String requestCode) {
         String trimmed = LegacyExportFormat.trimPadding(requestCode);
         return trimmed != null && LegacyExportFormat.COUNTED_REQUEST_CODES.contains(trimmed);
@@ -703,9 +633,9 @@ public class ShadowComparator {
         return operation == ReplayOperation.CREDIT || operation == ReplayOperation.DEBIT;
     }
 
-    // The legacy join compared only the first RATE_KEY_LENGTH characters of the account's currency
-    // (MOVE CURRENCYC TO WS-CURRENCY-KEY, CASH00.cbl:L213 credit, L247 debit), and the width comes from
-    // LegacyCharacterization so the characterized parameters keep one declaration point.
+    // The legacy join compared only the first five characters of the account's currency, the width of
+    // WS-CURRENCY-KEY that CURRENCYC was moved into (CASH00.cbl:L19, L213 credit, L247 debit); the constant
+    // comes from LegacyCharacterization so the characterized parameters keep one declaration point.
     private static String rateKey(String currency) {
         if (currency == null) {
             return "";
@@ -715,15 +645,11 @@ public class ShadowComparator {
                 : currency.substring(0, LegacyCharacterization.RATE_KEY_LENGTH);
     }
 
-    /**
-     * The grouping key for one captured owner, which never throws.
-     */
-    // OwnerNormalizer.normalize is the authority and is used wherever it succeeds. It raises INVALID_OWNER for
-    // a blank owner or one longer than 32 characters, and the owner column of migration_reconciliation is NOT
-    // NULL - so a capture the target refuses still needs a deterministic key to be recorded and counted
-    // under. The fallback applies the same folding the normalizer would (strip, upper case with Locale.ROOT
-    // so a Turkish default locale cannot map "i" to a dotted capital) and then cuts to the stored column
-    // width, which is how the legacy interface itself lost long owners (CASH00.cbl:L55).
+    // The grouping key for one captured owner, which never throws: OwnerNormalizer is the authority wherever
+    // it succeeds, but it rejects a blank or over-long owner, and the row's owner column is NOT NULL - so a
+    // capture the target refuses still needs a deterministic key. The fallback folds as the normalizer would
+    // and then cuts to the stored width, which is how the legacy interface itself lost long owners
+    // (CASH00.cbl:L55).
     private static String joinKey(String rawOwner) {
         try {
             return OwnerNormalizer.normalize(rawOwner);
@@ -735,8 +661,8 @@ public class ShadowComparator {
             if (folded.isEmpty()) {
                 return UNUSABLE_OWNER_KEY;
             }
-            // Counted and cut in code points, the unit OwnerNormalizer.MAX_LENGTH is stated in: a UTF-16 cut could
-            // split a supplementary character and leave an unpaired surrogate as the key's last unit.
+            // Counted and cut in code points, the unit OwnerNormalizer.MAX_LENGTH is stated in: a UTF-16 cut
+            // could split a supplementary character and leave an unpaired surrogate as the key's last unit.
             return folded.codePointCount(0, folded.length()) <= OwnerNormalizer.MAX_LENGTH
                     ? folded
                     : folded.substring(0, folded.offsetByCodePoints(0, OwnerNormalizer.MAX_LENGTH));
@@ -752,9 +678,9 @@ public class ShadowComparator {
         for (ReplayOperation operation : ReplayOperation.values()) {
             byCode.put(operation.code(), operation);
         }
-        // The cross-check that keeps LegacyExportFormat the single authority on the accepted codes: if the set
-        // there ever changes, this class fails to initialize rather than quietly leaving a code unroutable or
-        // routing one the legacy never recognized.
+        // Keeps LegacyExportFormat the single authority on the accepted codes: if the set there changes,
+        // this class fails to initialize rather than leaving a code unroutable or routing one the legacy
+        // never recognized.
         if (!byCode.keySet().equals(LegacyExportFormat.REQUEST_CODES)) {
             throw new IllegalStateException("The replay dispatch table covers " + byCode.keySet()
                     + " but LegacyExportFormat.REQUEST_CODES declares " + LegacyExportFormat.REQUEST_CODES);

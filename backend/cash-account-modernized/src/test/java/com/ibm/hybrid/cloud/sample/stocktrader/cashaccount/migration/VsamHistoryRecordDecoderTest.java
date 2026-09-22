@@ -1,19 +1,3 @@
-/*
-       Copyright 2025 Kyndryl, All Rights Reserved
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
- */
-
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.migration;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -38,37 +22,6 @@ import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 
-/*
- * WHY THIS TEST WRITES DOWN NO PART OF THE LAYOUT. Every offset, length, digit count, scale, charset and
- * accepted record length below is read from LegacyExportFormat, which is the single declaration of the
- * legacy structure (WS-VSAM-RECORD, backend/cash-account-cobol/COBOL/CASH00.cbl:L38-L45, and the cluster's
- * own attributes, backend/cash-account-cobol/VSAM/DEFKSDS.jcl:L11, L14). A literal retyped here would let
- * the decoder and this test agree with each other while both drifted from the characterized record, which
- * is the one failure a layout test exists to catch. The EBCDIC blank is derived the same way -- encoding a
- * space with the configured charset -- rather than typed as a byte value.
- *
- * WHY THE SYNTHETIC RECORD IS ENCODED FIELD BY FIELD WITH AN EXPLICIT CHARSET. The legacy record is a
- * concatenation of independently encoded fixed-width fields, not a string: encoding it as one text run
- * through the platform default would produce bytes that still decode into plausible-looking values and
- * mis-frame every field the moment the code page is not single-byte (AAP 0.12.2). The producing side here
- * mirrors the consuming side of the decoder for exactly that reason.
- *
- * WHY THE RECORD LENGTH IS ALWAYS DECLARED AND NEVER INFERRED. CASH00 writes a 57-byte record
- * (CASH00.cbl:L38-L45, L126-L131) into a cluster defined RECSZ(100 100) (DEFKSDS.jcl:L11), and the CICS
- * FILE definition that would settle which shape is on disk is not in this repository -- AAP 0.11.2's open
- * item. So both lengths are decodable, tool.history-record-length carries the operator's answer, and a
- * third value is refused before a byte is read; inferring the length from the file size would mis-frame
- * every record of an export that happened to divide evenly, which is a wrong load rather than a failed one.
- *
- * WHY NO BALANCE TOUCHES A FLOATING-POINT TYPE. PIC 9(7)V99 is unsigned zoned decimal that COBOL held
- * exactly; every expected value here is a BigDecimal built from text, so these assertions turn on the
- * decoder's arithmetic rather than on binary representation error (AAP 0.7.1).
- *
- * The three scenarios are the export-decoding budget of AAP 0.7.6 -- 57-byte record, 100-byte padded
- * record, bad length -- and nothing here reads a real VSAM data set or any other mainframe resource: the
- * tooling is proven against synthetic bytes and committed fixtures only (AAP 0.3.2).
- */
-
 /** Unit tests pinning {@code VsamHistoryRecordDecoder} to the characterized 57-byte WS-VSAM-RECORD layout. */
 class VsamHistoryRecordDecoderTest {
 
@@ -76,11 +29,13 @@ class VsamHistoryRecordDecoderTest {
     private static final Charset LEGACY_CHARSET = Charset.forName(LegacyExportFormat.DEFAULT_LEGACY_CHARSET);
 
     /**
-     * The blank a fixed-length legacy record is padded with, obtained by encoding a space in the legacy
-     * code page so that no byte value is written down here.
+     * The blank a fixed-length legacy record is padded with, obtained by encoding a space in the legacy code
+     * page rather than written down as a byte value.
      */
     private static final byte LEGACY_BLANK = " ".getBytes(LEGACY_CHARSET)[0];
 
+    // The committed fixture and the synthetic bytes below are the only history this test reads: nothing here
+    // touches a real VSAM data set or any other mainframe resource (AAP 0.3.2).
     private static final String BINARY_HISTORY_FIXTURE_RESOURCE =
             "fixtures/legacy-export/matched/" + LegacyExportFormat.HISTORY_BINARY_FILE;
 
@@ -88,8 +43,8 @@ class VsamHistoryRecordDecoderTest {
     private static final int EXPECTED_FIXTURE_RECORDS = 8;
 
     /**
-     * A declared record length that is neither of the two the legacy artifacts name; the scenario that uses
-     * it asserts through LegacyExportFormat that it really is unaccepted, so the value cannot go stale.
+     * A declared record length that is neither of the two the legacy artifacts name; the scenario using it
+     * asserts through LegacyExportFormat that it is unaccepted, so the value cannot go stale.
      */
     private static final int UNACCEPTED_RECORD_LENGTH = 80;
 
@@ -106,6 +61,8 @@ class VsamHistoryRecordDecoderTest {
     /** The significant digits of 1000.00; the encoder zero-fills them to the field's declared width. */
     private static final String BALANCE_DIGITS = "100000";
 
+    // Built from text, never a floating-point type: PIC 9(7)V99 is unsigned zoned decimal COBOL held exactly,
+    // so these assertions turn on the decoder's arithmetic rather than on representation error (AAP 0.7.1).
     private static final BigDecimal EXPECTED_BALANCE = new BigDecimal("1000.00");
 
     private static final String CURRENCY = "USD";
@@ -122,25 +79,24 @@ class VsamHistoryRecordDecoderTest {
 
         assertThat(decoded).hasSize(1);
         VsamHistoryRecord only = decoded.get(0);
-        // The CHAR fields come back with their blank padding removed and the stamps as the raw text
-        // FORMATTIME produced (CASH00.cbl:L112-L113), because resolving a stamp to an instant needs the
-        // region's time zone, which is a tool property rather than anything this decoder may assume.
+        // The CHAR fields come back with their blank padding removed and the stamps as the raw text ASKTIME and
+        // FORMATTIME produced (CASH00.cbl:L80-L85), because resolving a stamp to an instant needs the region's
+        // time zone, which is a tool property rather than anything this decoder may assume.
         assertThat(only.name()).isEqualTo(UPPER_CASE_NAME);
         assertThat(only.eventDate()).isEqualTo(EVENT_DATE);
         assertThat(only.eventTime()).isEqualTo(EVENT_TIME);
         assertThat(only.requestCode()).isEqualTo(REQUEST_CODE);
         assertThat(only.currency()).isEqualTo(CURRENCY);
         assertThat(only.retcode()).isEqualTo(RETCODE);
-        // Scale-sensitive equality plus the explicit scale: together they evidence both the value and the
-        // two implied decimal places of PIC 9(7)V99, which isEqualByComparingTo would have accepted away.
+        // Equality plus the explicit scale evidence both the value and the two implied decimal places of
+        // PIC 9(7)V99, which isEqualByComparingTo would have accepted away.
         assertThat(only.balance()).isEqualTo(EXPECTED_BALANCE);
         assertThat(only.balance().scale()).isEqualTo(LegacyExportFormat.MONEY_SCALE);
 
-        // The caller's own casing survives unfolded: CASH00.cbl:L111 moves WS-NAME into the record with no
-        // case folding, so "John"+stamp and "JOHN"+stamp are two distinct, equally valid 29-byte keys
-        // (WS-VSAM-KEY, CASH00.cbl:L47-L50; KEYS, DEFKSDS.jcl:L14) and an import that folded either away
-        // would silently merge two legacy rows. Asserting the whole record proves the casing is the only
-        // difference the name change makes.
+        // The caller's own casing survives unfolded: CASH00.cbl:L111 moves WS-NAME into the record with no case
+        // folding, so "John"+stamp and "JOHN"+stamp are two distinct, equally valid 29-byte keys (WS-VSAM-KEY,
+        // CASH00.cbl:L47-L50; KEYS, DEFKSDS.jcl:L14) and an import that folded either away would silently merge
+        // two legacy rows.
         VsamHistoryRecord mixedCase = decoderFor(LegacyExportFormat.HISTORY_RECORD_LENGTH).decodeRecord(
                 encodeHistoryRecord(MIXED_CASE_NAME, EVENT_DATE, EVENT_TIME, REQUEST_CODE, BALANCE_DIGITS,
                         CURRENCY, RETCODE),
@@ -149,6 +105,12 @@ class VsamHistoryRecordDecoderTest {
                 only.eventTime(), only.requestCode(), only.balance(), only.currency(), only.retcode()));
     }
 
+    // Both lengths are decodable because CASH00 writes a 57-byte record (CASH00.cbl:L38-L45, L126-L131) into a
+    // cluster defined RECSZ(100 100) (DEFKSDS.jcl:L11) and the CICS FILE definition that would settle which
+    // shape is on disk is outside this repository (AAP 0.11.2's open item). tool.history-record-length carries
+    // the operator's answer and a third value is refused before a byte is read: inferring the length from the
+    // file size would mis-frame every record of an export that happened to divide evenly, a wrong load rather
+    // than a failed one.
     @Test
     void decodesA100BytePaddedRecordIdenticallyAndReadsTheBinaryFixture() {
         byte[] data = encodeHistoryRecord(UPPER_CASE_NAME, EVENT_DATE, EVENT_TIME, REQUEST_CODE,
@@ -164,9 +126,8 @@ class VsamHistoryRecordDecoderTest {
                 decoderFor(LegacyExportFormat.HISTORY_RECORD_LENGTH).decodeRecord(data, 1);
         VsamHistoryRecord fromPadded =
                 decoderFor(LegacyExportFormat.HISTORY_PADDED_RECORD_LENGTH).decodeRecord(padded, 1);
-        // Record equality across the two declared lengths is the whole assertion: it proves at once that the
-        // tail past the last declared field is padding, that nothing from it bleeds into a field, and that
-        // no field shifts -- which re-asserting the seven components a second time would only restate.
+        // Record equality across the two declared lengths proves at once that the tail past the last declared
+        // field is padding, that nothing from it bleeds into a field, and that no field shifts.
         assertThat(fromPadded).isEqualTo(fromWritten);
 
         Path fixture = fixture(BINARY_HISTORY_FIXTURE_RESOURCE);
@@ -179,20 +140,18 @@ class VsamHistoryRecordDecoderTest {
         List<VsamHistoryRecord> records =
                 decoderFor(LegacyExportFormat.HISTORY_PADDED_RECORD_LENGTH).decodeAll(fixture);
 
-        // The fixture is the committed padded case, so what it proves here is framing: every record is
-        // found, and the two rows that differ only in the casing of one name survive as two. Its fields are
-        // checked value for value against history.csv by LoaderIT, which owns that comparison; repeating it
-        // here would add nothing and would breach the test budget of AAP 0.7.6.
+        // The fixture is the committed padded case, so what it proves here is framing: every record is found,
+        // and the two rows differing only in the casing of one name survive as two. Its fields are checked value
+        // for value against history.csv by LoaderIT, which owns that comparison (AAP 0.7.6).
         assertThat(records).hasSize(EXPECTED_FIXTURE_RECORDS);
         assertThat(records).extracting(VsamHistoryRecord::name).startsWith(MIXED_CASE_NAME, UPPER_CASE_NAME);
 
-        // THE OTHER HALF OF "THE TAIL IS PADDING": a tail that is neither EBCDIC blank nor 0x00 is not
-        // harmless residue but the first evidence that the file was never framed at the declared length -- a
-        // 57-byte export read as 100-byte records, or a transfer that inserted separators -- and a mis-framed
-        // export decodes into plausible-looking values at the wrong offsets instead of failing. The byte is
-        // planted at the LAST position of the frame, the one a check that inspected only the first tail byte
-        // would miss, and the failure has to name that offset because it is what an operator compares against
-        // the layout.
+        // The other half of "the tail is padding": a tail byte that is neither EBCDIC blank nor 0x00 is the
+        // first evidence that the file was never framed at the declared length - a 57-byte export read as
+        // 100-byte records, or a transfer that inserted separators - and a mis-framed export decodes into
+        // plausible-looking values at the wrong offsets instead of failing. The byte is planted at the last
+        // position of the frame, which a check inspecting only the first tail byte would miss, and the failure
+        // names that offset because it is what an operator compares against the layout.
         byte[] residueInTail = padded.clone();
         int lastOffsetOfFrame = LegacyExportFormat.HISTORY_PADDED_RECORD_LENGTH - 1;
         residueInTail[lastOffsetOfFrame] = "X".getBytes(LEGACY_CHARSET)[0];
@@ -213,8 +172,8 @@ class VsamHistoryRecordDecoderTest {
                         UNACCEPTED_RECORD_LENGTH)
                 .isFalse();
         // Refused at construction rather than at the first record: the length is the operator's declaration
-        // (tool.history-record-length, mandatory for binary input), and a run that starts with a wrong one
-        // has already mis-framed everything it will read.
+        // (tool.history-record-length, mandatory for binary input), and a run starting with a wrong one has
+        // already mis-framed everything it will read.
         assertThatThrownBy(() -> new VsamHistoryRecordDecoder(LEGACY_CHARSET, UNACCEPTED_RECORD_LENGTH))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining(String.valueOf(UNACCEPTED_RECORD_LENGTH));
@@ -223,10 +182,9 @@ class VsamHistoryRecordDecoderTest {
         Arrays.fill(notAWholeNumberOfRecords, LEGACY_BLANK);
         VsamHistoryRecordDecoder decoder = decoderFor(LegacyExportFormat.HISTORY_RECORD_LENGTH);
 
-        // A stream that does not divide by the declared length is a mis-declared length, a text-mode
-        // transfer that inserted separators, or a truncated export -- none of which may be papered over by
-        // decoding the whole records and discarding the remainder, so the failure names both numbers the
-        // operator has to compare.
+        // A stream that does not divide by the declared length is a mis-declared length, a text-mode transfer
+        // that inserted separators, or a truncated export - none of which may be papered over by decoding the
+        // whole records and discarding the remainder, so the failure names both numbers to compare.
         assertThatThrownBy(() -> decoder.decodeAll(notAWholeNumberOfRecords))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining(String.valueOf(notAWholeNumberOfRecords.length))
@@ -238,8 +196,14 @@ class VsamHistoryRecordDecoderTest {
     }
 
     /**
-     * Encodes one WS-VSAM-RECORD as the legacy program laid it out: a blank-filled fixed-length buffer with
-     * each declared field written at its own offset in the legacy code page.
+     * Encodes one WS-VSAM-RECORD as the legacy program laid it out, taking every offset, length and charset
+     * from LegacyExportFormat - the single declaration of the layout (WS-VSAM-RECORD,
+     * backend/cash-account-cobol/COBOL/CASH00.cbl:L38-L45; cluster attributes,
+     * backend/cash-account-cobol/VSAM/DEFKSDS.jcl:L11, L14) - so no literal retyped here can let the decoder
+     * and this test agree while both drift from the characterized record. Field by field with an explicit
+     * charset, because the record is a concatenation of independently encoded fixed-width fields: encoding it
+     * as one text run through the platform default would mis-frame every field the moment the code page is not
+     * single-byte (AAP 0.12.2).
      */
     private static byte[] encodeHistoryRecord(String name, String eventDate, String eventTime,
             String requestCode, String balanceDigits, String currency, String retcode) {
@@ -249,8 +213,8 @@ class VsamHistoryRecordDecoderTest {
         values.put(LegacyExportFormat.HISTORY_TIME_COLUMN, eventTime);
         values.put(LegacyExportFormat.HISTORY_REQUEST_CODE_COLUMN, requestCode);
         // The only zero-filled field of the record: the CHAR fields are blank-padded, but PIC 9(7)V99 is
-        // unsigned zoned decimal of fixed width with an implied point, so its unused high-order positions
-        // carry digits rather than blanks and a blank there would not decode as a number at all.
+        // unsigned zoned decimal of fixed width with an implied point, so its unused high-order positions carry
+        // digits and a blank there would not decode as a number at all.
         values.put(LegacyExportFormat.HISTORY_BALANCE_COLUMN, zeroFilled(balanceDigits));
         values.put(LegacyExportFormat.HISTORY_CURRENCY_COLUMN, currency);
         values.put(LegacyExportFormat.HISTORY_RETCODE_COLUMN, retcode);
@@ -284,8 +248,8 @@ class VsamHistoryRecordDecoderTest {
 
     private static byte[] readAllBytes(Path file) {
         try {
-            // Read as bytes, never through a Reader or a String: the fixture is EBCDIC, and any decoding
-            // step outside the decoder would silently re-encode it before the assertion could see it.
+            // Read as bytes, never through a Reader or a String: the fixture is EBCDIC, and any decoding step
+            // outside the decoder would re-encode it before the assertion could see it.
             return Files.readAllBytes(file);
         } catch (IOException e) {
             return fail("the binary history fixture at %s could not be read".formatted(file.toAbsolutePath()), e);
@@ -293,10 +257,8 @@ class VsamHistoryRecordDecoderTest {
     }
 
     /**
-     * Resolves a test-classpath fixture to a filesystem path.
-     *
-     * <p>Fails rather than skips when the fixture is missing: a decoder test with nothing to decode proves
-     * nothing, and a skipped test reports as success.
+     * Fails rather than skips when the fixture is missing: a decoder test with nothing to decode proves nothing,
+     * and a skipped test reports as success.
      */
     private static Path fixture(String resource) {
         URL location = VsamHistoryRecordDecoderTest.class.getClassLoader().getResource(resource);

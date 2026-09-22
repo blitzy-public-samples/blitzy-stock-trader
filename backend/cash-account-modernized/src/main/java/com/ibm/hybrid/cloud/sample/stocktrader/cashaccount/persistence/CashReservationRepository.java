@@ -1,19 +1,3 @@
-/*
-       Copyright 2025 Kyndryl, All Rights Reserved
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
- */
-
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.persistence;
 
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.domain.CashReservation;
@@ -34,53 +18,43 @@ import org.springframework.data.repository.query.Param;
 /** Data access for {@code cash_reservation}: replay lookups, the outstanding-hold test and the expiry sweep. */
 public interface CashReservationRepository extends JpaRepository<CashReservation, UUID> {
 
-    // Owner-scoped ON PURPOSE, which is the opposite of the method below and its whole reason for existing: the
-    // point is to see the rows the incarnation-scoped lookup cannot. ReservationService.holdOnce consults this
-    // after that lookup misses, so a match here can only be a retained row of an earlier incarnation - the
-    // 422 IDEMPOTENCY_KEY_REUSED case the UNIQUE (incarnation_id, idempotency_key) guard cannot catch, because
-    // the new incarnation makes the pair unique again (AAP 0.6.3 cash_reservation, AAP 0.11.1).
+    // Owner-scoped ON PURPOSE, to see the rows the incarnation-scoped lookup below cannot: consulted after
+    // that lookup misses, a match here can only be a retained row of an earlier incarnation - the
+    // 422 IDEMPOTENCY_KEY_REUSED case uq_cash_reservation_incarnation_key cannot catch, because a new
+    // incarnation makes the pair unique again (AAP 0.11.1).
     //
-    // A List rather than an Optional because the rows are legitimately plural: cash_reservation carries no
-    // foreign key and survives a retail DELETE, so every incarnation an owner has had may have left one row
-    // under the same key. An Optional-returning derived query would answer that with
-    // IncorrectResultSizeDataAccessException - a 500 - instead of the question that was asked.
+    // A List, not an Optional, because the rows are legitimately plural: cash_reservation carries no foreign
+    // key and survives a retail DELETE, so every incarnation an owner has had may have left one row under the
+    // same key, and an Optional-returning query would answer that with a 500.
     List<CashReservation> findByOwnerAndIdempotencyKey(String owner, String idempotencyKey);
 
-    // Scoped by the account's incarnation rather than by its owner, which is the whole point of the method:
-    // incarnation_id is renewed on every create, so an Idempotency-Key presented against an owner that was deleted
-    // and recreated matches nothing here - never a replay of a reservation that reserved funds in an account life
-    // that no longer exists. What such a key IS answered with is decided by the owner-scoped query above, which
-    // holdOnce consults next: 422 IDEMPOTENCY_KEY_REUSED when an earlier life of the owner already spent the key,
-    // and a fresh hold only when no life of it ever did. The pair read here is UNIQUE
-    // (schema/cash-account-schema.sql:L69), so at most one row can ever match and the Optional is safe by
-    // construction rather than by convention.
+    // Scoped by the account's incarnation rather than by its owner: incarnation_id is renewed on every create,
+    // so a key presented against an owner that was deleted and recreated matches nothing here - never a replay
+    // of a reservation that reserved funds in an account life that no longer exists. The pair read here is
+    // uq_cash_reservation_incarnation_key, so the Optional is safe by construction.
     //
-    // Called from a FRESH transaction, never from the one that lost the race. The losing INSERT's unique violation
-    // reaches the service as DataIntegrityViolationException, and PostgreSQL has already aborted that transaction,
-    // so a re-read inside it could only fail again; the winner's row is visible only to a new one. The service then
-    // compares request_hash to tell a replay (200 plus Idempotent-Replayed: true) from key reuse (422).
+    // Called from a FRESH transaction, never the one that lost the race: PostgreSQL has already aborted that
+    // one, so a re-read inside it could only fail again, and the winner's row is visible only to a new
+    // transaction. The service then compares request_hash to tell a replay from key reuse.
     Optional<CashReservation> findByIncarnationIdAndIdempotencyKey(UUID incarnationId, String idempotencyKey);
 
     boolean existsByOwnerAndState(String owner, ReservationState state);
 
-    // Deliberately UNLOCKED, and no @Lock may be added here. Every balance mutation in this module locks the
-    // cash_account row first and the reservation row second; a lock taken on reservation rows by this read would
-    // invert that order against a concurrent settle or release and deadlock the two. Collecting identifiers under
-    // no lock lets each candidate's own transaction still take the account row first, which is what makes the sweep
-    // cycle-free rather than merely lucky.
+    // Deliberately UNLOCKED, and no @Lock may be added here: every balance mutation locks the cash_account row
+    // first and the reservation row second, so a lock taken on reservation rows by this read would invert that
+    // order against a concurrent settle and deadlock the two. Collecting identifiers under no lock lets each
+    // candidate's own transaction still take the account row first, which is what makes the sweep cycle-free.
     //
     // A projection instead of entities for the same reason: entities returned here would join the sweeper's
-    // persistence context, where a copy read before the per-candidate transaction decided anything could later be
-    // flushed over that decision. (state, expires_at) serves the predicate and the ordering alike
-    // (schema/cash-account-schema.sql:L156-L157), and the Pageable bounds one pass so a backlog is drained over
-    // several short transactions instead of one long one.
+    // persistence context, where a copy read before the per-candidate transaction decided anything could later
+    // be flushed over that decision. idx_cash_reservation_state_expires_at serves the predicate and the
+    // ordering alike, and the Pageable bounds one pass so a backlog is drained over several short transactions.
     @Query("select r.reservationId as reservationId, r.owner as owner from CashReservation r "
             + "where r.state = :state and r.expiresAt < :cutoff order by r.expiresAt asc")
     List<ExpiryCandidate> findExpiryCandidates(@Param("state") ReservationState state,
             @Param("cutoff") OffsetDateTime cutoff, Pageable pageable);
 
-    // Nested rather than an eighth file in this package: the type exists only as the shape of the query above and
-    // has no meaning apart from it, so declaring it here keeps the two impossible to change independently.
+    /** The shape of the sweep query above, nested so the two cannot be changed independently. */
     interface ExpiryCandidate {
 
         UUID getReservationId();
@@ -89,45 +63,23 @@ public interface CashReservationRepository extends JpaRepository<CashReservation
     }
 
     // A precondition the compiler cannot state: the caller must ALREADY hold this owner's cash_account row lock
-    // from CashAccountRepository.findByOwnerForUpdate. Reaching the reservation row first would invert the module's
-    // single fixed lock order and deadlock against any concurrent settle, release or expiry sweep on the same owner.
+    // from CashAccountRepository.findByOwnerForUpdate. Reaching the reservation row first would invert the
+    // module's single fixed lock order and deadlock against a concurrent settle, release or expiry sweep on the
+    // same owner. No second-level or query cache is enabled on any method here for the same reason a lock is
+    // taken at all: a settle decided against a cached state is the exact loss it prevents.
     //
-    // Pessimistic row locking is the estate's sanctioned strategy
-    // (backend/portfolio/src/main/resources/META-INF/persistence.xml:L13-L14), narrowed here from that unit-wide
-    // setting to the two queries that need it so plain reads stay lock-free. The same file's
-    // cache.shared.default=false - "need this to scale beyond one pod" - is equally why no second-level or query
-    // cache is enabled on any method here: a settle decided against a cached state is the exact loss the lock is
-    // taken to prevent.
-    //
-    // The JPQL is declared rather than derived because "ForUpdate" is not a property of CashReservation: derivation
-    // would read the method name as the property path reservationIdForUpdate and fail the repository factory at
-    // context start-up, whereas a declared query pre-empts derivation under the default CREATE_IF_NOT_FOUND lookup
-    // strategy.
-    //
-    // PESSIMISTIC_WRITE reaches PostgreSQL as "for no key update", unqualified by any alias - the clause observed
-    // in the emitted SQL, and rendered by PostgreSQLSqlAstTranslator.getForUpdate() in hibernate-core
-    // 6.5.3.Final. Reading it off PostgreSQLDialect.getWriteLockString instead answers " for update", the pre-6
-    // lock-string path this query does not take; the emitted clause is the one that decides. It sounds weaker
-    // than it locks: FOR NO KEY UPDATE conflicts with itself, with FOR SHARE and FOR UPDATE, and with any UPDATE
-    // or DELETE of the row, leaving only the FOR KEY SHARE a foreign-key check takes - and no table references
-    // cash_reservation.
-    //
-    // No lock-timeout hint accompanies it: PostgreSQL's row locks express only NOWAIT and SKIP LOCKED, so a
-    // positive wait would be silently ignored. Blocking is therefore the server's to arbitrate, and its deadlock
-    // detection surfaces as CannotAcquireLockException, which the error package already renders as
-    // 409 CONCURRENT_MODIFICATION - so nothing is caught or translated here.
+    // The JPQL is declared because "ForUpdate" is not a property of CashReservation: derivation would read the
+    // method name as the property path reservationIdForUpdate and fail the repository factory at start-up.
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("select r from CashReservation r where r.reservationId = :reservationId")
     Optional<CashReservation> findByReservationIdForUpdate(@Param("reservationId") UUID reservationId);
 
-    // -2 is Hibernate's LockOptions.SKIP_LOCKED sentinel (0 is NO_WAIT, -1 WAIT_FOREVER), which the SQL AST
-    // translator appends to the write lock above through AbstractSqlAstTranslator.getSkipLocked() - the emitted
-    // clause, observed in the log, is "for no key update skip locked" - so a contended row is passed over rather
+    // -2 is Hibernate's LockOptions.SKIP_LOCKED sentinel (0 is NO_WAIT, -1 WAIT_FOREVER), which the translator
+    // appends to the write lock as "for no key update skip locked", so a contended row is passed over rather
     // than waited on.
     //
-    // An EMPTY Optional is therefore an ordinary outcome, not a failure: another sweeper holds the row, or it is
-    // already gone. The sweep must skip such a candidate silently - reporting it would turn routine contention into
-    // noise, and blocking on it would serialize the sweep behind an in-flight settle that is about to make the row
+    // An EMPTY Optional is therefore an ordinary outcome: another sweeper holds the row, or it is already gone.
+    // Blocking instead would serialize the sweep behind an in-flight settle that is about to make the row
     // terminal anyway, after which the re-check would decline to expire it regardless.
     //
     // Same account-lock-first precondition, and same reason for declaring the JPQL, as the method above.

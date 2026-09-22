@@ -1,19 +1,3 @@
-/*
-       Copyright 2025 Kyndryl, All Rights Reserved
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
- */
-
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.support;
 
 import java.io.ByteArrayInputStream;
@@ -50,20 +34,6 @@ import com.nimbusds.jose.crypto.RSASSASigner;
 import com.nimbusds.jwt.JWTClaimsSet;
 import com.nimbusds.jwt.SignedJWT;
 
-// Key hygiene is the reason this class exists in the shape it does. The estate's siblings mount a shared Liberty
-// trust store whose jwtSigner entry carries its private half, and that store is baked into every sibling image - a
-// defect this module deliberately does not repeat, so nothing here reads it, copies it, or derives a path to it.
-// Instead one RSA-2048 key pair is generated inside the test JVM, its public half is published as a certificate in
-// the system temp directory, and its private half never leaves memory. No key material is checked in.
-//
-// The published file is an X.509 certificate rather than a bare SubjectPublicKeyInfo because that is the shape the
-// production resource has (config/JwtDecoderConfig loads src/main/resources/security/jwtsigner.pem, a self-signed
-// RS256 certificate), and pointing the same property at the same shape means the tests exercise the deployed
-// certificate-parsing path rather than a second branch that only tests ever take.
-//
-// The certificate DER is assembled here field by field because there is no other way to reach it: BouncyCastle is
-// not a dependency of this module and sun.security.x509 is not exported on Java 21, so a certificate builder would
-// mean either a new dependency or an --add-exports argument - both pom.xml changes this file does not own.
 /** Mints the RS256 bearer tokens the module's secured tests carry, signed by an ephemeral per-JVM key pair. */
 public final class JwtTestTokens {
 
@@ -91,23 +61,21 @@ public final class JwtTestTokens {
     /** StockViewer member {@code read} (none.xml:L45). */
     public static final String USER_STOCK_VIEWER = "read";
 
-    /** Registry user {@code other}, a member of no group (none.xml:L36). */
+    /** Registry user {@code other}, a member of no group (none.xml:L37). */
     public static final String USER_UNPRIVILEGED = "other";
 
-    // MicroProfile JWT names these two, and config/JwtDecoderConfig reads exactly them: roles come from "groups",
-    // the principal from "upn". They are given by the estate's tokens, not chosen here.
+    // Claim names given by MicroProfile JWT and read as such by config/JwtDecoderConfig, never chosen here.
     private static final String UPN_CLAIM = "upn";
 
     private static final String GROUPS_CLAIM = "groups";
 
-    // Mirrors the production analogue expiry="12h" on <mpJwt ... keyName="jwtSigner"/>
-    // [backend/broker/src/main/liberty/config/includes/basic.xml:L40;
-    // frontend/trader/src/main/liberty/config/includes/basic.xml:L24], so a test token's lifetime is the deployed
-    // one rather than an arbitrarily short window that could expire mid-suite.
+    // The deployed expiry="12h" [backend/broker/src/main/liberty/config/includes/basic.xml:L40;
+    // frontend/trader/src/main/liberty/config/includes/basic.xml:L24], rather than a shorter window that could
+    // expire mid-suite.
     private static final Duration TOKEN_LIFETIME = Duration.ofHours(12);
 
-    // An expired mint is dated a full lifetime ago and one further hour, which is far outside the 60-second clock
-    // skew Spring's default timestamp validator allows, so the rejection is unambiguous rather than marginal.
+    // Far outside the 60-second clock skew Spring's default timestamp validator allows, so the rejection of an
+    // expired mint is unambiguous rather than marginal.
     private static final Duration EXPIRED_AGE = Duration.ofHours(1);
 
     // Deliberately not production's CN=Stock Trader, so an ephemeral artefact can never be read as the real signer.
@@ -115,8 +83,7 @@ public final class JwtTestTokens {
 
     private static final Duration CERTIFICATE_LIFETIME = Duration.ofDays(1);
 
-    // Backdated so a host whose clock trails the one that generated the key still sees a currently valid
-    // certificate; the decoder checks the token's timestamps, but a reader that checks the certificate's must pass.
+    // Backdates the certificate so a host whose clock trails the one that generated the key still sees it as valid.
     private static final Duration CLOCK_SKEW_ALLOWANCE = Duration.ofMinutes(5);
 
     private static final DateTimeFormatter UTC_TIME =
@@ -149,11 +116,15 @@ public final class JwtTestTokens {
     /** The absent-parameters encoding sha256WithRSAEncryption requires. */
     private static final byte[] DER_NULL = {0x05, 0x00};
 
-    // One key pair for the whole JVM: several *IT classes bind cashaccount.security.jwt.public-key-location in
-    // separate Spring contexts, and a per-context key would leave tokens minted in one context untrusted in the
-    // next. Eager initialisation also means a broken certificate fails at class load with the message below.
+    // Generated inside the test JVM, its private half never leaving memory, rather than read from the estate's
+    // shared Liberty trust store whose jwtSigner entry carries a private key: no key material is checked in. One
+    // pair for the whole JVM because several *IT classes bind cashaccount.security.jwt.public-key-location in
+    // separate Spring contexts, and a per-context key would leave tokens minted in one untrusted in the next.
     private static final KeyPair KEY_PAIR = generateKeyPair();
 
+    // Published as an X.509 certificate, the shape config/JwtDecoderConfig loads from
+    // src/main/resources/security/jwtsigner.pem, so the tests exercise the deployed certificate-parsing path
+    // rather than a second branch only tests take.
     private static final Path CERTIFICATE_PEM = writeCertificatePem(KEY_PAIR);
 
     private JwtTestTokens() {
@@ -162,6 +133,8 @@ public final class JwtTestTokens {
     /**
      * Spring-resolvable location of the ephemeral signer certificate, for
      * {@code registry.add("cashaccount.security.jwt.public-key-location", JwtTestTokens::publicKeyLocation)}.
+     *
+     * @return a {@code file:} URL naming the certificate this JVM published
      */
     public static String publicKeyLocation() {
         // toUri() rather than "file:" + path: it escapes spaces and normalises separators, which a concatenated
@@ -169,35 +142,30 @@ public final class JwtTestTokens {
         return CERTIFICATE_PEM.toUri().toString();
     }
 
-    /** Mints a valid token for {@code upn} carrying {@code groups} as its roles. */
     public static String tokenFor(String upn, String... groups) {
         Instant issuedAt = Instant.now();
         return mint(upn, groups, issuedAt, issuedAt.plus(TOKEN_LIFETIME));
     }
 
-    /** Valid token for the StockTrader role, which every retail and institutional write requires. */
     public static String stockTraderToken() {
         return tokenFor(USER_STOCK_TRADER, GROUP_STOCK_TRADER);
     }
 
-    /** Valid token for the StockViewer role, which reaches reads only. */
     public static String stockViewerToken() {
         return tokenFor(USER_STOCK_VIEWER, GROUP_STOCK_VIEWER);
     }
 
-    /** Mints a structurally valid token whose {@code exp} has already passed, to exercise the expiry validator. */
+    // Signed and structurally valid, with only exp in the past, so the expiry validator is the one check it fails.
     public static String expiredTokenFor(String upn, String... groups) {
         Instant expiresAt = Instant.now().minus(EXPIRED_AGE);
         return mint(upn, groups, expiresAt.minus(TOKEN_LIFETIME), expiresAt);
     }
 
-    /** Wraps a compact serialization in the {@code Authorization} header value the estate sends. */
     public static String bearer(String token) {
-        // "Bearer " + raw token, the shape frontend/trader/.../Utilities.java:L110-L123 sends and broker forwards.
+        // The shape frontend/trader/.../Utilities.java:L122 sends and broker forwards unchanged.
         return "Bearer " + token;
     }
 
-    /** The ephemeral public key, for a test that builds its own decoder instead of pointing at the PEM. */
     public static RSAPublicKey publicKey() {
         return (RSAPublicKey) KEY_PAIR.getPublic();
     }
@@ -222,8 +190,8 @@ public final class JwtTestTokens {
         try {
             jwt.sign(new RSASSASigner((RSAPrivateKey) KEY_PAIR.getPrivate()));
         } catch (JOSEException exception) {
-            // Unchecked throughout this class: a failure here is unrecoverable test infrastructure, and forcing
-            // every caller into a try/catch would put noise in 21 test classes to no purpose.
+            // Unchecked throughout this class: a signing failure is unrecoverable test infrastructure, so every
+            // caller is spared a try/catch it could do nothing with.
             throw new IllegalStateException("Could not sign a test token for '" + upn + "'.", exception);
         }
         return jwt.serialize();
@@ -275,10 +243,9 @@ public final class JwtTestTokens {
         }
     }
 
-    // Parsing the certificate straight back through the very API config/JwtDecoderConfig uses turns a malformed-DER
-    // mistake into a legible failure at class load, instead of an opaque "not a readable X.509 certificate" raised
-    // while an unrelated *IT builds its Spring context. Verifying the signature with the certificate's own key
-    // additionally proves the signature bytes and the algorithm identifier agree.
+    // Parsed back through the very API config/JwtDecoderConfig uses, so a malformed-DER mistake fails legibly at
+    // class load instead of surfacing while an unrelated *IT builds its Spring context; verifying the signature
+    // with the certificate's own key also proves the signature bytes and the algorithm identifier agree.
     private static void verifyParseable(byte[] der, RSAPublicKey expected) {
         X509Certificate certificate;
         try {
@@ -295,6 +262,9 @@ public final class JwtTestTokens {
         }
     }
 
+    // The DER is assembled field by field because there is no other route: BouncyCastle is not a dependency and
+    // sun.security.x509 is not exported on Java 21, so a certificate builder would mean either a new dependency or
+    // an --add-exports argument, both of them pom.xml changes this file does not own.
     private static byte[] selfSignedCertificate(KeyPair keyPair) {
         Instant now = Instant.now();
         byte[] signatureAlgorithm = sequence(OID_SHA256_WITH_RSA, DER_NULL);

@@ -1,38 +1,14 @@
-/*
-       Copyright 2025 Kyndryl, All Rights Reserved
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
- */
-
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.error;
 
 import java.util.Objects;
 import java.util.UUID;
 
-// One unchecked type for every expected condition, rather than a checked exception per condition, because this is the
-// direct replacement for the legacy program's single status channel: WS-RETCODE was cleared to spaces
-// [backend/cash-account-cobol/COBOL/CASH00.cbl:L78] and then received the LAST executed statement's SQLCODE through
-// "MOVE SQLCODE TO WS-RETCODE" [CASH00.cbl:L104], a numeric-to-alphanumeric MOVE that dropped the sign, so an earlier
-// failure in the same paragraph was invisible and several paths reported success anyway. Carrying an error code instead
-// makes each condition individually observable, and one type means no service signature has to enumerate conditions it
-// merely propagates.
-//
-// Unchecked is also what enforces the AAP's "every failure path throws before the transaction commits" (0.12.3):
-// @Transactional rolls back on an unchecked throw by default, so a rejected operation can leave neither a half-applied
-// balance change nor an orphan ledger row - unlike the legacy paths that committed and then returned the caller's own
-// submitted amount back as the balance [CASH00.cbl:L104-L108]. The stack trace is deliberately not suppressed:
-// ApiExceptionHandler decides what to log per status, and a suppressed trace would make a genuine 500 undiagnosable.
-/** The single runtime exception this module throws; it carries the error code that fixes the response status. */
+/**
+ * The single exception this module throws; it carries the error code that fixes the response status, and it is
+ * unchecked so that every rejection rolls the caller's transaction back before a balance change or ledger row
+ * can commit (AAP 0.12.3), unlike the legacy paths that committed and then echoed the caller's own submitted
+ * amount back as the balance [backend/cash-account-cobol/COBOL/CASH00.cbl:L104-L108].
+ */
 public final class CashAccountException extends RuntimeException {
 
     private static final long serialVersionUID = 1L;
@@ -87,8 +63,8 @@ public final class CashAccountException extends RuntimeException {
         return new CashAccountException(code, message, null, reservationId, null);
     }
 
-    // UUID overloads so the reservation-scoped callers need no conversion of their own while this package stays free of
-    // any domain or persistence type: the identifier is held as text here.
+    // UUID overloads so reservation-scoped callers need no conversion of their own, while the identifier stays text
+    // here and this package stays free of any domain or persistence type.
     public static CashAccountException forReservation(CashAccountErrorCode code, UUID reservationId) {
         return new CashAccountException(code, null, null, asText(reservationId), null);
     }
@@ -109,9 +85,6 @@ public final class CashAccountException extends RuntimeException {
         return reservationId;
     }
 
-    // JavaBean aliases of the three accessors above, mirroring CashAccountErrorCode: the renderers of this condition -
-    // the exception handler and the two security filter-chain handlers - are separate classes, and the aliases mean
-    // none of them is edited over an accessor-naming preference.
     public CashAccountErrorCode getErrorCode() {
         return errorCode;
     }
@@ -124,10 +97,9 @@ public final class CashAccountException extends RuntimeException {
         return reservationId;
     }
 
-    // A null code is rejected here, inside the super() argument, so the throw site fails instead of a
-    // status-less exception reaching the renderers: they derive the HTTP status and the Retry-After hint from the code
-    // alone, and without one there is no status to choose. A blank message falls back for the same reason the code
-    // carries a default at all - the payload must never surface an empty explanation.
+    // The null check runs inside the super() argument so the throw site fails rather than a status-less exception
+    // reaching the renderers, which derive status and Retry-After from the code alone. A blank message falls back to
+    // the code's default so the payload never surfaces an empty explanation.
     private static String resolveMessage(CashAccountErrorCode code, String message) {
         Objects.requireNonNull(code, "errorCode is required");
         return message == null || message.isBlank() ? code.defaultMessage() : message;
