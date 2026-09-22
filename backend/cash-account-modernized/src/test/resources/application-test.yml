@@ -28,6 +28,19 @@ cashaccount:
     # sweep-versus-settle cases; tests drive the sweep directly, so it is moved aside, not disabled.
     expiry-sweep-interval: PT1H
 
+spring:
+  datasource:
+    hikari:
+      # Every *IT class is its own cached Spring context (each carries a distinct @DynamicPropertySource key), and
+      # Spring's test-context cache keeps all of them open for the whole Failsafe run against the ONE shared
+      # container in support/PostgresTestSupport. Hikari's default is 10 eagerly held connections per pool, so a
+      # dozen contexts exhaust PostgreSQL's max_connections and the last context to start fails with
+      # "FATAL: sorry, too many clients already". No test needs more than three concurrent connections
+      # (ReservationLifecycleIT's two-thread races plus the readiness db check), so the pool is capped here;
+      # the deployed pool size in application.yml is untouched.
+      maximum-pool-size: 5
+      minimum-idle: 1
+
 management:
   endpoint:
     health:

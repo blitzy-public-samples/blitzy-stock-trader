@@ -37,9 +37,15 @@ public abstract class PostgresTestSupport {
     // so the bean this field registers is what makes the guard stand down and every *IT reach this container instead
     // of dialling the deployment's JDBC_HOST. Database name, user and password are left at the container's defaults
     // because @ServiceConnection derives all three, which is why application-test.yml sets no spring.datasource.*.
+    //
+    // max_connections is raised from PostgreSQL's default 100 because this single instance serves every *IT's
+    // Spring context at once (Spring's test-context cache keeps each one's Hikari pool open until the JVM exits);
+    // application-test.yml caps each pool as well, and this headroom keeps a future *IT from rediscovering
+    // "FATAL: sorry, too many clients already". fsync=off is the container class's own default, kept for speed.
     @ServiceConnection
     protected static final PostgreSQLContainer<?> POSTGRES =
-            new PostgreSQLContainer<>(DockerImageName.parse("postgres:12.22-alpine"));
+            new PostgreSQLContainer<>(DockerImageName.parse("postgres:12.22-alpine"))
+                    .withCommand("postgres", "-c", "fsync=off", "-c", "max_connections=200");
 
     // Started once per JVM as the documented Testcontainers singleton, deliberately without @Container: that
     // annotation binds a container to one class's lifecycle, so each *IT would be handed a freshly mapped host port
