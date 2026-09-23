@@ -1,6 +1,10 @@
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.migration;
 
+import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.UncheckedIOException;
 import java.nio.charset.Charset;
 import java.nio.charset.IllegalCharsetNameException;
 import java.nio.charset.StandardCharsets;
@@ -104,9 +108,14 @@ public class MigrationToolRunner implements ApplicationRunner {
     /** Escape hatch for a checkout whose working directory is neither the module root nor its parent. */
     private static final String CHARACTERIZATION_DOCUMENT_PROPERTY = "cashaccount.characterization-doc";
 
-    // Under docs/ and deliberately not in src/main/resources, so it is not on the classpath and is resolved
-    // as a filesystem path relative to the JVM's working directory.
+    // Authored under docs/ rather than src/main/resources, and copied onto the classpath by pom.xml's
+    // copy-characterization-document execution, so the same relative name resolves both as a filesystem path
+    // against the JVM's working directory and as a classpath resource inside the built artifact.
     private static final String CHARACTERIZATION_DOCUMENT_PATH = "docs/legacy-characterization.md";
+
+    // The packaged copy, last in precedence. Absolute because a classpath resource name is resolved against the
+    // declaring class's package unless it is.
+    private static final String CHARACTERIZATION_DOCUMENT_RESOURCE = "/" + CHARACTERIZATION_DOCUMENT_PATH;
 
     private static final String PARENT_DIRECTORY = "..";
 
@@ -746,18 +755,61 @@ public class MigrationToolRunner implements ApplicationRunner {
             }
         }
 
+        // The copy pom.xml packaged into this artifact, consulted only after every filesystem candidate: it is
+        // the revision the artifact was built from, so a document the data owner signed ACCEPTED afterwards -
+        // named with -Dcashaccount.characterization-doc, or simply present under the working directory - has to
+        // outrank it. Before it existed, an invocation from anywhere but the module root recorded DRAFT however
+        // the real document read, which for a container run (the image carries the jar alone) was every
+        // invocation; the column is a runbook sign-off criterion, so that degradation silently withheld a gate.
+        MigrationRun.CharacterizationStatus packaged = statusInPackagedDocument();
+        if (packaged != null) {
+            LOGGER.info("Characterization document packaged at classpath:{} reads Status: {}",
+                    CHARACTERIZATION_DOCUMENT_RESOURCE, packaged);
+            return packaged;
+        }
+
         // A missing document is DRAFT and can never be ACCEPTED: runbook Step 1's sign-off criterion includes
         // characterization_status = 'ACCEPTED', so the absence of the baseline must be unable to satisfy it,
         // where defaulting the other way would let a run with no characterization be signed off against a
         // real export. DRAFT still runs freely against the fixtures.
         LOGGER.warn("No characterization document with a recognizable 'Status: DRAFT|ACCEPTED' line was found"
-                + " (tried {}); this run records characterization_status {}. Set -D"
+                + " (tried {} and classpath:{}); this run records characterization_status {}. Set -D"
                 + CHARACTERIZATION_DOCUMENT_PROPERTY + "=<path> when the document is elsewhere",
-                candidates, MigrationRun.CharacterizationStatus.DRAFT);
+                candidates, CHARACTERIZATION_DOCUMENT_RESOURCE, MigrationRun.CharacterizationStatus.DRAFT);
         return MigrationRun.CharacterizationStatus.DRAFT;
     }
 
-    /** The paths the characterization document is looked for in, in precedence order. */
+    /**
+     * The acceptance state declared by the copy packaged into this artifact, or {@code null} when the artifact
+     * carries none or it declares none.
+     *
+     * @return the packaged document's acceptance state, or {@code null}
+     */
+    // Package-private so the packaged copy is assertable without a database or a Spring context, which is what
+    // makes "the artifact carries its own baseline" a checked claim rather than a build detail.
+    static MigrationRun.CharacterizationStatus statusInPackagedDocument() {
+        try (InputStream packaged =
+                MigrationToolRunner.class.getResourceAsStream(CHARACTERIZATION_DOCUMENT_RESOURCE)) {
+            if (packaged == null) {
+                return null;
+            }
+            try (BufferedReader lines = new BufferedReader(
+                    new InputStreamReader(packaged, StandardCharsets.UTF_8))) {
+                return latestStatusIn(lines.lines().toList());
+            }
+        } catch (IOException | UncheckedIOException e) {
+            // Unreadable is treated exactly as absent, and for the same reason as an unreadable file: an
+            // unverifiable baseline may not be reported as an accepted one.
+            LOGGER.warn("Could not read the packaged characterization document classpath:{}: {}",
+                    CHARACTERIZATION_DOCUMENT_RESOURCE, e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * The filesystem paths the characterization document is looked for in, in precedence order; the copy
+     * packaged into the artifact is consulted after all of them.
+     */
     // Package-private so the resolution order is assertable without a database or a Spring context.
     static List<Path> characterizationDocumentCandidates() {
         List<Path> candidates = new ArrayList<>(3);
@@ -801,6 +853,13 @@ public class MigrationToolRunner implements ApplicationRunner {
             return null;
         }
 
+        return latestStatusIn(lines);
+    }
+
+    // The one parse both sources share, so the packaged copy and a file on disk cannot be read by different
+    // rules: the last matching Status: line wins, making the closing Acceptance section authoritative over any
+    // earlier mention of the field.
+    private static MigrationRun.CharacterizationStatus latestStatusIn(List<String> lines) {
         MigrationRun.CharacterizationStatus latest = null;
         for (String line : lines) {
             Matcher matcher = CHARACTERIZATION_STATUS_PATTERN.matcher(line);

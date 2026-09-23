@@ -6,6 +6,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermissions;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -20,8 +21,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.autoconfigure.jdbc.JdbcConnectionDetails;
+import org.springframework.boot.context.properties.bind.Bindable;
+import org.springframework.boot.context.properties.bind.Binder;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.core.env.ConfigurableEnvironment;
 import org.springframework.core.env.Environment;
 
 /** Fail-closed datasource configuration: PostgreSQL or no start-up, plus the JDBC URL the chart's variables imply. */
@@ -43,6 +47,18 @@ public class DataSourceGuardConfig {
     private static final String URL_BREAKING_CHARACTERS = "/?&# \t\r\n";
     private static final String TRUST_STORE_VARIABLE = "cert_defaultTrustStore";
     private static final String DEFAULT_POSTGRES_PORT = "5432";
+
+    // The driver's own two bounds on the hop, which the pool cannot set: connectTimeout caps one TCP-and-TLS
+    // handshake and socketTimeout caps a read on an established connection. Left unset, pgJDBC gives the first
+    // 10 s and the second none at all - so a statement in flight when the peer vanishes waits for ever, which no
+    // Hikari setting reaches, because the pool's connection-timeout governs OBTAINING a connection rather than
+    // using one. Defaults here match application.yml, which stays the declared source of truth for both values.
+    private static final String CONNECT_TIMEOUT_PARAMETER = "connectTimeout";
+    private static final String SOCKET_TIMEOUT_PARAMETER = "socketTimeout";
+    private static final String CONNECT_TIMEOUT_PROPERTY = "cashaccount.jdbc.connect-timeout";
+    private static final String SOCKET_TIMEOUT_PROPERTY = "cashaccount.jdbc.socket-timeout";
+    private static final Duration DEFAULT_CONNECT_TIMEOUT = Duration.ofSeconds(2);
+    private static final Duration DEFAULT_SOCKET_TIMEOUT = Duration.ofSeconds(30);
 
     // pgJDBC's own spellings, matched case-insensitively and listed in the rejection message; see keepableParameters
     // for why this is an allowlist rather than a list of parameters to strip.
@@ -114,9 +130,15 @@ public class DataSourceGuardConfig {
      * those chart variables are present and whenever TLS is demanded, and otherwise reduced to a host, a port, a
      * database and a set of accepted parameters by {@link #normalizedConfiguredTarget}.
      *
-     * @return the URL {@link #buildJdbcUrl} produces for the resolved host, port, database and TLS mode
-     * @throws IllegalStateException when a required connection variable is missing, blank or malformed, and when a
-     *         configured {@code spring.datasource.url} would change the dialect, the credentials or the TLS mode
+     * <p>Every resolved URL also carries the driver's {@code connectTimeout} and {@code socketTimeout}, from
+     * {@code cashaccount.jdbc.connect-timeout} and {@code cashaccount.jdbc.socket-timeout}, unless a supplied URL
+     * names that parameter itself.</p>
+     *
+     * @return the URL {@link #buildJdbcUrl} produces for the resolved host, port, database and TLS mode, with the
+     *         driver's connect and read bounds appended
+     * @throws IllegalStateException when a required connection variable is missing, blank or malformed, when a
+     *         configured {@code spring.datasource.url} would change the dialect, the credentials or the TLS mode,
+     *         and when either timeout is not a positive duration of whole seconds
      */
     public String resolveJdbcUrl() {
         boolean ssl = sslEnabled(configuredValue("cashaccount.jdbc.ssl", "JDBC_SSL"));
@@ -126,12 +148,66 @@ public class DataSourceGuardConfig {
                 : chartTarget();
         // Staged after the target is settled, so a refused URL never leaves a certificate file behind.
         String certificatePath = ssl ? stagedTrustStorePath() : null;
-        String url = target.toUrl(ssl, certificatePath);
-        LOGGER.info("Cash ledger datasource: {} at {}:{}/{} from {}, TLS {}", SUPPORTED_JDBC_KIND, target.host(),
-                target.port(), target.database(), target.origin(),
+        List<String> driverBounds = driverTimeoutParameters(target.parameters());
+        String url = target.toUrl(ssl, certificatePath, driverBounds);
+        // The bounds are logged with the target because they are the difference between a database outage that
+        // surfaces as 503 DATASTORE_UNAVAILABLE in seconds and one that parks a request thread, and the effective
+        // pair is otherwise invisible: either value may have come from a deployment override or from the URL.
+        LOGGER.info("Cash ledger datasource: {} at {}:{}/{} from {}, TLS {}, driver bounds set here: {}",
+                SUPPORTED_JDBC_KIND, target.host(), target.port(), target.database(), target.origin(),
                 ssl ? (certificatePath == null ? "verify-ca against the JVM trust store"
-                        : "verify-ca against the injected CA certificate") : "disabled");
+                        : "verify-ca against the injected CA certificate") : "disabled",
+                driverBounds.isEmpty() ? "none, both were supplied on the URL" : String.join(", ", driverBounds));
         return url;
+    }
+
+    // Skipped per parameter rather than wholesale: a supplied URL that names one of the two has an operator behind
+    // it, and appending ours as well would hand pgJDBC the same parameter twice - the driver keeps the last
+    // occurrence, so the value an operator can read in the URL would not be the value in force.
+    private List<String> driverTimeoutParameters(List<String> suppliedParameters) {
+        List<String> bounds = new ArrayList<>(2);
+        addTimeoutUnlessSupplied(bounds, suppliedParameters, CONNECT_TIMEOUT_PARAMETER, CONNECT_TIMEOUT_PROPERTY,
+                DEFAULT_CONNECT_TIMEOUT);
+        addTimeoutUnlessSupplied(bounds, suppliedParameters, SOCKET_TIMEOUT_PARAMETER, SOCKET_TIMEOUT_PROPERTY,
+                DEFAULT_SOCKET_TIMEOUT);
+        return List.copyOf(bounds);
+    }
+
+    private void addTimeoutUnlessSupplied(List<String> bounds, List<String> suppliedParameters, String parameter,
+            String property, Duration fallback) {
+        for (String supplied : suppliedParameters) {
+            int assignment = supplied.indexOf('=');
+            String name = (assignment < 0) ? supplied : supplied.substring(0, assignment);
+            if (parameter.equalsIgnoreCase(name)) {
+                return;
+            }
+        }
+        bounds.add(parameter + "=" + wholeSeconds(property, configuredDuration(property, fallback)));
+    }
+
+    // Binder, never a @Value placeholder: a placeholder's resolved text is handed on to Spring's expression
+    // resolver, so a timeout written as #{...} would execute while this configuration was being created. Binder
+    // resolves ${...} and converts, evaluating nothing. A non-configurable Environment exposes no property
+    // sources, so it yields the documented default exactly as an unset key does.
+    private Duration configuredDuration(String property, Duration fallback) {
+        if (!(environment instanceof ConfigurableEnvironment)) {
+            return fallback;
+        }
+        return Binder.get(environment).bind(property, Bindable.of(Duration.class)).orElse(fallback);
+    }
+
+    // Refused rather than rounded. pgJDBC takes both parameters as an int of SECONDS and reads 0 as "no timeout at
+    // all", so PT0.5S would arrive as the unbounded default these two settings exist to remove - the same silent
+    // downgrade JDBC_SSL=ture would be if sslEnabled read it as false.
+    private static long wholeSeconds(String property, Duration value) {
+        if (value == null || value.isZero() || value.isNegative() || value.toMillis() % 1000 != 0) {
+            throw new IllegalStateException("Cannot assemble the cash ledger JDBC URL: " + property + " is "
+                    + (value == null ? "not set" : value.toString()) + ", and it must be a positive ISO-8601"
+                    + " duration of whole seconds (for example PT2S). The driver takes this bound as an integer"
+                    + " number of seconds and treats 0 as no timeout at all, so a fraction of a second would be"
+                    + " truncated into exactly the unbounded wait this setting exists to remove.");
+        }
+        return value.toSeconds();
     }
 
     // Assembled here rather than by a placeholder in application.yml because no static one expresses this
@@ -313,12 +389,17 @@ public class DataSourceGuardConfig {
     private record ConnectionTarget(String host, String port, String database, List<String> parameters,
             String origin) {
 
-        String toUrl(boolean ssl, String sslRootCertPath) {
+        // The driver bounds trail the accepted parameters, so a URL an operator supplied still reads as written
+        // and what this service added to it is visible at the end.
+        String toUrl(boolean ssl, String sslRootCertPath, List<String> driverBounds) {
             String url = buildJdbcUrl(host, port, database, ssl, sslRootCertPath);
-            if (parameters.isEmpty()) {
+            List<String> appended = new ArrayList<>(parameters.size() + driverBounds.size());
+            appended.addAll(parameters);
+            appended.addAll(driverBounds);
+            if (appended.isEmpty()) {
                 return url;
             }
-            return url + (url.indexOf('?') < 0 ? '?' : '&') + String.join("&", parameters);
+            return url + (url.indexOf('?') < 0 ? '?' : '&') + String.join("&", appended);
         }
     }
 

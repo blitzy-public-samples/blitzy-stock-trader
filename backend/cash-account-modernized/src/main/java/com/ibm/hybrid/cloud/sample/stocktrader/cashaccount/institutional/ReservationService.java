@@ -551,9 +551,12 @@ public class ReservationService {
     private void appendLedger(CashAccount account, CashReservation reservation,
             ReservationStateMachine.Effect effect, LedgerEntry.Source source) {
         // One row per effect, inside this transaction, so a partial settlement's SETTLEMENT and RELEASE rows
-        // and the balance change commit together and are queryable the instant they do.
+        // and the balance change commit together and are queryable the instant they do. Each row's after-state
+        // comes from its own effect and is never recomputed here: which balances a leg leaves behind is a
+        // balance effect, and the state machine is the only authority on those.
         for (ReservationStateMachine.LedgerEffect ledgerEffect : effect.ledgerEffects()) {
-            ledger.append(account, reservation, ledgerEffect.eventType(), ledgerEffect.amount(), source);
+            ledger.append(account, reservation, ledgerEffect.eventType(), ledgerEffect.amount(),
+                    ledgerEffect.availableAfter(), ledgerEffect.reservedAfter(), source);
         }
     }
 

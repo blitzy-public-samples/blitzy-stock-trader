@@ -74,9 +74,40 @@ spring:
     # sslmode=verify-ca, swap in a non-validating SSL factory, fold credentials into the URL or repoint the ledger.
     username: ${JDBC_ID:}
     password: ${JDBC_PASSWORD:}
-    # Deliberately no spring.datasource.hikari.schema: the Operational Runbook's Step 1 rehearsal supplies
-    # spring.datasource.hikari.schema=cash_account_rehearsal at run time so production tables stay untouched, which
-    # a value pinned here would defeat.
+
+    hikari:
+      # THE BOUND ON HOW LONG ANYTHING WAITS FOR THE LEDGER'S DATABASE. Hikari's own default is 30 s to borrow a
+      # connection, which is not a budget anyone chose: with the database unreachable every DB-dependent request
+      # sat for 30.0 s before returning the 503 that was already decided at the first refused connection, and the
+      # readiness group's `db` indicator - which borrows from this very pool - answered DOWN just as late, so the
+      # kubelet's probe (period 15s, no timeoutSeconds, hence its 1 s default:
+      # .../templates/cash-account.yaml:L211-L216) never saw a body at all while a Tomcat worker stayed parked per
+      # probe and per caller. The exchange-rate hop is already capped at cashaccount.fx.timeout=PT2S "never as a
+      # request that outlives its caller"; the datastore is the other outbound hop and takes the same ceiling.
+      #
+      # What a caller receives once it expires is unchanged and was always correct: Hikari's
+      # SQLTransientConnectionException reaches error/ApiExceptionHandler as 503 DATASTORE_UNAVAILABLE with
+      # Retry-After: 5 - the modern reading of DB2's -911/-913, which CICS backed out at once rather than queued
+      # (AAP 0.12.3). A saturated pool now answers that way too instead of queueing half a minute: with every
+      # operation here a single-row read or write, 2 s of unbroken contention is real overload, and a retryable
+      # 503 is the honest answer to it. Retunable with no chart change through
+      # SPRING_DATASOURCE_HIKARI_CONNECTION_TIMEOUT.
+      connection-timeout: 2000
+      # Must stay at or below the borrow budget, which is why the 5 s default is replaced rather than left alone:
+      # the aliveness check of a pooled connection runs INSIDE the borrow, so a dead-but-open connection would
+      # otherwise be declared invalid only after the ceiling above had already passed, and the bound would be a
+      # claim rather than a fact.
+      validation-timeout: 1000
+      # Start-up keeps, deliberately and by name, the tolerance the 30 s borrow default used to give it by
+      # accident: Hikari retries once a second across this window before failing the context, so a pod whose
+      # database is still coming up starts anyway and the tighter budget above cannot turn a slow database into a
+      # crash loop. Not negative on purpose - a negative value starts the pod with no database at all, while
+      # spring.sql.init and ddl-auto=validate below both have to run against a real one before this service is
+      # allowed to answer.
+      initialization-fail-timeout: 30000
+      # Deliberately no spring.datasource.hikari.schema: the Operational Runbook's Step 1 rehearsal supplies
+      # spring.datasource.hikari.schema=cash_account_rehearsal at run time so production tables stay untouched, which
+      # a value pinned here would defeat.
 
   sql:
     init:
@@ -212,6 +243,23 @@ cashaccount:
     # Mirrors portfolio's <variable name="JDBC_SSL" defaultValue="false"/>
     # (backend/portfolio/src/main/liberty/config/includes/postgres.xml:L2).
     ssl: ${JDBC_SSL:false}
+    # The two bounds the pool cannot set because they belong to the driver, appended to the assembled URL by
+    # config/DataSourceGuardConfig (both are already in the parameters it accepts on a supplied URL). They close
+    # what spring.datasource.hikari.connection-timeout above cannot reach:
+    #   connect-timeout bounds ONE TCP-and-TLS handshake, so a host that drops packets rather than refusing them
+    #   fails inside the pool's borrow budget instead of sitting in the kernel's connect retry, leaving the socket
+    #   and its thread behind after Hikari has already given up on it;
+    #   socket-timeout bounds a READ on an established connection, which nothing else here bounds at all -
+    #   pgJDBC's default is 0, meaning a statement already in flight when the peer disappears waits for ever, and
+    #   the pool's borrow budget governs getting a connection rather than using one.
+    # socket-timeout is a ceiling on the slowest legitimate single round trip, not a request budget: the longest
+    # this service can legitimately wait on one statement is schema/cash-account-schema.sql's pg_advisory_lock
+    # while another pod applies the same script, so it is generous where the borrow budget is tight. Whole
+    # seconds only, because the driver takes an int of seconds and reads 0 as "no timeout at all" - a sub-second
+    # value would be truncated into exactly the unbounded default these two settings exist to remove, so
+    # DataSourceGuardConfig refuses it instead.
+    connect-timeout: PT2S
+    socket-timeout: PT30S
     # PEM text of the database server's CA, injected as cert_defaultTrustStore from configMap key ssl.certs and only
     # when global.specifyCerts is on (.../templates/cash-account.yaml:L179-L186), which defaults to false
     # (.../values.yaml:L72) — hence the empty default. When present, DataSourceGuardConfig writes it to a private
@@ -231,8 +279,12 @@ cashaccount:
     # Broker's default account currency, so a same-currency account short-circuits to a rate of exactly 1 with no
     # network call (backend/broker/src/main/java/com/ibm/hybrid/cloud/sample/stocktrader/broker/BrokerService.java:L357-L365).
     base-currency: USD
-    # Connect and read budget for FrankfurterExchangeRateClient. A slow rate provider must surface as
-    # 503 EXCHANGE_RATE_UNAVAILABLE with the balance untouched, never as a request that outlives its caller.
+    # Budget for the whole exchange per attempt in FrankfurterExchangeRateClient - connect, response headers AND
+    # body reception together, the last of which no timeout on the JDK HTTP client can bound (its response timer is
+    # disarmed once the headers arrive), so config/FxClientConfig enforces the three as one deadline. A slow rate
+    # provider must surface as 503 EXCHANGE_RATE_UNAVAILABLE with the balance untouched, never as a request that
+    # outlives its caller; at most two attempts are made, so this value is half the worst case a degraded or
+    # hostile provider can impose on a caller.
     timeout: PT2S
     # THE single authority for the accepted-currency policy: retail/RetailCashAccountService,
     # migration/reconcile/ReconciliationService and fx/FrankfurterExchangeRateClient all bind this key, so

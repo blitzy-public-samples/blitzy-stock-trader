@@ -288,10 +288,13 @@ public class SecurityConfig {
                             .hasRole(ROLE_STOCK_TRADER)
                     .requestMatchers(HttpMethod.DELETE, RETAIL_ACCOUNT_PATH).hasRole(ROLE_STOCK_TRADER)
                     // Claimed after the retail matchers, the order AAP 0.7.5 fixes: every genuine institutional
-                    // route carries four or more segments, so none is absorbed above, while the only paths the
-                    // retail matchers take from this wildcard are /cash-account/institutional and its
-                    // debit|credit - which MVC dispatches to the retail controller as the owner INSTITUTIONAL, so
-                    // claiming the wildcard first answers a strict-mode StockViewer's valid read of it 403.
+                    // route carries four or more segments, so none is absorbed above. The only paths the retail
+                    // matchers take from this wildcard are /cash-account/institutional and its debit|credit,
+                    // which MVC dispatches to the retail controller - and that controller reserves the segment,
+                    // answering all three 404 UNSUPPORTED_PATH instead of serving an account named INSTITUTIONAL.
+                    // Authorization is therefore decided by the retail rules on paths that serve nothing, which
+                    // is safe in both grant modes: the write verbs still require StockTrader, and a strict-mode
+                    // StockViewer's GET reaches Spring MVC only to be refused as an unmapped path.
                     .requestMatchers(INSTITUTIONAL_SPACE).hasRole(ROLE_STOCK_TRADER)
                     // authenticated(), never denyAll(): an authenticated caller asking for a path or verb this
                     // service does not implement must reach Spring MVC, which is what produces the 404

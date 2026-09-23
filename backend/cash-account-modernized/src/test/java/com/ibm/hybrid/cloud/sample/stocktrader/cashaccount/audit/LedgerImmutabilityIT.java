@@ -6,6 +6,7 @@ import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
 import java.math.BigDecimal;
 import java.sql.SQLException;
 
+import org.assertj.core.api.ThrowableAssert.ThrowingCallable;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -35,6 +36,10 @@ class LedgerImmutabilityIT extends PostgresTestSupport {
 
     private static final String DELETE_ATTEMPT = "DELETE FROM ledger_entry";
 
+    // The statement no row-level trigger can see: PostgreSQL fires only statement-level triggers for TRUNCATE, and
+    // the chart's single database identity owns the table, so this is reachable by the service's own credential.
+    private static final String TRUNCATE_ATTEMPT = "TRUNCATE ledger_entry";
+
     // ledger_entry_reject() in schema/cash-account-schema.sql raises without an ERRCODE, so plpgsql reports its
     // default raise_exception rather than a class this test would otherwise have to guess at.
     private static final String RAISE_EXCEPTION_SQLSTATE = "P0001";
@@ -60,7 +65,8 @@ class LedgerImmutabilityIT extends PostgresTestSupport {
         if (ledgerRowsFor(jdbc) == 0) {
             retailCashAccountService.create(OWNER, new BigDecimal("1000.00"), "USD");
         }
-        // The guard is a FOR EACH ROW trigger, so an empty table would let both attacks pass for the wrong reason.
+        // The UPDATE and DELETE guard is a FOR EACH ROW trigger, so an empty table would let those two attacks pass
+        // for the wrong reason, and no attack could then show the rows it failed to destroy are still there.
         assertThat(ledgerRowsFor(jdbc)).isPositive();
     }
 
@@ -84,21 +90,36 @@ class LedgerImmutabilityIT extends PostgresTestSupport {
         assertDeleteRejected(secondaryJdbc());
     }
 
+    // The gap the row-level guard leaves: UPDATE and DELETE are refused row by row while TRUNCATE removes every
+    // row in one statement the table's owner - the single identity the pod connects with - is entitled to issue.
+    @Test
+    void truncateOnLedgerEntryIsRejectedBeforeAndAfterSchemaReapplication() {
+        assertTruncateRejected(jdbc);
+        assertTruncateRejected(secondaryJdbc());
+    }
+
     private void assertUpdateRejected(JdbcTemplate target) {
-        assertRejected(target, UPDATE_ATTEMPT, "UPDATE");
+        assertRejected(target, "UPDATE", () -> target.update(UPDATE_ATTEMPT));
     }
 
     private void assertDeleteRejected(JdbcTemplate target) {
-        assertRejected(target, DELETE_ATTEMPT, "DELETE");
+        assertRejected(target, "DELETE", () -> target.update(DELETE_ATTEMPT));
+    }
+
+    // TRUNCATE reports no update count, so it is issued through execute rather than update; the assertion that
+    // follows is the same one the other two attacks make.
+    private void assertTruncateRejected(JdbcTemplate target) {
+        assertRejected(target, "TRUNCATE", () -> target.execute(TRUNCATE_ATTEMPT));
     }
 
     // Raw SQL rather than the repository, because persistence/LedgerEntryRepository exposes only save and two
     // finders and nothing above the database can express this attack. The ledger it protects replaces a VSAM
     // history that nothing read back and that silently discarded a second record for one owner within the same
-    // second [backend/cash-account-cobol/COBOL/CASH00.cbl:L123-L131].
-    private void assertRejected(JdbcTemplate target, String statement, String operation) {
+    // second [backend/cash-account-cobol/COBOL/CASH00.cbl:L123-L131]. The attempt arrives as a callable because
+    // the three statements need two different JdbcTemplate entry points for one shared expectation.
+    private void assertRejected(JdbcTemplate target, String operation, ThrowingCallable attempt) {
         assertThatExceptionOfType(DataAccessException.class)
-                .isThrownBy(() -> target.update(statement))
+                .isThrownBy(attempt)
                 .satisfies(failure -> {
                     SQLException raised = rootSqlException(failure);
                     assertThat(raised.getSQLState()).isEqualTo(RAISE_EXCEPTION_SQLSTATE);

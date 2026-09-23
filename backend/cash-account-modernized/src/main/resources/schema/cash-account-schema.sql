@@ -181,6 +181,21 @@ BEGIN
             BEFORE UPDATE OR DELETE ON ledger_entry
             FOR EACH ROW EXECUTE FUNCTION ledger_entry_reject();
     END IF;
+    -- PostgreSQL never fires a row-level trigger for TRUNCATE, so the guard above would let the one identity the
+    -- chart supplies for DDL and DML alike (AAP 0.6.3) erase the whole ledger in a single statement. Keeping the
+    -- append-only promise of AAP 0.7.4 true under that identity therefore takes a statement-level trigger too.
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger t
+          JOIN pg_class c ON c.oid = t.tgrelid
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE t.tgname = 'ledger_entry_immutable_truncate'
+           AND c.relname = 'ledger_entry'
+           AND n.nspname = current_schema()
+    ) THEN
+        CREATE TRIGGER ledger_entry_immutable_truncate
+            BEFORE TRUNCATE ON ledger_entry
+            FOR EACH STATEMENT EXECUTE FUNCTION ledger_entry_reject();
+    END IF;
 END
 $trg$;;
 

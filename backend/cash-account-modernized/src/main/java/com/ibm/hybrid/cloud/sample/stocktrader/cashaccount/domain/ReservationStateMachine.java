@@ -13,18 +13,27 @@ public final class ReservationStateMachine {
     }
 
     /**
-     * One ledger row a transition requires, as an event type and the non-negative magnitude it carries.
+     * One ledger row a transition requires: its event type, its magnitude and the balances as of that row.
      *
-     * @param eventType the row's event type, which alone carries the direction
-     * @param amount    the row's non-negative magnitude
+     * <p>The after-state belongs to the leg rather than to the transition because a transition may write more
+     * than one row - a partial settlement writes {@code SETTLEMENT} then {@code RELEASE} - and consumers
+     * derive every signed delta from consecutive {@code available_after}/{@code reserved_after} values
+     * (AAP 0.6.3). A second row repeating the transition's final pair would therefore state an amount against
+     * a derived delta of zero.</p>
+     *
+     * @param eventType      the row's event type, which alone carries the direction
+     * @param amount         the row's non-negative magnitude
+     * @param availableAfter the available balance once this leg, and only this leg, has been applied
+     * @param reservedAfter  the reserved balance once this leg, and only this leg, has been applied
      */
-    public record LedgerEffect(LedgerEventType eventType, Money amount) {
+    public record LedgerEffect(LedgerEventType eventType, Money amount, Money availableAfter,
+            Money reservedAfter) {
 
         public LedgerEffect {
             // A null component is a defect in this module rather than a caller condition, so the handler's
             // catch-all renders it as 500 INTERNAL instead of a plausible 4xx a caller could act on.
-            if (eventType == null || amount == null) {
-                throw new IllegalArgumentException("eventType and amount are required");
+            if (eventType == null || amount == null || availableAfter == null || reservedAfter == null) {
+                throw new IllegalArgumentException("eventType, amount and both after-balances are required");
             }
         }
     }
@@ -35,7 +44,8 @@ public final class ReservationStateMachine {
      * @param resultingState the reservation's state after the transition, which the response reports
      * @param availableBalance the account's available balance after the transition, absolute, not a delta
      * @param reservedBalance the account's reserved balance after the transition, absolute, not a delta
-     * @param ledgerEffects the rows to append, in the order they must be written; empty for a no-op
+     * @param ledgerEffects the rows to append, in the order they must be written, each carrying the balances
+     *        as of its own leg; empty for a no-op
      * @param idempotentNoOp {@code true} exactly when nothing changed, so the caller appends nothing
      */
     public record Effect(ReservationState resultingState, Money availableBalance, Money reservedBalance,
@@ -48,6 +58,22 @@ public final class ReservationStateMachine {
             // Copied because the effects are the instruction audit/LedgerService acts on: a caller still
             // holding the list could otherwise write rows this class never sanctioned.
             ledgerEffects = List.copyOf(ledgerEffects);
+
+            // The chain of rows has to end where the aggregate ended, which is what a future multi-leg
+            // transition would break silently: the rollback-replay derivation reads an owner's LAST row as its
+            // absolute end state (AAP 0.12.1), so a final leg carrying an intermediate snapshot would report a
+            // balance the account never held. Value comparison, not identity - Money instances are rebuilt by
+            // every arithmetic step.
+            if (!ledgerEffects.isEmpty()) {
+                LedgerEffect last = ledgerEffects.get(ledgerEffects.size() - 1);
+                if (last.availableAfter().compareTo(availableBalance) != 0
+                        || last.reservedAfter().compareTo(reservedBalance) != 0) {
+                    throw new IllegalArgumentException("the last ledger effect must carry the transition's own"
+                            + " balances, but " + last.eventType() + " carries available "
+                            + last.availableAfter() + " / reserved " + last.reservedAfter() + " against "
+                            + availableBalance + " / " + reservedBalance);
+                }
+            }
         }
     }
 
@@ -104,7 +130,7 @@ public final class ReservationStateMachine {
 
         account.moveBalances(newAvailable, newReserved);
         return new Effect(ReservationState.HELD, newAvailable, newReserved,
-                List.of(new LedgerEffect(LedgerEventType.HOLD, amount)), false);
+                List.of(new LedgerEffect(LedgerEventType.HOLD, amount, newAvailable, newReserved)), false);
     }
 
     /**
@@ -114,8 +140,10 @@ public final class ReservationStateMachine {
      * {@code available += (heldAmount - settleAmount)} - the settled portion leaves the account for good and
      * only the remainder comes back. Ledger: a {@code SETTLEMENT} row of {@code settleAmount}, followed by a
      * {@code RELEASE} row of the remainder when there is one, so a full settlement writes one row and a
-     * partial or zero settlement writes two. A settle on an already {@code SETTLED} reservation is an
-     * idempotent no-op that mutates nothing and appends nothing.</p>
+     * partial or zero settlement writes two. The two rows carry different after-states - the settled portion
+     * leaving reserved, then the remainder arriving in available - so each row's amount is visible as the
+     * delta between consecutive rows the way AAP 0.6.3 has consumers read it. A settle on an already
+     * {@code SETTLED} reservation is an idempotent no-op that mutates nothing and appends nothing.</p>
      *
      * @param account the account holding the funds, already locked by the caller
      * @param reservation the reservation to settle
@@ -225,7 +253,7 @@ public final class ReservationStateMachine {
         account.moveBalances(newAvailable, newReserved);
         reservation.applyTransition(ReservationState.EXPIRED, null);
         return new Effect(ReservationState.EXPIRED, newAvailable, newReserved,
-                List.of(new LedgerEffect(LedgerEventType.EXPIRY, amount)), false);
+                List.of(new LedgerEffect(LedgerEventType.EXPIRY, amount, newAvailable, newReserved)), false);
     }
 
     /**
@@ -309,6 +337,12 @@ public final class ReservationStateMachine {
         }
 
         Money remainder = held.minus(settled);
+        // The two legs' snapshots are taken before moveBalances, in this order, because both helpers read the
+        // aggregate: after the write there is only the final pair, which is what made a partial settlement's
+        // RELEASE row state a remainder against a derived delta of zero. The settled portion leaves reserved
+        // while available does not move, so the SETTLEMENT leg is (available unchanged, reserved - settled).
+        Money availableWhileHeld = account.availableBalance();
+        Money reservedAfterSettlement = reservedAfterReleasing(account, settled);
         Money newReserved = reservedAfterReleasing(account, held);
         // The remainder always has room to return: CashAccount bounds available + reserved on every write, so
         // available + remainder never exceeds Money.MAX_VALUE however large a credit was taken while the
@@ -320,11 +354,14 @@ public final class ReservationStateMachine {
 
         // The SETTLEMENT row is written even when it is zero, so the ledger carries one row per settlement
         // decision and a reader can tell "settled nothing" from "never settled". The RELEASE row appears only
-        // when there is a remainder, because a row of zero would assert a movement that did not happen.
+        // when there is a remainder, because a row of zero would assert a movement that did not happen - and
+        // where it is absent the SETTLEMENT leg's snapshot is already the transition's final pair.
         List<LedgerEffect> effects = remainder.isZero()
-                ? List.of(new LedgerEffect(LedgerEventType.SETTLEMENT, settled))
-                : List.of(new LedgerEffect(LedgerEventType.SETTLEMENT, settled),
-                        new LedgerEffect(LedgerEventType.RELEASE, remainder));
+                ? List.of(new LedgerEffect(LedgerEventType.SETTLEMENT, settled, availableWhileHeld,
+                        reservedAfterSettlement))
+                : List.of(new LedgerEffect(LedgerEventType.SETTLEMENT, settled, availableWhileHeld,
+                                reservedAfterSettlement),
+                        new LedgerEffect(LedgerEventType.RELEASE, remainder, newAvailable, newReserved));
         return new Effect(ReservationState.SETTLED, newAvailable, newReserved, effects, false);
     }
 
@@ -336,13 +373,14 @@ public final class ReservationStateMachine {
         account.moveBalances(newAvailable, newReserved);
         reservation.applyTransition(ReservationState.RELEASED, null);
         return new Effect(ReservationState.RELEASED, newAvailable, newReserved,
-                List.of(new LedgerEffect(LedgerEventType.RELEASE, amount)), false);
+                List.of(new LedgerEffect(LedgerEventType.RELEASE, amount, newAvailable, newReserved)), false);
     }
 
     /*
      * Not a caller-facing sufficiency check, despite calling the same Money.minus: reserved funds only ever
-     * move by an amount this class placed there at hold time, so an INSUFFICIENT_FUNDS here means a hold was
-     * never moved back - a defect, not a 422 telling the caller its valid request lacked funds.
+     * move by an amount this class placed there at hold time, or by a settled portion of one, so an
+     * INSUFFICIENT_FUNDS here means a hold was never moved back - a defect, not a 422 telling the caller its
+     * valid request lacked funds.
      */
     private static Money reservedAfterReleasing(CashAccount account, Money amount) {
         try {

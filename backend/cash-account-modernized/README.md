@@ -20,35 +20,35 @@ This module is a **plain tracked directory in the umbrella checkout — not a gi
 edited: the umbrella repository carries these files directly so the new service can be built and reviewed in the same
 checkout as the seam it has to satisfy and the chart it has to conform to.
 
-### `target/` is expected to show as untracked, and that is the settled answer
+### `target/` is ignored, so the parent's boundary gate stays clean
 
-The module tracks **no `.gitignore`**: the frozen file inventory (AAP 0.2.1, 0.6.1) contains none and the umbrella
-repository has none of its own. The consequence is concrete rather than theoretical — in a committed checkout, after
-the build this README mandates (`./mvnw -B clean verify`), `git status --porcelain` reports exactly one line:
+The module carries its own **`.gitignore`**, and it ignores exactly one path: `target/`. Every sibling under
+`backend/`, `frontend/`, `infra/` and `tools/` is a submodule with ignores of its own and the umbrella repository has
+none, so without that line this module's build output is untracked content in the parent tree — after the build this
+README mandates (`./mvnw -B clean verify`), `git status --porcelain` at the repository root reported
 
 ```text
 ?? backend/cash-account-modernized/target/
 ```
 
-That line is **build output, never a tracked change**: no file this deliverable ships is modified by it, so the
-minimal-change criterion (AAP 0.7.7, "only files under `backend/cash-account-modernized/` are created") still holds.
-Either of these reports nothing at all in the same checkout — an exclusion pathspec, or removing the output before
-inspecting:
+— the whole build tree, some 60 MB of it, that a blanket `git add -A` would commit, and a boundary check that can no
+longer tell this deliverable's files from its artifacts. With the file in place the same command after the same build
+reports nothing, so the gate —
+only `backend/cash-account-modernized/` may appear at the parent, and no submodule may be dirty — reads clean without
+a pathspec or a manual `rm -rf`. Both halves of that claim are checkable in any checkout:
 
 ```bash
-git status --porcelain -- ':!backend/cash-account-modernized/target'
-rm -rf backend/cash-account-modernized/target && git status --porcelain
+cd backend/cash-account-modernized && ./mvnw -B clean verify
+cd ../.. && git status --porcelain                              # prints nothing
+git check-ignore -v backend/cash-account-modernized/target      # names .gitignore:<line>:target/
+git check-ignore -v backend/cash-account-modernized/README.md   # exits 1 - nothing but target/ is ignored
 ```
 
-A checkout that would rather never see the line excludes the path locally, with no tracked file added:
-
-```bash
-echo 'backend/cash-account-modernized/target/' >> .git/info/exclude
-```
-
-Shipping a one-line `.gitignore` in the module is the other way to settle this, and it is deliberately not taken here
-because it would add a file the frozen inventory does not carry; it is recorded for the owners under
-[Deviations from the frozen AAP inventory](#deviations-from-the-frozen-aap-inventory).
+The last command is why the file stays at one pattern: a wider rule could hide a deliverable file from the very check
+this file exists to keep honest. The file is itself a **deviation** — AAP 0.2.1's frozen inventory carries no
+`.gitignore` — so it is recorded as row **D5** of the [authorization record](#authorization-record) rather than taken
+silently. The minimal-change criterion (AAP 0.7.7, "only files under `backend/cash-account-modernized/` are created")
+still holds: nothing outside this module changes.
 
 ## What is in here
 
@@ -176,7 +176,7 @@ shred -u ca-db.env 2>/dev/null || rm -f ca-db.env
 
 The schema is applied at start-up (see [Schema application](#schema-application)), so an empty database is enough —
 and so the store this run reaches gains the seven tables, the `ledger_entry_reject()` function and the
-`ledger_entry_immutable` trigger. **Point it at a local throwaway database**, never at a shared or production store;
+`ledger_entry_immutable` and `ledger_entry_immutable_truncate` triggers. **Point it at a local throwaway database**, never at a shared or production store;
 that is the same rule `docs/operational-runbook.md` Step 0 states for its own memory-fit check.
 
 Once the log reports the port, these all answer `200`:
@@ -207,7 +207,7 @@ variables and adds none. `src/main/resources/application.yml` is the declared so
 
 | Environment variable (chart source) | Spring property | Default |
 | --- | --- | --- |
-| `CURRENCY_API_URL` ← `cashAccount.exchangeRateUrl` | `cashaccount.fx.url` | `https://api.frankfurter.app/latest` |
+| `CURRENCY_API_URL` ← `cashAccount.exchangeRateUrl` | `cashaccount.fx.url` | `https://api.frankfurter.app/latest` — **`https` only**; start-up fails naming `CURRENCY_API_URL` and the offending scheme (below) |
 | `JDBC_KIND` ← `database.kind` | `cashaccount.jdbc.kind` | `postgres` — **and nothing else starts** (below) |
 | `JDBC_HOST` ← `database.host` | `cashaccount.jdbc.host` | **none** — start-up fails naming `JDBC_HOST` and `cashaccount.jdbc.host` |
 | `JDBC_PORT` ← `database.port` | `cashaccount.jdbc.port` | `5432` |
@@ -220,6 +220,30 @@ variables and adds none. `src/main/resources/application.yml` is the declared so
 | `JWT_ISSUER` ← `jwt.issuer` | `cashaccount.security.jwt.issuer` | `http://stock-trader.ibm.com` |
 | `JWT_AUDIENCE` ← `jwt.audience` | `cashaccount.security.jwt.audience` | `stock-trader` |
 | `OIDC_JWKS_URL` ← `oidc.jwksUrl` | `cashaccount.security.jwt.jwks-url` | empty; read only when `AUTH_TYPE=oidc` |
+
+### `CURRENCY_API_URL` is `https`-only, and refused at start-up
+
+`fx/FrankfurterExchangeRateClient.requireEndpoint`, called from that class's constructor, checks the value while the
+context is refreshing, so a non-conforming endpoint stops start-up before the port is bound: the pod never becomes
+ready — the chart's `startupProbe` has nothing to probe — and the container log is the only place that says why. It
+is not a degraded rate lookup that a later request reports. The value must satisfy four checks, and every refusal
+names the property and the chart variable together, so a log line leads straight back to this section:
+
+- scheme `https`, compared case-insensitively —
+  `cashaccount.fx.url (CURRENCY_API_URL) must use the https scheme, not http`, the rejected scheme named because its
+  grammar cannot carry a forged log record, while the rest of the value is never echoed;
+- a host — `must name a host`, which `https:///latest` fails;
+- no `user:password@` user information — `must carry no user-info credentials`, since that credential would live in
+  a configMap value that reaches logs and metrics tags;
+- no `#fragment` — `must carry no fragment`, which is never put on the wire and so cannot mean what it reads as.
+
+**No property relaxes any of it**, and plaintext is refused rather than warned about because this rate is not
+advisory data: it is multiplied into every cross-currency credit and debit and the product is written to the
+immutable ledger, so an on-path attacker who can rewrite an HTTP answer moves money (CWE-319, CWE-345).
+`config/FxClientConfig` builds the client's `HttpClient` with `Redirect.NORMAL` rather than `ALWAYS` to close the
+same hole from the other side — a redirect may not walk the endpoint back down to HTTP. An internal rate mirror is
+therefore reachable only over TLS; for a developer's stub see
+[A local or CI FX stub must be served over TLS](#a-local-or-ci-fx-stub-must-be-served-over-tls).
 
 ### `JDBC_KIND` is guarded, not defaulted
 
@@ -270,7 +294,65 @@ would otherwise decide the dialect, the host, the credentials and the TLS mode t
   `socketTimeout` and `tcpKeepAlive` are refused by name, so a supplied URL can neither weaken nor claim TLS.
 - No refusal message quotes the URL or a parameter value, because either may be the credential it was refused for.
 
-`DataSourceGuardConfigTest` covers both TLS shapes, the `JDBC_KIND` guard and every refusal above.
+Every resolved URL — assembled or normalized — also carries the driver's two bounds,
+`connectTimeout=2&socketTimeout=30` by default, from the properties in the next section. A supplied URL that names
+one of the two keeps **its own** value for it and is not given a second copy: pgJDBC honours the last occurrence of
+a repeated parameter, so a duplicate would leave the URL saying one thing and the connection doing another.
+
+`DataSourceGuardConfigTest` covers both TLS shapes, the `JDBC_KIND` guard, every refusal above, the appended bounds
+and their precedence.
+
+### How long anything waits for the database
+
+Four values, and together they are the whole answer. None of them is a framework default left in place.
+
+| Property | Default | What it bounds |
+| --- | --- | --- |
+| `spring.datasource.hikari.connection-timeout` | `2000` ms | Waiting for a pooled connection — the bound a caller feels |
+| `spring.datasource.hikari.validation-timeout` | `1000` ms | Testing a pooled connection, which happens **inside** the borrow above |
+| `spring.datasource.hikari.initialization-fail-timeout` | `30000` ms | Start-up only: how long the pool retries, once a second, before the context fails |
+| `cashaccount.jdbc.connect-timeout` / `cashaccount.jdbc.socket-timeout` | `PT2S` / `PT30S` | One TCP-and-TLS handshake, and one read on an established connection |
+
+Left at their own defaults, Hikari waits 30 s for a connection and pgJDBC waits for ever on a read. With the
+database unreachable that produced a measured **30.0 s** for every database-dependent request and for
+`/actuator/health/readiness` — whose `db` indicator borrows from this same pool — before returning the `503` that
+had already been decided at the first refused connection. The status and body were right; the wait was not. Each
+one occupied a Tomcat worker for the whole 30 s, broker propagates retail calls with no client timeout of its own,
+and the scheduled expiry sweep blocked for the same 30 s. The exchange-rate hop is capped at `PT2S` precisely so a
+provider cannot outlive its caller; the datastore is the other outbound hop and now carries the same ceiling, so a
+caller gets `503 DATASTORE_UNAVAILABLE` with `Retry-After: 5` in about two seconds instead of thirty.
+
+Why each value is what it is:
+
+- **`validation-timeout` at or below `connection-timeout`.** The aliveness test of a pooled connection runs inside
+  the borrow, so Hikari's own 5 s default would declare a dead-but-open connection invalid only after the 2 s
+  ceiling had passed, making the ceiling a claim rather than a fact.
+- **`initialization-fail-timeout` at 30 s.** The 30 s borrow default used to give cold start its tolerance by
+  accident. Stated explicitly, the pool retries once a second across that window before failing the context, so a
+  pod whose database is still starting still starts — a tighter borrow budget must not turn a slow database into a
+  crash loop. It is deliberately **not** negative: a negative value starts the pod with no database at all, while
+  `spring.sql.init` and `ddl-auto=validate` both have to run against a real one first.
+- **`socket-timeout` generous where the pool's budget is tight.** It is a ceiling on the slowest legitimate single
+  round trip, not a request budget: the longest this service can legitimately wait on one statement is
+  `schema/cash-account-schema.sql`'s `pg_advisory_lock` while another pod applies the same script. Whole seconds
+  only — the driver takes an `int` of seconds and reads `0` as *no timeout*, so `PT0.5S` would be truncated into
+  exactly the unbounded wait the setting exists to remove, and `DataSourceGuardConfig` refuses it instead.
+- **A saturated pool answers the same way.** Every operation here is a single-row read or write, so 2 s of
+  unbroken contention is real overload, and a retryable `503` is the honest answer to it rather than a queue.
+
+One thing this does **not** reach, stated so it is not mistaken for covered: the chart's `readinessProbe` declares
+`periodSeconds: 15` and `failureThreshold: 3` but no `timeoutSeconds`, so the kubelet applies its 1 s default, and a
+2 s answer still arrives after the probe attempt has been abandoned. The pod leaves the Service endpoints after the
+same three failed periods either way — a timed-out attempt and a `DOWN` body score identically — and what changes
+is that the server no longer holds a worker per probe for 30 s. Making the kubelet *read* the `DOWN` body needs
+`timeoutSeconds` on the probe, which lives in
+`infra/stocktrader-operator/helm-charts/stocktrader/templates/cash-account.yaml` — a read-only template here (AAP
+0.3.4), so it belongs to the chart's owners. The alternative, a sub-second `connection-timeout`, is deliberately not
+taken: opening a TLS connection to a managed PostgreSQL instance can legitimately take several hundred
+milliseconds, and spurious `503`s on a healthy database would be a worse defect than a late probe body.
+
+All four are retunable as plain container environment with no chart change:
+`SPRING_DATASOURCE_HIKARI_CONNECTION_TIMEOUT`, `CASHACCOUNT_JDBC_SOCKET_TIMEOUT`, and so on.
 
 ### Properties with no environment binding
 
@@ -282,6 +364,8 @@ These have internal defaults; nothing in the chart supplies them, and nothing ne
 | `cashaccount.security.all-authenticated-hold-stocktrader` | `true` | Parity with the siblings' `ALL_AUTHENTICATED_USERS → StockTrader` binding; `false` is the strict mode (see [Security](#security)) |
 | `cashaccount.fx.base-currency` | `USD` | Broker's default account currency, so a same-currency account short-circuits to a rate of exactly `1` with no network call |
 | `cashaccount.fx.timeout` | `PT2S` | Connect and read budget; a slow rate provider must surface as `503`, not as a request that outlives its caller |
+| `cashaccount.jdbc.connect-timeout` | `PT2S` | Bounds one TCP-and-TLS handshake to the database, appended to the assembled URL as pgJDBC's `connectTimeout`. A host that drops packets rather than refusing them otherwise sits in the kernel's connect retry, leaving the socket behind after the pool has already given up on it. See [How long anything waits for the database](#how-long-anything-waits-for-the-database) |
+| `cashaccount.jdbc.socket-timeout` | `PT30S` | Bounds a **read** on an established connection, appended as pgJDBC's `socketTimeout`. Nothing else here bounds it at all: the driver's default is `0`, so a statement in flight when the peer disappears waits for ever, and the pool's `connection-timeout` governs obtaining a connection rather than using one |
 | `cashaccount.fx.accepted-currencies` | The 31 ISO codes `AUD BGN BRL CAD CHF CNY CZK DKK EUR GBP HKD HUF IDR ILS INR ISK JPY KRW MXN MYR NOK NZD PHP PLN RON SEK SGD THB TRY USD ZAR` | The **estate allowlist**, adopted verbatim from the `allowed_currencies` CHECK the estate's PostgreSQL init template already enforces — **not** the set the exchange-rate API serves, which is a 30-code subset of it: as of 2026-09-22 the configured provider's `/v1/currencies` omits `BGN` and `GET /latest?from=USD&to=BGN` answers `404`. Acceptance is therefore not a promise of convertibility — a `BGN` account is created and read normally, and only a cross-currency `credit`/`debit` for it fails, with `503 EXCHANGE_RATE_UNAVAILABLE`, the balance unchanged and no ledger row. `BGN` is kept rather than dropped because this list also decides what a legacy export may be **loaded** with (an out-of-set currency is recorded as `CURRENCY` / `INVALID_IN_LEGACY` and the account is not migrated), so dropping it would silently strand a `BGN`-denominated legacy account. A deployment whose accounts must all be convertible narrows the list — `CASHACCOUNT_FX_ACCEPTED_CURRENCIES=USD,EUR,…`, no chart change — and `application.yml` is the single authority every consumer binds |
 | `cashaccount.reservation.default-ttl` | `PT24H` | A hold nobody settles or releases must not strand funds indefinitely |
 | `cashaccount.reservation.expiry-sweep-interval` | `PT60S` | Bounds how long an overdue hold keeps money out of the available balance |
@@ -315,8 +399,9 @@ outer layer belongs to the ingress, service mesh or API gateway in front of the 
 change this module may not make (AAP 0.3.4 makes a chart template change a [stop-and-flag](#stop-and-flag)
 condition, and AAP 0.2.4 puts values, CRDs and GitOps resources out of scope); it is recorded for the platform owner
 under [Deviations from the frozen AAP inventory](#deviations-from-the-frozen-aap-inventory).
-`REQUEST_TOO_LARGE` is the one error code this deliverable added beyond the AAP's own table, and is recorded in the
-same place.
+`REQUEST_TOO_LARGE` is one of the three error codes this deliverable added beyond the AAP's own table — the other
+two are the media-type pair `UNSUPPORTED_MEDIA_TYPE` and `NOT_ACCEPTABLE` — and all three are recorded in the same
+place.
 
 ### Tool-profile properties
 
@@ -368,7 +453,7 @@ The service is deployed by the chart that already exists at
 | --- | --- | --- |
 | `cashAccount.enabled` | `false` | Gates the whole Deployment, and reaches broker and portfolio as `CASH_ACCOUNT_ENABLED` |
 | `cashAccount.url` | `http://{{ .Release.Name }}-cash-account-service:8080/cash-account` | Broker's `CASH_ACCOUNT_URL`; matches the controllers' `/cash-account` mapping |
-| `cashAccount.exchangeRateUrl` | `https://api.frankfurter.app/latest` | `CURRENCY_API_URL` → `cashaccount.fx.url` |
+| `cashAccount.exchangeRateUrl` | `https://api.frankfurter.app/latest` | `CURRENCY_API_URL` → `cashaccount.fx.url`; **must stay an `https` URL** ([above](#currency_api_url-is-https-only-and-refused-at-start-up)) |
 | `cashAccount.image.repository` / `.tag` | `ghcr.io/ibmstocktrader/cash-account` / `1.0.0` | The image the pod runs; set to the digest-pinned image the [build path](#image-build-scan-and-push) produces |
 | `database.kind` / `.host` / `.port` / `.db` / `.ssl` / `.id` / `.password` | `db2` and DB2 host values | `JDBC_KIND` / `JDBC_HOST` / `JDBC_PORT` / `JDBC_DB` / `JDBC_SSL` / `JDBC_ID` / `JDBC_PASSWORD` |
 | `jwt.issuer` / `jwt.audience` | `http://stock-trader.ibm.com` / `stock-trader` | `JWT_ISSUER` / `JWT_AUDIENCE` |
@@ -532,17 +617,21 @@ return channel, which dropped the sign in a `X(10)` field and reported only the 
 | `RESERVATIONS_OUTSTANDING` | 409 | Retail `PUT`/`DELETE` while a `HELD` reservation exists |
 | `EXCHANGE_RATE_UNAVAILABLE` | 503 + `Retry-After: 5` | The rate is missing, unreachable or unparsable; the balance is unchanged and no ledger row is written (legacy returned success over an uninitialized rate) |
 | `DATASTORE_UNAVAILABLE` | 503 + `Retry-After: 5` | Database unreachable (legacy `-911` / `-913` / `-904`) |
-| `UNSUPPORTED_PATH` | 404 | An unmapped path — fail closed, where the legacy `EVALUATE` fell through as success |
+| `UNSUPPORTED_PATH` | 404 | An unmapped path — fail closed, where the legacy `EVALUATE` fell through as success. Also the answer on the retail seam for the one reserved segment, `/cash-account/institutional` and its `/debit` and `/credit` in any casing: those reach the retail `/{owner}` mappings, and serving them would make the institutional namespace a retail account. Owner identity is untouched — the loader still carries a legacy row named `INSTITUTIONAL`, and the institutional endpoints still read it |
 | `UNSUPPORTED_METHOD` | 405 | A known path with an unmapped verb |
-| `REQUEST_TOO_LARGE` | 413 | A request body above `server.max-request-body-size` (8KB), refused on its declared `Content-Length` or counted mid-read — see [Request intake bounds](#request-intake-bounds). The one code here with **no** legacy counterpart and no entry in the AAP's own error table: a COMMAREA is a fixed-length structure, so an oversized request was unrepresentable rather than rejected, and a 413 cannot be reported without a code of its own. Recorded under [Deviations from the frozen AAP inventory](#deviations-from-the-frozen-aap-inventory) |
+| `UNSUPPORTED_MEDIA_TYPE` | 415 | A request body in a media type no configured converter reads — `text/plain`, `application/xml`, or the `application/x-www-form-urlencoded` a `curl -d` sends when no `Content-Type` is given. The rejection carries `Accept: application/json`, naming what this service does read. Beyond the AAP's own error table, and recorded with `REQUEST_TOO_LARGE` under [Deviations from the frozen AAP inventory](#deviations-from-the-frozen-aap-inventory) |
+| `NOT_ACCEPTABLE` | 406 | An `Accept` header this service cannot satisfy (`application/xml`, `text/html`). The body is still the `ApiError` shape in `application/json` — a rejection that could not be rendered would be no rejection at all. Recorded in the same place |
+| `REQUEST_TOO_LARGE` | 413 | A request body above `server.max-request-body-size` (8KB), refused on its declared `Content-Length` or counted mid-read — see [Request intake bounds](#request-intake-bounds). One of the three codes here with **no** legacy counterpart and no entry in the AAP's own error table: a COMMAREA is a fixed-length structure, so an oversized request was unrepresentable rather than rejected, and a 413 cannot be reported without a code of its own. Recorded under [Deviations from the frozen AAP inventory](#deviations-from-the-frozen-aap-inventory) |
 | `INVALID_QUERY` | 400 | `limit` below 1 or above 1000, or an unparsable `since` |
 | `CONCURRENT_MODIFICATION` | 409 + `Retry-After: 1` | A lock conflict. One second, not five: the conflict clears as soon as the competing transaction commits |
 | `UNAUTHORIZED` | 401 | Missing or invalid token, rendered by the filter chain's entry point |
 | `FORBIDDEN` | 403 | Authenticated but lacking the required role, rendered by the access-denied handler |
 | `INTERNAL` | 500 | Any unexpected exception |
 
-That is the complete set: **23 codes**, one status each, nothing else reachable — the 22 the AAP's error table
-declares, with the statuses it declares, plus `REQUEST_TOO_LARGE`.
+That is the complete set: **25 codes**, one status each, nothing else reachable — the 22 the AAP's error table
+declares, with the statuses it declares, plus `REQUEST_TOO_LARGE`, `UNSUPPORTED_MEDIA_TYPE` and `NOT_ACCEPTABLE`.
+Each of the three exists because the condition it names is a caller mistake that has to be reported and the closed
+vocabulary can express it in no other way that stays true; all three are on the same signable register row.
 
 ## Security
 
@@ -663,11 +752,30 @@ java -jar target/cash-account-modernized-1.0.0-SNAPSHOT.jar \
      --spring.profiles.active=tool \
      --tool.command=shadow-compare \
      --tool.input=src/test/resources/fixtures/shadow/matched \
-     --tool.batch-id="$(uuidgen 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())')"
+     --tool.batch-id="$BATCH_ID"
 ```
 
 The tool profile needs the same `JDBC_*` environment as a normal run. Each invocation is its own `migration_run` row;
 the shared `--tool.batch-id` is how a `reconcile` names the `load` it judges.
+
+**A `shadow-compare` window depends on a completed `load` in the same database, whatever batch id it carries.** The
+replay prices its cross-currency lines from the staged `frankfurt1` rates under `tool.rate-source=legacy-table`, and
+those rows belong to a `load` run. The window resolves that run in two steps: the completed `load` of its own batch id
+if there is one — which is why the block above reuses `$BATCH_ID` — and otherwise **the most recent completed load in
+the schema**, which is what the runbook's per-window batch ids resolve to. Either way the run that priced the window
+is named in its log:
+
+```text
+Legacy rate lookups resolve against staging run <run> of batch <batch>
+Batch <batch> holds no completed load, so legacy rate lookups resolve against staging run <run> of batch <batch> - this schema's most recent completed load
+```
+
+With **no** completed load anywhere in the schema there is no rate to price with, and each cross-currency line is
+recorded as a `REJECTED_BY_TARGET` row with status `VARIANCE` and migrated value `EXCHANGE_RATE_UNAVAILABLE`, so the
+window exits `2` rather than reporting agreement it never measured. A target that cannot price a line the captured
+legacy reply priced successfully is reporting its own environment, so that row is an outstanding variance and never an
+accepted exception — unlike the over-debit the legacy stored as an absolute value, which is one
+([`tool.rate-source`](#toolrate-source) and the fixture expectations below).
 
 `--tool.history-record-length=100` appears on the `load` alone, and it is not optional there: that fixture directory
 carries a binary `history.cp037.bin`, and for binary history the record length is **declared, never inferred** — the
@@ -823,7 +931,8 @@ the `@sha256:` form before routing is confirmed.
 
 **Run it against a disposable database, never against a shared or production store.** Start-up applies
 `schema/cash-account-schema.sql` (`spring.sql.init.mode=always`), so the store this check reaches gains the seven
-tables, the `ledger_entry_reject()` function and the `ledger_entry_immutable` trigger. Turning the initializer off is
+tables, the `ledger_entry_reject()` function and the `ledger_entry_immutable` and `ledger_entry_immutable_truncate`
+triggers. Turning the initializer off is
 not the alternative — `spring.jpa.hibernate.ddl-auto=validate` then fails start-up, and readiness includes the `db`
 indicator, so the check needs a real database that is genuinely expendable.
 
@@ -874,9 +983,10 @@ schema is written against.
 
 ## Local development notes
 
-Three things surprise a developer running this module outside the chart, and each is recorded because the
+Four things surprise a developer running this module outside the chart, and each is recorded because the
 surprise is by design and the remedy is never an edit to another module: broker's local-dev URL default,
-what the fail-closed error model does to a broker request, and how the schema reaches an empty database.
+what the fail-closed error model does to a broker request, why a stand-in rate endpoint has to speak TLS, and
+how the schema reaches an empty database.
 
 ### Broker's local-dev default URL ends in `/account`, and stays that way
 
@@ -897,10 +1007,56 @@ the legacy program answered an unknown request code with a success-looking retur
 amount back as a balance, this service answers `404`/`405`/`503` with an `ApiError`, and broker degrades exactly as it
 already does when the cash service is unreachable.
 
+### A local or CI FX stub must be served over TLS
+
+Standing a rate endpoint up locally is the ordinary way to exercise cross-currency credit and debit without reaching
+a third party, and it cannot be `http://localhost:<port>`: the rule under
+[`CURRENCY_API_URL` is `https`-only, and refused at start-up](#currency_api_url-is-https-only-and-refused-at-start-up)
+runs in a constructor and no property relaxes it, so a plaintext stub yields a process that exits during start-up.
+Serve the stub over TLS with a self-signed certificate for the host the URL names, and hand the JVM a truststore
+holding that certificate — a copy of the JDK's own, so the shared `cacerts` gains nothing:
+
+```bash
+umask 077
+# The stub's own key pair and self-signed certificate. `-storepass:env` keeps even this throwaway password out of
+# argv, for the reason stated under Run locally.
+IFS= read -rsp 'stub keystore password: ' CA_FX_STUB_PW; echo; export CA_FX_STUB_PW
+keytool -genkeypair -alias fx-stub -keyalg RSA -keysize 2048 -validity 30 \
+        -dname CN=fx-stub.localhost -ext san=dns:fx-stub.localhost \
+        -keystore fx-stub.p12 -storetype PKCS12 -storepass:env CA_FX_STUB_PW
+keytool -exportcert -rfc -alias fx-stub -keystore fx-stub.p12 -storetype PKCS12 \
+        -storepass:env CA_FX_STUB_PW > fx-stub-cert.pem
+
+# A copy of the JDK truststore, PKCS12 because that is what the JDK 21 `cacerts` file already is. Neither the copy
+# nor `changeit` is a secret — public certificates and the JDK's own default password — so both sit in the clear.
+cp "$JAVA_HOME/lib/security/cacerts" ca-fx-truststore.p12
+keytool -importcert -noprompt -alias ca-fx-stub -file fx-stub-cert.pem \
+        -keystore ca-fx-truststore.p12 -storetype PKCS12 -storepass changeit
+
+# The stub serves HTTPS on <port> with fx-stub.p12; only the truststore and the endpoint differ from Run locally.
+CURRENCY_API_URL=https://fx-stub.localhost:<port>/latest \
+java -Djavax.net.ssl.trustStore=ca-fx-truststore.p12 -Djavax.net.ssl.trustStorePassword=changeit \
+     -jar target/cash-account-modernized-1.0.0-SNAPSHOT.jar
+
+# Afterwards
+unset CA_FX_STUB_PW
+shred -u fx-stub.p12 ca-fx-truststore.p12 2>/dev/null || rm -f fx-stub.p12 ca-fx-truststore.p12
+```
+
+The subject alternative name has to equal the host in `CURRENCY_API_URL`, because the JDK HTTP client verifies the
+hostname as well as the chain. Get it wrong and start-up **succeeds** while every cross-currency operation answers
+`503 EXCHANGE_RATE_UNAVAILABLE` with the balance untouched — a running service with no rates, which is the harder of
+the two symptoms to read.
+
+**No test needs any of this.** `fx/CurrencyConversionTest` binds spring-test's `MockRestServiceServer` to the client
+builder, so the suite never opens a socket to a rate provider, and it is also where every refusal above is asserted
+(`endpointMustBeHttpsWithAHostAndNoCredentials`). The stub is for a hand-started process only.
+
 ### Schema application
 
 `src/main/resources/schema/cash-account-schema.sql` holds the seven tables, their constraints and indexes, the
-`ledger_entry_reject()` function and the `ledger_entry_immutable` trigger. It is applied at start-up by Spring Boot's
+`ledger_entry_reject()` function and the `ledger_entry_immutable` and `ledger_entry_immutable_truncate` triggers. It is
+applied at start-up by Spring Boot's
 own SQL initialization (`spring.sql.init.mode=always`,
 `spring.sql.init.schema-locations=classpath:schema/cash-account-schema.sql`) with
 `spring.jpa.hibernate.ddl-auto=validate`, so any drift between the entities and the DDL stops start-up instead of being
@@ -956,7 +1112,9 @@ start-up initializer and the hand-applied path — and running it twice changes 
 
 **Hardened production posture.** The chart supplies a single database identity, used for DDL and DML alike, exactly as
 portfolio's hand-applied DDL is. Under that identity the immutability trigger protects the ledger against every
-application code path but not against a privileged operator who could drop it. The hardened arrangement is:
+application code path but not against a privileged operator who could drop it. A second, statement-level
+`ledger_entry_immutable_truncate` trigger (`BEFORE TRUNCATE`) closes the one statement a row-level trigger never sees,
+so `TRUNCATE ledger_entry` is refused under that same identity too. The hardened arrangement is:
 
 1. Apply the script once with `psql` under a DDL-owning role.
 2. Run the service under a **DML-only** role holding `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the tables but not
@@ -1008,17 +1166,17 @@ and regression work exceeded each of them, and the first four rows below are tho
 name is in the tree and none of it is to be reverted** — each is either a fix for a named vulnerability or the
 coverage that guards a fixed defect — but each needs the requesting organization's authorization, and this register
 is where that outstanding decision is visible rather than buried at a code site. The last two rows are the other two
-shapes the same question takes: work the AAP puts outside this module and only the platform owner can do, and a
-deviation deliberately **not** taken, recorded so the owners can take it if they prefer.
+shapes the same question takes: work the AAP puts outside this module that only the platform owner can do, and a file
+beyond the plan's frozen **file** inventory (AAP 0.2.1) that this repository's own boundary-hygiene gate requires.
 
 | Open item | What settles it |
 | --- | --- |
 | **Three dependency versions override AAP 0.9.1's frozen inventory** — `org.postgresql:postgresql` `42.7.13` (the AAP pins `42.7.7`, matching `backend/portfolio`), `tomcat.version` `10.1.60` (Spring Boot 3.3.13's BOM manages `10.1.42`) and `micrometer.version` `1.15.12` (the BOM manages `1.13.15`). Each is a CVE remediation the mandated 3.3 line ships no newer parent to inherit, declared per coordinate in `pom.xml` and detailed [below](#the-three-dependency-overrides-and-why-no-bom-version-remediates-them) | The requesting organization authorizes the three coordinates, recording that Micrometer `1.15.12` sits two minor lines above Boot 3.3.13's tested matrix and is proven only on the surfaces `ActuatorProbesIT` exercises (`/metrics` and `/actuator/prometheus` answering 200 with `http_server_requests_seconds_count`, the series runbook Step 3's rollback criterion reads). **Reverting to the AAP-pinned versions is not an option on the table** — those versions are the vulnerable ones. Decision row **D1** of the [authorization record](#authorization-record) |
-| **A 23rd error code beyond AAP 0.6.2's closed 22-code vocabulary** — `REQUEST_TOO_LARGE` → `413`, raised by `config/RequestBodySizeLimitFilter` and carried out of a mid-read stream by `error/RequestBodyTooLargeException`. Purely additive: every AAP-declared code is present with the status the AAP declares. It exists because a `413` cannot be reported without a code of its own, and both alternatives break the invariant the enum is for — a `413` carrying a `400`'s code makes the code-to-status binding untrue on the wire, and `400 INVALID_AMOUNT` tells a caller its amount was wrong when its body was never parsed | The requesting organization authorizes the 23rd code. The only alternative is a decision to accept an unbounded request body, because removing the code removes the `413` path, which **is** the remediation ([Request intake bounds](#request-intake-bounds)). Decision row **D2** of the [authorization record](#authorization-record) |
+| **Three error codes beyond AAP 0.6.2's closed 22-code vocabulary** — `REQUEST_TOO_LARGE` → `413`, raised by `config/RequestBodySizeLimitFilter` and carried out of a mid-read stream by `error/RequestBodyTooLargeException`; and the media-type pair `UNSUPPORTED_MEDIA_TYPE` → `415` and `NOT_ACCEPTABLE` → `406`, rendered by `error/ApiExceptionHandler` for Spring's `HttpMediaTypeNotSupportedException` and `HttpMediaTypeNotAcceptableException`. Purely additive: every AAP-declared code is present with the status the AAP declares. Each exists because the condition cannot be reported without a code of its own, and the alternatives break the invariant the enum is for — a `413`, `415` or `406` carrying a `400`'s code makes the code-to-status binding untrue on the wire, and `400 INVALID_AMOUNT` tells a caller its amount was wrong when its body was never parsed at all. The media-type pair closes a runtime defect rather than a hypothetical: unhandled, a wrong `Content-Type` or an unsatisfiable `Accept` was answered `500 INTERNAL` with an `ERROR` record, reporting a caller's mistake as a server fault and contradicting the fail-closed model of AAP 0.4.3 | The requesting organization authorizes the three codes. For `REQUEST_TOO_LARGE` the only alternative is a decision to accept an unbounded request body, because removing the code removes the `413` path, which **is** the remediation ([Request intake bounds](#request-intake-bounds)). For the media-type pair the alternative is a `400` carrying one of the existing codes — available, and rejected here only because the status would then be untrue; `error/FailClosedIT` would need its two media-type assertions changed with it. Decision row **D2** of the [authorization record](#authorization-record) |
 | **The Maven wrapper properties are not the verbatim copy AAP 0.2.3 and 0.8.1 call for** — `.mvn/wrapper/maven-wrapper.properties` adds exactly two lines to `backend/portfolio-assistant`'s file (lines 20–21: a provenance comment and `distributionSha256Sum=0d7125e8…eeadb`). Lines 1–19 are byte-identical, `mvnw` and `mvnw.cmd` are byte-identical, `wrapperVersion`, `distributionType` and `distributionUrl` are unchanged, and the build resolves the same Apache Maven 3.9.11; `pom.xml`'s verified-build-inputs comment records how the value was derived | The requesting organization authorizes the two lines. **The checksum stays**: without it the wrapper downloads and executes an unverified distribution, which is the defect CWE-494 names. If verbatim copying must hold to the byte, the owners supply an equivalent control outside the file — a repository- or runner-level integrity policy that pins the same distribution. Decision row **D3** of the [authorization record](#authorization-record) |
-| **The suite executes 126 tests against AAP 0.7.6's "approximately 72"** — Surefire 47 plus Failsafe 79, 0 skipped. Every addition traces to a prior checkpoint's mandated regression coverage, and the ceiling's qualitative prohibitions are honoured: zero `@ParameterizedTest`, no exploratory or redundant variants, Mockito excluded from the build. Per-family accounting [below](#test-volume-126-executed-against-a-ceiling-of-72) | The requesting organization authorizes the overshoot as regression coverage. **No test is to be deleted to reach the number**: each one guards a defect a prior checkpoint fixed, so deleting it restores the defect's cover, not the plan. The executed count is folded into the declared scenarios below — 72 declared plus 54 named regressions — and the decision is row **D4** of the [authorization record](#authorization-record) |
+| **The suite executes 141 tests against AAP 0.7.6's "approximately 72"** — Surefire 54 plus Failsafe 87, 0 skipped. Every addition traces to a named regression a prior checkpoint's fix left behind, and the ceiling's qualitative prohibitions are honoured: zero `@ParameterizedTest`, `@RepeatedTest` and `@TestFactory`, no exploratory or redundant variants, Mockito excluded from the build. Per-family accounting, and the command that re-derives the number from the build's own XML rather than from this table, are [below](#test-volume-141-executed-against-a-ceiling-of-72) | The requesting organization authorizes the overshoot as regression coverage. **No test is to be deleted to reach the number**: each one guards a defect a prior checkpoint fixed, so deleting it restores the defect's cover, not the plan. The executed count is folded into the declared scenarios below — 72 declared plus 69 named regressions — and the decision is row **D4** of the [authorization record](#authorization-record) |
 | **A request-body cap at the edge is outstanding, and only the platform owner can set it** — the in-process controls bound what this pod reads (8KB parsed, 64KB drained), never what the network delivers to the connector. Setting it in the ingress, service mesh or API gateway is a deployment change this module may not make: AAP 0.3.4 makes a chart template change a [stop-and-flag](#stop-and-flag) condition and AAP 0.2.4 puts values, CRDs and GitOps resources out of scope | The platform owner sets a request-body limit at or below this module's 8KB for the `/cash-account` path space — for example nginx-ingress `client_max_body_size`, or an Envoy buffer limit — and captures as evidence an over-limit `POST` refused at the edge before it reaches a pod |
-| **Whether the module should ship a one-line `.gitignore`** — it does not, because AAP 0.2.1's inventory carries no such file, so after the mandated build `git status --porcelain` reports `?? backend/cash-account-modernized/target/` as described under [Module placement](#target-is-expected-to-show-as-untracked-and-that-is-the-settled-answer) | The owners decide. Adding `target/` in a tracked `.gitignore` needs the same authorization as the rows above, because it is a file beyond the frozen inventory; declining it costs nothing but that one untracked line, which a checkout suppresses locally through `.git/info/exclude` |
+| **The module ships a one-line `.gitignore` (`target/`), a file AAP 0.2.1's inventory does not carry** — without it every build leaves `?? backend/cash-account-modernized/target/` in the parent tree, so the boundary gate this repository is checked with cannot tell the deliverable's files from some 60 MB of build output, and a blanket `git add -A` commits the artifacts; described under [Module placement](#target-is-ignored-so-the-parents-boundary-gate-stays-clean) | The requesting organization authorizes the file, on the same terms as the rows above because it is a file beyond the frozen inventory. Rejecting it means accepting that untracked line permanently or suppressing it per checkout (`echo 'backend/cash-account-modernized/target/' >> .git/info/exclude`), which no clone inherits from the repository and which therefore has to be repeated by every reviewer. Decision row **D5** of the [authorization record](#authorization-record) |
 
 #### The three dependency overrides, and why no BOM version remediates them
 
@@ -1034,45 +1192,73 @@ specific — `ActuatorProbesIT` asserts 200 on `/metrics` and on `/actuator/prom
 `http_server_requests_seconds_count` series. Re-assert **both** scrape routes after any change to the Boot or
 Micrometer version, since that is exactly what the compatibility statement nobody has issued would otherwise cover.
 
-#### Test volume: 126 executed against a ceiling of 72
+#### Test volume: 141 executed against a ceiling of 72
 
-Counts are from `./mvnw -B clean verify` (Surefire `*Test`, Failsafe `*IT`), 0 skipped.
+Counts are from `./mvnw -B clean verify` (Surefire `*Test`, Failsafe `*IT`), 0 skipped. They are re-derivable from
+the build's own reports rather than from this table, which is what makes the number reviewable instead of asserted:
+
+```bash
+cd backend/cash-account-modernized && ./mvnw -B clean verify
+# Prints 141 and the per-class tally the table below is built from (54 Surefire + 87 Failsafe).
+python3 - <<'PY'
+import collections, glob, xml.etree.ElementTree as ET
+per = collections.Counter()
+for report in sorted(glob.glob('target/*-reports/TEST-*.xml')):
+    for case in ET.parse(report).getroot().iter('testcase'):
+        # Grouped by the testcase's own classname, never by the report's file name: Surefire files a @Nested
+        # class's methods under the nested name and writes a tests="0" report for the outer class.
+        per[case.get('classname').rsplit('.', 1)[-1]] += 1
+print('executed test methods:', sum(per.values()))
+for name, count in sorted(per.items()):
+    print(f'  {count:>3}  {name}')
+PY
+```
 
 The executed number is the AAP's own scenario count plus the regressions the fixes left behind, and the third column
-is that difference: **72 declared + 54 fix-mandated regressions = 126**. Every family's addition is named in the
+is that difference: **72 declared + 69 fix-mandated regressions = 141**. Every family's addition is named in the
 paragraph below, so the overshoot is accounted for scenario by scenario rather than asserted as a total.
 
 | Family | AAP 0.7.6 declared | Added by fixes | Executed | Classes |
 | --- | --- | --- | --- | --- |
 | State-transition unit | 8 | 1 | 9 | `ReservationStateMachineTest` |
-| Money / arithmetic unit | 11 | 2 | 13 | `MoneyTest` 7, `LegacyBalanceCalculatorTest` 3, `CharacterizationDocPresentTest` 3 |
-| Currency conversion | 6 | 6 | 12 | `CurrencyConversionTest` 9, `ExchangeRateSourceWiringTest` 3 |
-| Owner normalization and datasource | 5 | 3 | 8 | `OwnerNormalizerTest` 4, `DataSourceGuardConfigTest` 4 |
+| Money / arithmetic unit | 11 | 3 | 14 | `MoneyTest` 7, `LegacyBalanceCalculatorTest` 3, `CharacterizationDocPresentTest` 4 |
+| Currency conversion | 6 | 10 | 16 | `CurrencyConversionTest` 10, `ExchangeRateSourceWiringTest` 6 |
+| Owner normalization and datasource | 5 | 5 | 10 | `OwnerNormalizerTest` 5, `DataSourceGuardConfigTest` 5 |
 | Export decoding | 3 | 0 | 3 | `VsamHistoryRecordDecoderTest` |
-| Contract through the caller's client | 10 | 5 | 15 | `RetailContractIT` 14, `CashAccountClientDriftTest` 1 |
+| Contract through the caller's client | 10 | 7 | 17 | `RetailContractIT` 16, `CashAccountClientDriftTest` 1 |
 | Institutional and audit immediacy | 13 | 11 | 24 | `ReservationLifecycleIT` 22, `AuditImmediacyIT` 2 |
-| Audit immutability | 2 | 0 | 2 | `LedgerImmutabilityIT` |
+| Audit immutability | 2 | 1 | 3 | `LedgerImmutabilityIT` |
 | Security | 5 | 8 | 13 | `RoleEnforcementIT` |
-| Fail-closed | 2 | 3 | 5 | `FailClosedIT` |
+| Fail-closed | 2 | 8 | 10 | `FailClosedIT` |
 | Deployment shape | 1 | 1 | 2 | `ActuatorProbesIT` |
 | Reconciliation and dual-run | 6 | 14 | 20 | `LoaderIT` 10, `ReconciliationIT` 6, `ShadowComparatorIT` 3, `RollbackReplayFileTest` 1 |
-| **Total** | **72** | **54** | **126** | 21 classes |
+| **Total** | **72** | **69** | **141** | 21 classes |
 
-Where the extra 54 came from: the families that grew most are the ones a security or correctness fix reached.
+Where the extra 69 came from: the families that grew most are the ones a security or correctness fix reached.
 Currency conversion gained the outbound-request assertions — no `Authorization` header forwarded, an https-only
-endpoint with no credentials, a bounded response — and the wiring proof that the staged legacy rate source can never
-reach the request path. Security grew into a two-mode matrix (the deployed parity grant, and the strict `groups`-only
+endpoint with no credentials, a bounded response, and a real stalling socket proving the `cashaccount.fx.timeout`
+budget bounds body reception — and the wiring proofs that the staged legacy rate source can never reach the request
+path and that the tool profile starts, and prices from the staged table, without ever constructing the live client.
+The datasource guard gained the driver-bound case (`connectTimeout`/`socketTimeout` appended, sub-second values
+refused), owner normalization the reserved `institutional` segment, the characterization test the packaged copy of
+the document, and audit immutability the `TRUNCATE` refusal beside `UPDATE` and `DELETE`. Security grew into a two-mode matrix (the deployed parity grant, and the strict `groups`-only
 mode as a second context) with `HEAD`-equals-`GET` authorization, the security-header assertions on success and on
 both filter-chain rejections, and the https-only JWKS case. Institutional grew the idempotency-hash cases — expiry
 omitted, `10.0` versus `10.00`, a key retained from a deleted account's life — and the three two-thread races.
 Reconciliation and dual-run grew a live-rate-source mode beside the default `legacy-table` one, plus the
-held-funds and ledger-source classifications. Fail-closed grew an `OPTIONS` case and the two framings of the body
-cap (declared `Content-Length`, and counted mid-read). None of them is a parameterized matrix or an exploratory test,
-and each is the regression a specific fix left behind.
+held-funds and ledger-source classifications. Fail-closed grew an `OPTIONS` case, the two framings of the body
+cap (declared `Content-Length`, and counted mid-read), and the malformed-metadata answers — a firewall-refused
+header value as `400`, an unsupported `Content-Type` as `415`, an unsatisfiable `Accept` as `406`, a validation
+failure naming its field, and the bare institutional prefix refused on the retail seam. The contract pair that took
+that family from 15 to 17 closes a condition AAP 0.6.2 declares and AAP 0.7.6's scenario list does not enumerate: retail `PUT`
+and retail `DELETE` answering `409 RESERVATIONS_OUTSTANDING` while a reservation is `HELD`. Until they existed the
+whole suite stayed green with that guard removed, which would have made an account with funds on hold overwritable
+and deletable — the invariant the reserved balance exists to protect (AAP 0.6.3). None of them is a parameterized
+matrix or an exploratory test, and each is the regression a specific fix left behind.
 
 #### Authorization record
 
-The four rows above that need an authorization are recorded here, in the same shape and with the same discipline as
+The five rows above that need an authorization are recorded here, in the same shape and with the same discipline as
 the characterization document's acceptance block (`docs/legacy-characterization.md` section 10): a status, a named
 authority, a date and a reference, written as single lines in a table so a reader — or a simple `grep` — can tell at
 a glance which decisions are outstanding.
@@ -1082,23 +1268,30 @@ record the authorizer's name and role, the date, and a reference to where the de
 risk acceptance, a ticket). Nobody building or reviewing this module may fill these fields on the organization's
 behalf, for the same reason the retention requirement may not be defaulted: an authorization nobody granted is worse
 than a deviation plainly marked outstanding. `AUTHORIZED` closes the row; `REJECTED` means the deviation must be
-removed, which for D1–D3 reinstates the vulnerability the change fixed and for D4 deletes regression coverage, so a
-rejection needs the replacement control named in that row's "what settles it" cell. The runbook's Step 0
-prerequisites are the natural point to collect these, since that step already gathers the platform owner's sign-offs
-before any cutover action.
+removed, which for D1–D3 reinstates the vulnerability the change fixed, for D4 deletes regression coverage and for D5
+returns the build output to the parent's boundary gate, so a rejection needs the replacement control named in that
+row's "what settles it" cell. The runbook's Step 0 prerequisites are the natural point to collect these, since that
+step already gathers the platform owner's sign-offs before any cutover action.
+
+**What each row needs to be closable**, so that no authorizer has to reconstruct it: D1 the three coordinates and the
+Micrometer caveat; D2 the code and its status; D3 the two wrapper lines; **D4 the executed count, which is
+re-derivable from the build in the two commands under [Test volume](#test-volume-141-executed-against-a-ceiling-of-72)
+so the number on this row can be checked rather than believed, together with the per-family attribution of every test
+above the 72 declared scenarios**; D5 the single ignored pattern and the gate it keeps clean. Each of the five is
+stated in full in the [deviations table](#deviations-from-the-frozen-aap-inventory) above; this register adds only the
+decision.
 
 | # | Deviation, and the inventory it departs from | Status | Authorized by (name, role) | Date | Reference |
 | --- | --- | --- | --- | --- | --- |
 | D1 | pgJDBC `42.7.13`, Tomcat `10.1.60` and Micrometer `1.15.12` (AAP 0.9.1), including the Micrometer-outside-the-tested-matrix caveat | PENDING | — | — | — |
-| D2 | `REQUEST_TOO_LARGE` → `413` as a 23rd error code (AAP 0.6.2) | PENDING | — | — | — |
+| D2 | `REQUEST_TOO_LARGE` → `413`, `UNSUPPORTED_MEDIA_TYPE` → `415` and `NOT_ACCEPTABLE` → `406` as three codes beyond the 22 (AAP 0.6.2) | PENDING | — | — | — |
 | D3 | The two lines added to the wrapper properties: the provenance comment and `distributionSha256Sum` (AAP 0.2.3, 0.8.1) | PENDING | — | — | — |
-| D4 | 126 executed tests — 72 declared scenarios plus 54 fix-mandated regressions (AAP 0.7.6) | PENDING | — | — | — |
-| D5 | A tracked one-line `.gitignore` beyond AAP 0.2.1's inventory | NOT TAKEN — see the register's last row | — | — | — |
+| D4 | 141 executed tests — 72 declared scenarios plus 69 fix-mandated regressions (AAP 0.7.6) | PENDING | — | — | — |
+| D5 | A tracked one-line `.gitignore` (`target/`) beyond AAP 0.2.1's file inventory | PENDING | — | — | — |
 
 Legend: `PENDING` — the change is in the tree and the decision is outstanding. `AUTHORIZED` — approved, with the
 authority, date and reference recorded on that row. `REJECTED` — the deviation must be removed together with the
-replacement control its register row names. `NOT TAKEN` — the deviation was declined during implementation and
-nothing in the tree depends on it.
+replacement control its register row names.
 
 ## Prohibitions
 

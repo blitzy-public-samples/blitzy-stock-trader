@@ -90,9 +90,15 @@ class ReservationStateMachineTest {
         assertThat(effect.resultingState()).isEqualTo(ReservationState.HELD);
         assertThat(effect.availableBalance().amount()).isEqualTo(new BigDecimal("750.00"));
         assertThat(effect.reservedBalance().amount()).isEqualTo(new BigDecimal("250.00"));
+        // The row's own after-state is asserted, not just its amount: a consumer derives the signed delta from
+        // consecutive available_after/reserved_after values (AAP 0.6.3), so a single-leg transition's row has to
+        // carry the pair the transition ended on.
         assertThat(effect.ledgerEffects())
-                .extracting(LedgerEffect::eventType, ledger -> ledger.amount().amount())
-                .containsExactly(tuple(LedgerEventType.HOLD, new BigDecimal("250.00")));
+                .extracting(LedgerEffect::eventType, ledger -> ledger.amount().amount(),
+                        ledger -> ledger.availableAfter().amount(),
+                        ledger -> ledger.reservedAfter().amount())
+                .containsExactly(tuple(LedgerEventType.HOLD, new BigDecimal("250.00"),
+                        new BigDecimal("750.00"), new BigDecimal("250.00")));
         assertThat(effect.idempotentNoOp()).isFalse();
     }
 
@@ -109,9 +115,14 @@ class ReservationStateMachineTest {
         assertThat(effect.resultingState()).isEqualTo(ReservationState.SETTLED);
         assertThat(effect.availableBalance().amount()).isEqualTo(new BigDecimal("750.00"));
         assertThat(effect.reservedBalance().amount()).isEqualTo(new BigDecimal("0.00"));
+        // One leg, so its snapshot is the transition's own pair: the settled amount is the fall in reserved and
+        // available does not move.
         assertThat(effect.ledgerEffects())
-                .extracting(LedgerEffect::eventType, ledger -> ledger.amount().amount())
-                .containsExactly(tuple(LedgerEventType.SETTLEMENT, new BigDecimal("250.00")));
+                .extracting(LedgerEffect::eventType, ledger -> ledger.amount().amount(),
+                        ledger -> ledger.availableAfter().amount(),
+                        ledger -> ledger.reservedAfter().amount())
+                .containsExactly(tuple(LedgerEventType.SETTLEMENT, new BigDecimal("250.00"),
+                        new BigDecimal("750.00"), new BigDecimal("0.00")));
         assertThat(effect.idempotentNoOp()).isFalse();
     }
 
@@ -129,11 +140,18 @@ class ReservationStateMachineTest {
         assertThat(effect.availableBalance().amount()).isEqualTo(new BigDecimal("900.00"));
         assertThat(effect.reservedBalance().amount()).isEqualTo(new BigDecimal("0.00"));
         // Order is part of the contract, not incidental: the ledger is append-only, so the pair of rows one
-        // partial settlement writes is read back in the order named here.
+        // partial settlement writes is read back in the order named here. Each row carries the state as of its
+        // own leg, which is what makes both stated amounts visible as deltas (AAP 0.6.3): the settled 100.00 is
+        // reserved falling 250.00 -> 150.00 with available untouched, then the 150.00 remainder is available
+        // rising 750.00 -> 900.00 as the rest of the hold leaves reserved.
         assertThat(effect.ledgerEffects())
-                .extracting(LedgerEffect::eventType, ledger -> ledger.amount().amount())
-                .containsExactly(tuple(LedgerEventType.SETTLEMENT, new BigDecimal("100.00")),
-                        tuple(LedgerEventType.RELEASE, new BigDecimal("150.00")));
+                .extracting(LedgerEffect::eventType, ledger -> ledger.amount().amount(),
+                        ledger -> ledger.availableAfter().amount(),
+                        ledger -> ledger.reservedAfter().amount())
+                .containsExactly(tuple(LedgerEventType.SETTLEMENT, new BigDecimal("100.00"),
+                                new BigDecimal("750.00"), new BigDecimal("150.00")),
+                        tuple(LedgerEventType.RELEASE, new BigDecimal("150.00"),
+                                new BigDecimal("900.00"), new BigDecimal("0.00")));
         assertThat(effect.idempotentNoOp()).isFalse();
     }
 
@@ -152,10 +170,17 @@ class ReservationStateMachineTest {
         assertThat(effect.resultingState()).isEqualTo(ReservationState.SETTLED);
         assertThat(effect.availableBalance().amount()).isEqualTo(new BigDecimal("1000.00"));
         assertThat(effect.reservedBalance().amount()).isEqualTo(new BigDecimal("0.00"));
+        // The zero SETTLEMENT leg moves nothing, so it repeats the balances the hold left, and the RELEASE leg
+        // alone shows the whole hold returning - the one case where two consecutive rows differ in exactly one
+        // of the two columns.
         assertThat(effect.ledgerEffects())
-                .extracting(LedgerEffect::eventType, ledger -> ledger.amount().amount())
-                .containsExactly(tuple(LedgerEventType.SETTLEMENT, new BigDecimal("0.00")),
-                        tuple(LedgerEventType.RELEASE, new BigDecimal("250.00")));
+                .extracting(LedgerEffect::eventType, ledger -> ledger.amount().amount(),
+                        ledger -> ledger.availableAfter().amount(),
+                        ledger -> ledger.reservedAfter().amount())
+                .containsExactly(tuple(LedgerEventType.SETTLEMENT, new BigDecimal("0.00"),
+                                new BigDecimal("750.00"), new BigDecimal("250.00")),
+                        tuple(LedgerEventType.RELEASE, new BigDecimal("250.00"),
+                                new BigDecimal("1000.00"), new BigDecimal("0.00")));
         assertThat(effect.idempotentNoOp()).isFalse();
     }
 
@@ -171,8 +196,11 @@ class ReservationStateMachineTest {
         assertThat(effect.availableBalance().amount()).isEqualTo(new BigDecimal("1000.00"));
         assertThat(effect.reservedBalance().amount()).isEqualTo(new BigDecimal("0.00"));
         assertThat(effect.ledgerEffects())
-                .extracting(LedgerEffect::eventType, ledger -> ledger.amount().amount())
-                .containsExactly(tuple(LedgerEventType.RELEASE, new BigDecimal("250.00")));
+                .extracting(LedgerEffect::eventType, ledger -> ledger.amount().amount(),
+                        ledger -> ledger.availableAfter().amount(),
+                        ledger -> ledger.reservedAfter().amount())
+                .containsExactly(tuple(LedgerEventType.RELEASE, new BigDecimal("250.00"),
+                        new BigDecimal("1000.00"), new BigDecimal("0.00")));
         assertThat(effect.idempotentNoOp()).isFalse();
     }
 
@@ -190,8 +218,11 @@ class ReservationStateMachineTest {
         assertThat(effect.availableBalance().amount()).isEqualTo(new BigDecimal("1000.00"));
         assertThat(effect.reservedBalance().amount()).isEqualTo(new BigDecimal("0.00"));
         assertThat(effect.ledgerEffects())
-                .extracting(LedgerEffect::eventType, ledger -> ledger.amount().amount())
-                .containsExactly(tuple(LedgerEventType.EXPIRY, new BigDecimal("250.00")));
+                .extracting(LedgerEffect::eventType, ledger -> ledger.amount().amount(),
+                        ledger -> ledger.availableAfter().amount(),
+                        ledger -> ledger.reservedAfter().amount())
+                .containsExactly(tuple(LedgerEventType.EXPIRY, new BigDecimal("250.00"),
+                        new BigDecimal("1000.00"), new BigDecimal("0.00")));
         assertThat(effect.idempotentNoOp()).isFalse();
     }
 

@@ -335,21 +335,22 @@ public class RoleEnforcementIT extends PostgresTestSupport {
         }
 
         @Test
-        void unqualifiedInstitutionalPathIsReadAsARetailOwner() throws JsonProcessingException {
-            // The exact two-segment path is what Spring MVC dispatches to the retail @GetMapping("/{owner}") as
-            // the owner INSTITUTIONAL - no institutional route is that short - so the read-only rule has to be the
-            // one that decides it. A 403 here would mean the institutional wildcard was consulted for a path that
-            // never reaches an institutional handler (AAP 0.7.5 rule order).
+        void unqualifiedInstitutionalPathIsAdmittedByTheRetailRuleAndRefusedByTheController()
+                throws JsonProcessingException {
+
+            // The exact two-segment path is what Spring MVC dispatches to the retail @GetMapping("/{owner}") - no
+            // institutional route is that short - so the read-only rule has to be the one that admits it. A 403
+            // here would mean the institutional wildcard was consulted for a path that never reaches an
+            // institutional handler (AAP 0.7.5 rule order), which is the property under test and is unchanged.
             ResponseEntity<String> response = strictRest.exchange("/cash-account/institutional", HttpMethod.GET,
                     new HttpEntity<>(jsonHeaders(JwtTestTokens.stockViewerToken())), String.class);
 
-            // Not the assertApiError helper: that one asserts the ownerless payload, and this 404 is the retail
-            // read's own ACCOUNT_NOT_FOUND, which names the owner it could not find.
-            assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
-
-            JsonNode error = json(response.getBody());
-            assertThat(error.path("code").asText()).isEqualTo("ACCOUNT_NOT_FOUND");
-            assertThat(error.path("owner").asText()).isEqualTo("INSTITUTIONAL");
+            // What the retail controller then does with it is the reservation: the segment belongs to the
+            // institutional surface, so it is refused as an unmapped path instead of being served as an account
+            // named INSTITUTIONAL. Before it was reserved, a POST here created that account and the GET served
+            // it - one path that was both a namespace and a retail resource. The payload is therefore the
+            // ownerless UNSUPPORTED_PATH, which is what assertApiError asserts.
+            assertApiError(response, HttpStatus.NOT_FOUND, "UNSUPPORTED_PATH");
         }
 
         @Test

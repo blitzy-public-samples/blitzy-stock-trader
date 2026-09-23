@@ -148,6 +148,36 @@ class OwnerNormalizerTest {
         assertThat(LogSafeText.ofMessage(null)).isNull();
     }
 
+    // The reservation of the institutional path segment, and the line it does not cross. The bare prefix
+    // /cash-account/institutional reaches the retail /{owner} mappings, where it used to create and serve a real
+    // account named INSTITUTIONAL; retail/RetailCashAccountController now refuses that ROUTE through this
+    // predicate. Identity is untouched on purpose: AAP 0.4.2 and 0.6.2 fix INVALID_OWNER to blank-or-over-32, so
+    // refusing the value as an owner would change which accounts can exist and would fail a whole
+    // single-transaction bulk load (AAP 0.6.3) over one legacy export row.
+    @Test
+    void recognizesTheReservedInstitutionalPathSegmentWithoutNarrowingOwnerIdentity() {
+        assertThat(OwnerNormalizer.INSTITUTIONAL_PATH_SEGMENT).isEqualTo("INSTITUTIONAL");
+
+        // Every casing and the padding of a CHAR(32) export column, because the retail path segment is matched
+        // case-sensitively by Spring MVC while the owner behind it is case-folded: reserving one spelling only
+        // would leave /cash-account/INSTITUTIONAL serving the account /cash-account/institutional refuses.
+        assertThat(OwnerNormalizer.isInstitutionalPathSegment("institutional")).isTrue();
+        assertThat(OwnerNormalizer.isInstitutionalPathSegment("INSTITUTIONAL")).isTrue();
+        assertThat(OwnerNormalizer.isInstitutionalPathSegment("Institutional")).isTrue();
+        assertThat(OwnerNormalizer.isInstitutionalPathSegment("  institutional  ")).isTrue();
+
+        // Nothing else is reserved - not a neighbouring owner, not a longer name that merely starts with it.
+        assertThat(OwnerNormalizer.isInstitutionalPathSegment("institutional-desk-7")).isFalse();
+        assertThat(OwnerNormalizer.isInstitutionalPathSegment("JOHN")).isFalse();
+        assertThat(OwnerNormalizer.isInstitutionalPathSegment("")).isFalse();
+        assertThat(OwnerNormalizer.isInstitutionalPathSegment(null)).isFalse();
+
+        // And the value is still a perfectly ordinary owner, which is what keeps the loader and the
+        // institutional endpoints able to carry it.
+        assertThat(OwnerNormalizer.normalize("institutional"))
+                .isEqualTo(OwnerNormalizer.INSTITUTIONAL_PATH_SEGMENT);
+    }
+
     @Test
     void rejectsNullAndBlankOwners() {
         assertThat(rejectionCodeFor(null)).isEqualTo(CashAccountErrorCode.INVALID_OWNER);

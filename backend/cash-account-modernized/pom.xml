@@ -320,6 +320,45 @@
                     </execution>
                 </executions>
             </plugin>
+            <!-- Packages docs/legacy-characterization.md into the artifact, as the one resource that comes
+                 from outside src/main/resources. MigrationToolRunner copies the document's "Status:" line into
+                 migration_run.characterization_status, and runbook Step 1's sign-off and Step 3's gates read
+                 that column; resolved only from the working directory, it silently degraded to DRAFT for every
+                 invocation started anywhere but the module root - the container included, since the image
+                 carries the jar alone. Carried inside the jar it answers wherever the artifact runs, and the
+                 document the value then describes is unambiguous: the revision this artifact was built from.
+                 A copy-resources execution rather than a <resources> block, because overriding <resources>
+                 would also drop the Spring Boot parent's application*.yml filtering configuration. Precedence
+                 in the runner keeps -Dcashaccount.characterization-doc and the working-directory copies ahead
+                 of this one, so a document signed ACCEPTED after the build still wins. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-resources-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>copy-characterization-document</id>
+                        <phase>process-resources</phase>
+                        <goals>
+                            <goal>copy-resources</goal>
+                        </goals>
+                        <configuration>
+                            <outputDirectory>${project.build.outputDirectory}/docs</outputDirectory>
+                            <resources>
+                                <resource>
+                                    <directory>${project.basedir}/docs</directory>
+                                    <includes>
+                                        <include>legacy-characterization.md</include>
+                                    </includes>
+                                    <!-- Never filtered: the document quotes COBOL and SQL verbatim, and
+                                         Maven's @...@ and ${...} delimiters would rewrite a citation into
+                                         whatever a property of that name happens to hold. -->
+                                    <filtering>false</filtering>
+                                </resource>
+                            </resources>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
             <!-- Parent-managed version accepted on purpose: backend/portfolio/pom.xml:L150-L153 pins
                  3.14.0, but overriding a BOM-managed plugin here would give this module a second version
                  authority for no benefit. -->

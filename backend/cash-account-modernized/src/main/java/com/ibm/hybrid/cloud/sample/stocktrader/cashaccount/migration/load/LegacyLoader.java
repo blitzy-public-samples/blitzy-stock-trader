@@ -109,9 +109,14 @@ public class LegacyLoader {
     // thread-safe.
     private final DelimitedExportReader exportReader;
 
-    private final Charset legacyCharset;
+    // Both held as inert text and resolved on use, never in the constructor: an unusable tool.legacy-charset or
+    // tool.legacy-timezone must reach an operator as MigrationToolRunner's one-line argument error, and resolving
+    // them during bean creation made that same message the innermost Caused-by of an 80-line refresh failure.
+    // The runner's dispatch passes its own validated values to the explicit load(...) below, so these two are
+    // read only by the convenience overload, whose caller declared no values of its own.
+    private final String configuredLegacyCharset;
 
-    private final ZoneId legacyTimeZone;
+    private final String configuredLegacyTimeZone;
 
     private final Integer historyRecordLength;
 
@@ -140,8 +145,9 @@ public class LegacyLoader {
     // BINDER, NEVER @Value, FOR ALL FOUR. A @Value placeholder is resolved and its RESOLVED TEXT is then handed to
     // Spring's expression resolver, so a code page, zone, record length or chunk size written as #{...} would
     // execute while this loader was being created. Binder resolves ${...} and converts, evaluating nothing, so a
-    // wrong value fails its own conversion or the checks below. It also drops the two inline #{null} defaults these
-    // parameters used to carry, since an unbound Integer is already the absent case the record-length rule needs.
+    // wrong value fails its own conversion, the chunk-size check below, or - for the code page and the zone - the
+    // invocation that would have decoded with it. It also drops the two inline #{null} defaults these parameters
+    // used to carry, since an unbound Integer is already the absent case the record-length rule needs.
     public LegacyLoader(CashAccountRepository accounts,
                         CashReservationRepository reservations,
                         LegacyHistoryRepository legacyHistory,
@@ -160,9 +166,9 @@ public class LegacyLoader {
         this.ledgerService = Objects.requireNonNull(ledgerService, "ledgerService");
         this.reconciliationService = Objects.requireNonNull(reconciliationService, "reconciliationService");
         this.exportReader = new DelimitedExportReader();
-        this.legacyCharset = charsetOf(
-                toolProperty(environment, LEGACY_CHARSET_PROPERTY, LegacyExportFormat.DEFAULT_LEGACY_CHARSET));
-        this.legacyTimeZone = zoneOf(toolProperty(environment, LEGACY_TIMEZONE_PROPERTY, null));
+        this.configuredLegacyCharset =
+                toolProperty(environment, LEGACY_CHARSET_PROPERTY, LegacyExportFormat.DEFAULT_LEGACY_CHARSET);
+        this.configuredLegacyTimeZone = toolProperty(environment, LEGACY_TIMEZONE_PROPERTY, null);
         this.historyRecordLength = integerProperty(environment, HISTORY_RECORD_LENGTH_PROPERTY);
         // Refused rather than defaulted away: a chunk size below one describes a batch that cannot exist,
         // which an operator must see at start-up and not halfway through a migration window.
@@ -298,8 +304,10 @@ public class LegacyLoader {
     public LoadResult load(MigrationRun run, Path inputDirectory) {
         Objects.requireNonNull(run, "run");
         Objects.requireNonNull(inputDirectory, "inputDirectory");
-        return load(run, LoadSources.inDirectory(inputDirectory), legacyCharset, legacyTimeZone,
-                historyRecordLength);
+        // Resolved here rather than at construction, so a code page or zone this JVM cannot use is refused by
+        // the invocation that would have decoded with it and not by the context that merely held it.
+        return load(run, LoadSources.inDirectory(inputDirectory), charsetOf(configuredLegacyCharset),
+                zoneOf(configuredLegacyTimeZone), historyRecordLength);
     }
 
     /**

@@ -110,14 +110,21 @@ public class LedgerService {
     // Called once per effect the state machine names, so a partial settlement lands as two rows - SETTLEMENT x
     // then RELEASE (amount - x) - in the one transaction. Nothing here chooses, collapses or reorders those
     // effects; the state machine is the single place that knows which a transition produces.
+    //
+    // The after-state is passed in rather than read off the aggregate, unlike the single-row overloads above: a
+    // transition may write more than one row while the aggregate holds only the pair the transition ended on, so
+    // reading it here gave a partial settlement's two rows one identical snapshot and left the RELEASE row
+    // stating a remainder whose derived delta was zero. Each effect therefore carries the balances as of its own
+    // leg, which is what AAP 0.6.3's "derive the delta from consecutive available_after/reserved_after values"
+    // requires; ReservationStateMachine.Effect asserts the last leg still matches the aggregate.
     @Transactional(propagation = Propagation.MANDATORY)
     public LedgerEntry append(CashAccount account, CashReservation reservation, LedgerEventType eventType,
-            Money amount, LedgerEntry.Source source) {
+            Money amount, Money availableAfter, Money reservedAfter, LedgerEntry.Source source) {
 
         Objects.requireNonNull(account, "account");
         Objects.requireNonNull(reservation, "reservation");
         return append(account.owner(), account.incarnationId(), eventType, amount, account.currency(),
-                account.availableBalance(), account.reservedBalance(), reservation.reservationId(),
+                availableAfter, reservedAfter, reservation.reservationId(),
                 reservation.orderReference(), source, null);
     }
 

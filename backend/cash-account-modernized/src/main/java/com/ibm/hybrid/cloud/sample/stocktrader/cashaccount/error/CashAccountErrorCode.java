@@ -60,6 +60,22 @@ public enum CashAccountErrorCode {
 
     UNSUPPORTED_METHOD(HttpStatus.METHOD_NOT_ALLOWED, "Method not supported for this resource."),
 
+    // The media-type pair, added for the same reason REQUEST_TOO_LARGE below was: the condition is a caller
+    // mistake that has to be reported, and the closed AAP 0.6.2 vocabulary can express it in no other way that
+    // stays true. Without them Spring's HttpMediaTypeNotSupportedException and HttpMediaTypeNotAcceptableException
+    // reach error/ApiExceptionHandler's catch-all and a wrong Content-Type or an unsatisfiable Accept is answered
+    // 500 INTERNAL - a client error reported as a server fault, which is the opposite of failing closed
+    // [backend/cash-account-cobol/COBOL/CASH00.cbl:L89-L102 is the fall-through this service exists to replace]
+    // and which puts an ERROR record in the log for every mis-configured integration attempt. Mapping them onto an
+    // existing 400 was rejected for the reason stated at REQUEST_TOO_LARGE: a 415 or 406 carrying a 400's code
+    // makes this enum's one-code-one-status binding untrue on the wire, and INVALID_AMOUNT would tell a caller its
+    // amount was wrong when the body was never parsed. error/FailClosedIT asserts both statuses and both codes.
+    UNSUPPORTED_MEDIA_TYPE(HttpStatus.UNSUPPORTED_MEDIA_TYPE,
+            "Request body media type is not supported; send application/json."),
+
+    NOT_ACCEPTABLE(HttpStatus.NOT_ACCEPTABLE,
+            "No acceptable representation; this service answers application/json."),
+
     // The one condition in this enum with no legacy counterpart and no entry in the AAP 0.6.2 error table: a
     // request body larger than any payload this service defines. It exists because a 413 cannot be reported
     // without it. Every other spare failure is mapped ONTO a constant that already exists, but the alternatives

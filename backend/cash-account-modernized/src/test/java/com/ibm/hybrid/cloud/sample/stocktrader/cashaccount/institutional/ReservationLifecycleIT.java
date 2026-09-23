@@ -404,19 +404,22 @@ class ReservationLifecycleIT extends PostgresTestSupport {
         LedgerEntryResponse release = releases.get(0);
         assertThat(settlement.amount()).isEqualByComparingTo(new BigDecimal("100.00"));
         assertThat(release.amount()).isEqualByComparingTo(new BigDecimal("150.00"));
+        // Each row carries the state as of its own leg, never the transition's end state twice: consumers read
+        // a signed delta off consecutive available_after/reserved_after values (AAP 0.6.3), so the settled
+        // 100.00 has to show as reserved 250.00 -> 150.00 with available unmoved, and the 150.00 remainder as
+        // available 750.00 -> 900.00 with the rest of the hold leaving reserved. Repeating the final pair on
+        // both rows would state the remainder against a derived delta of zero.
+        assertThat(settlement.availableAfter()).isEqualByComparingTo(new BigDecimal("750.00"));
+        assertThat(settlement.reservedAfter()).isEqualByComparingTo(new BigDecimal("150.00"));
         assertThat(release.availableAfter()).isEqualByComparingTo(new BigDecimal("900.00"));
         assertThat(release.reservedAfter()).isEqualByComparingTo(ZERO);
-        // Every row of one transition carries the same post-transition balances, so the pair is
-        // indistinguishable by balance and the event type, the amount and the identity are all that separate
-        // them - which is precisely why the query's tie-break has to be the identity.
-        assertThat(settlement.availableAfter()).isEqualByComparingTo(new BigDecimal("900.00"));
-        assertThat(settlement.reservedAfter()).isEqualByComparingTo(ZERO);
 
         // The primary half of the ordering contract, on the only transition that writes two rows at once:
         // entry_id is GENERATED ALWAYS AS IDENTITY and the rows are appended as the state machine named them -
         // SETTLEMENT then RELEASE - so under "recordedAt DESC, entryId DESC" (AAP 0.6.2) the RELEASE comes back
-        // first. recorded_at is stamped per row, so these two usually differ and the secondary entryId ordering
-        // is proved separately by theLedgerQueryBreaksARecordedAtTieOnTheEntryIdentity below.
+        // first. The identity is what the ordering rests on rather than the balances, which is why the tie-break
+        // is proved on identity: recorded_at is stamped per row, so these two usually differ and the secondary
+        // entryId ordering is proved separately by theLedgerQueryBreaksARecordedAtTieOnTheEntryIdentity below.
         assertThat(settlement.entryId()).isNotNull();
         assertThat(release.entryId()).isNotNull();
         assertThat(release.entryId()).isGreaterThan(settlement.entryId());

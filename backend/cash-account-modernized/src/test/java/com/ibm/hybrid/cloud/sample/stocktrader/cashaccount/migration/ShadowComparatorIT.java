@@ -37,6 +37,7 @@ import org.springframework.context.annotation.Primary;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.mock.env.MockEnvironment;
 
+import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.error.CashAccountErrorCode;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.fx.ExchangeRateSource;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.fx.LegacyRateTableSource;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.migration.load.LegacyLoader;
@@ -99,6 +100,12 @@ class ShadowComparatorIT extends PostgresTestSupport {
     /** GREG's balance after the same credit priced at the corpus rate of 0.79, which is what the target replays. */
     private static final BigDecimal TARGET_GBP_BALANCE = new BigDecimal("123535.78");
 
+    // Two more GBP rates for the staging-resolution phase, distinct from each other, from the corpus rate and
+    // from the live phase's, so an assertion naming one of them can only be satisfied by the load that staged it.
+    private static final BigDecimal OLDER_LOAD_GBP_RATE = new BigDecimal("0.30");
+
+    private static final BigDecimal NEWER_LOAD_GBP_RATE = new BigDecimal("0.40");
+
     @Autowired
     private ShadowComparator shadowComparator;
 
@@ -141,6 +148,10 @@ class ShadowComparatorIT extends PostgresTestSupport {
 
     @Autowired
     private StagedLegacyRateSource stagedRates;
+
+    // The run the current test's corpus load staged its rates under, so a phase that repoints the staged source
+    // can hand it back and leave the reset's state for whatever runs after it.
+    private UUID corpusStagingRunId;
 
     // The drift guard of AAP 0.10.1: the fixtures' expected values come from the characterization document's
     // formula, so a run against a missing or gutted document would assert arithmetic with no authority behind it.
@@ -186,6 +197,8 @@ class ShadowComparatorIT extends PostgresTestSupport {
         assertThat(legacyRates.findByRunId(corpusLoad.runId()))
                 .as("the staged USD/EUR/GBP rates are what the cross-currency replays are priced from")
                 .hasSize(CORPUS_RATES);
+
+        this.corpusStagingRunId = corpusLoad.runId();
 
         // A staged rate source is wired in because profile test's only ExchangeRateSource bean is the live client
         // pointed at the refused port 127.0.0.1:1 (application-test.yml), so the GREG (GBP) and ERIC (EUR) replays
@@ -388,8 +401,124 @@ class ShadowComparatorIT extends PostgresTestSupport {
                 .isEqualTo(1);
 
         malformedCaptureIsRecordedWithAnExplicitAbsenceToken();
+        stagedRateLookupFallsBackToTheSchemasLatestCompletedLoad();
+        anUnpriceableCrossCurrencyLineStaysAnOutstandingVariance();
         lostWindowKeepsItsProgressAndItsCommittedFindings();
         liveExplanationResolvesTheBatchsCompletedLoadAndNotANewerRunningOne();
+    }
+
+    /**
+     * A window whose own batch holds no load prices from the schema's most recent completed load, while a batch
+     * that does hold one still resolves to it.
+     */
+    // The dual-run step replays one window per invocation, each with its own --tool.batch-id (AAP 0.3.3 Step 2),
+    // so the staged rates a cross-currency replay must be priced from were staged by the migration step's load
+    // under a different batch. Resolving the batch alone made every such window fail for want of a rate, and the
+    // window then closed clean having priced nothing. Driven through the production LegacyRateTableSource's
+    // interface method - the one the replay reaches through ToolExchangeRateSource - because that method's own
+    // resolution is what changed; the run-explicit overload the class's test double uses never consults a batch.
+    // started_at is pinned rather than left to two consecutive clock reads, so "most recent" is a fact of the
+    // rows and not of the clock's granularity.
+    private void stagedRateLookupFallsBackToTheSchemasLatestCompletedLoad() {
+        UUID olderBatch = UUID.randomUUID();
+        UUID newerBatch = UUID.randomUUID();
+        UUID olderLoad = completedLoadStagingGbpRate(olderBatch, OLDER_LOAD_GBP_RATE, 120);
+        UUID newerLoad = completedLoadStagingGbpRate(newerBatch, NEWER_LOAD_GBP_RATE, 60);
+
+        assertThat(migrationRuns.findLatestCompletedLoadInSchema().map(MigrationRun::runId))
+                .as("the schema's most recent completed load is the one started later")
+                .contains(newerLoad);
+
+        // A window's own batch, holding no load at all: the documented shape, and the one that used to price
+        // nothing. It resolves the newer of the two, which is the state a Step 1 load leaves behind.
+        assertThat(rateSourceForBatch(UUID.randomUUID()).rate("USD", "GBP"))
+                .as("a window whose batch holds no load prices from the schema's latest completed load")
+                .isEqualByComparingTo(NEWER_LOAD_GBP_RATE);
+
+        // And the batch-scoped resolution is untouched: naming the older batch prices from ITS load even though
+        // a newer completed load exists, which is what keeps a reconcile judging the load it names (AAP 0.6.3).
+        assertThat(rateSourceForBatch(olderBatch).rate("USD", "GBP"))
+                .as("a batch that holds a completed load still resolves to it, newer loads notwithstanding")
+                .isEqualByComparingTo(OLDER_LOAD_GBP_RATE);
+        assertThat(olderLoad).isNotEqualTo(newerLoad);
+    }
+
+    /**
+     * A cross-currency line the target could not price: recorded as an outstanding {@code VARIANCE}, so the
+     * window's variance count and exit code both move.
+     */
+    // The dual-run gate is "zero VARIANCE rows for N consecutive windows" (AAP 0.3.3 Step 2), and
+    // EXCHANGE_RATE_UNAVAILABLE used to be classified as an authorized deviation - which made a window in which
+    // every cross-currency transaction went unpriced indistinguishable from one in which every balance agreed.
+    // A captured legacy reply that succeeded proves the legacy HAD its rate, so a target that cannot price the
+    // same line is reporting its own environment and not a characterized difference in behaviour.
+    private void anUnpriceableCrossCurrencyLineStaysAnOutstandingVariance() {
+        BigDecimal beforeReplay = balanceOf("GREG");
+
+        // A staging run that staged nothing, which is what an unresolvable rate looks like from the service's
+        // side: LegacyRateTableSource finds no FRANKFURT1 row and the replay is refused 503, balance untouched.
+        stagedRates.useStagingRun(UUID.randomUUID());
+
+        UUID runId = UUID.randomUUID();
+        MigrationRun run = migrationRuns.save(MigrationRun.start(runId, UUID.randomUUID(),
+                MigrationRun.Mode.SHADOW, IN_MEMORY_WINDOW, MigrationRun.CharacterizationStatus.DRAFT));
+
+        int variances = shadowComparator.compare(run,
+                List.of(new ShadowTransaction(1L, "GREG", "C", new BigDecimal("100.00"), "GBP")),
+                List.of(new ShadowLegacyResponse(1L, "GREG", SUCCESS_RETCODE, TARGET_GBP_BALANCE)));
+
+        assertThat(variances)
+                .as("an unpriced cross-currency line must raise the window's variance count, and with it the"
+                        + " exit code the Step 2 gate reads")
+                .isEqualTo(1);
+
+        List<MigrationReconciliation> rows = findingsOfRun(runId);
+        assertThat(rows).as("the window's only finding").hasSize(1);
+
+        MigrationReconciliation refused = row(rows, "GREG", VarianceKind.REJECTED_BY_TARGET);
+        assertThat(refused.status())
+                .as("a rate the target could not obtain is an outstanding difference, not an accepted one")
+                .isEqualTo(ReconciliationStatus.VARIANCE);
+        assertThat(refused.migratedValue()).isEqualTo(CashAccountErrorCode.EXCHANGE_RATE_UNAVAILABLE.name());
+        assertThat(refused.legacyBalance()).isEqualByComparingTo(TARGET_GBP_BALANCE);
+        assertThat(refused.migratedBalance())
+                .as("the target produced no balance to compare")
+                .isNull();
+        assertThat(balanceOf("GREG"))
+                .as("a refused credit leaves the balance exactly as it was")
+                .isEqualByComparingTo(beforeReplay);
+
+        // Handed back so any phase after this one prices from the corpus again, exactly as the reset left it.
+        stagedRates.useStagingRun(corpusStagingRunId);
+    }
+
+    /**
+     * Saves a completed {@code LOAD} run with one staged GBP rate, at a pinned start time.
+     *
+     * @param batchId         the batch the load belongs to
+     * @param gbpRate         the {@code RATES} value staged under it
+     * @param secondsBackdated how far before now its {@code started_at} is pinned
+     * @return the run id of the completed load
+     */
+    // The rate row is inserted rather than loaded from a file for the reason the live-mode phase gives: no
+    // committed fixture may carry a rate that contradicts the corpus it ships beside. started_at is pinned in the
+    // same statement because the selector under test orders by it.
+    private UUID completedLoadStagingGbpRate(UUID batchId, BigDecimal gbpRate, int secondsBackdated) {
+        MigrationRun load = MigrationRun.start(UUID.randomUUID(), batchId, MigrationRun.Mode.LOAD,
+                IN_MEMORY_WINDOW, MigrationRun.CharacterizationStatus.DRAFT);
+        load.finish(MigrationRun.Status.CLEAN, 1, 1, 0);
+        migrationRuns.save(load);
+        jdbcTemplate.update("UPDATE migration_run SET started_at = now() - make_interval(secs => ?)"
+                + " WHERE run_id = ?", secondsBackdated, load.runId());
+        jdbcTemplate.update("INSERT INTO legacy_rate_table (run_id, currnkey, currnbase, amount, rates)"
+                + " VALUES (?, 'GBP', 'USD', 1.00, ?)", load.runId(), gbpRate);
+        return load.runId();
+    }
+
+    // The production source as a shadow window reaches it: bound to one --tool.batch-id through an Environment,
+    // exactly as the container binds it, so the resolution under test is its own and not this test's.
+    private LegacyRateTableSource rateSourceForBatch(UUID batchId) {
+        return new LegacyRateTableSource(legacyRates, migrationRuns, batchId.toString());
     }
 
     /**
@@ -719,9 +848,9 @@ class ShadowComparatorIT extends PostgresTestSupport {
             UUID staged = stagingRunId;
             if (staged == null) {
                 // Deliberately not the module's rate-unavailable exception: the service layer would translate a
-                // rate outage into 503 EXCHANGE_RATE_UNAVAILABLE, which the comparator classifies as an
-                // authorized deviation, so a misconfigured harness would record a quiet ACCEPTED_EXCEPTION row
-                // instead of failing loudly.
+                // rate outage into 503 EXCHANGE_RATE_UNAVAILABLE, which the comparator records as a finding of
+                // the window under test, so a harness that had simply not declared its staging run would report
+                // as a product variance instead of failing loudly here.
                 throw new IllegalStateException(
                         "no staging run has been declared for this test; the corpus load must run first");
             }

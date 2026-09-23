@@ -6,9 +6,12 @@ import java.util.LinkedHashSet;
 import java.util.Locale;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.regex.Pattern;
 
 import org.hibernate.exception.ConstraintViolationException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.context.properties.bind.Bindable;
 import org.springframework.boot.context.properties.bind.Binder;
@@ -54,6 +57,16 @@ public class RetailCashAccountService {
     // A bound rather than a while(true): a cycle in an exception chain must not turn a rejected create into a
     // hung request thread.
     private static final int MAX_CAUSE_DEPTH = 10;
+
+    // Stripes that serialize concurrent creates of one owner (see create). A fixed array rather than a lock per
+    // owner: the create path is reachable with any owner a caller cares to name, so a map keyed by owner would
+    // grow with the names it is asked about and never shrink. Two owners sharing a stripe serialize with each
+    // other, which costs an administrative operation nothing.
+    private static final int CREATE_LOCK_STRIPES = 64;
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(RetailCashAccountService.class);
+
+    private final ReentrantLock[] createLocks = createLocks();
 
     private final CashAccountRepository accounts;
     private final CashReservationRepository reservations;
@@ -143,7 +156,6 @@ public class RetailCashAccountService {
     // as spelled (L158). Safe because broker maps only balance and currency out of the response
     // (backend/broker/src/main/java/com/ibm/hybrid/cloud/sample/stocktrader/broker/BrokerService.java:L364-L365,
     // L500-L501, L542-L543).
-    @Transactional
     public CashAccountResponse create(String owner, BigDecimal balance, String currency) {
 
         // Every validation precedes the first repository call: the legacy discovered bad input as an SQLCODE from
@@ -153,18 +165,61 @@ public class RetailCashAccountService {
         String normalizedCurrency = requireCurrency(normalizedOwner, currency);
         Money openingBalance = requireBalance(normalizedOwner, balance);
 
+        // Concurrent creates of ONE owner are serialized here instead of being left to collide on the primary
+        // key. Either way the callers are answered identically - one 200, a 409 for each of the rest - but a
+        // collision is not free: the loser's INSERT reaches PostgreSQL, returns SQLSTATE 23505, and Hibernate
+        // narrates it on the way out at ERROR, with the whole INSERT and the constraint name, before this class
+        // can map it to 409. Five simultaneous creates of one owner produced twelve such ERROR records, so
+        // ordinary client behaviour arrived in the log at the level operators alert on.
+        //
+        // The lock is taken out HERE, around a transactional call, rather than inside createOnce: it has to
+        // outlive that transaction's commit, which happens as the proxied call returns. Released any earlier and
+        // the next caller would read before the winner's row was visible, find nothing, and collide exactly as
+        // before. This bounds one JVM; a second replica racing the same owner still collides, and the catch in
+        // createOnce stays as that backstop.
+        ReentrantLock creationLock = createLocks[Math.floorMod(normalizedOwner.hashCode(), CREATE_LOCK_STRIPES)];
+        creationLock.lock();
+        try {
+            return self.createOnce(normalizedOwner, normalizedCurrency, openingBalance);
+        } finally {
+            creationLock.unlock();
+        }
+    }
+
+    /**
+     * The transactional unit of {@link #create}: refuses an existing owner, inserts the account and appends its
+     * {@code ACCOUNT_CREATED} ledger row.
+     *
+     * <p>Public only because a transactional method has to be entered through the Spring proxy - reached as a
+     * plain {@code this.createOnce(...)} call it would run with no transaction at all, which is why
+     * {@link #create} calls it through {@code self}. It is the inner half of one operation rather than a second
+     * way in: {@link #create} validates its arguments and serializes same-owner callers first, and the owner is
+     * normalized again here so the method is safe by itself.</p>
+     *
+     * @param owner          the owner, normalized again here at no cost
+     * @param currency       the validated, normalized account currency
+     * @param openingBalance the validated opening available balance
+     * @return the created account's wire shape
+     * @throws CashAccountException {@link CashAccountErrorCode#ACCOUNT_ALREADY_EXISTS} (409) when the owner
+     *         already exists - whether this transaction read it or another instance inserted it concurrently -
+     *         and {@link CashAccountErrorCode#INVALID_OWNER} (400) for an owner that is not usable at all
+     */
+    @Transactional
+    public CashAccountResponse createOnce(String owner, String currency, Money openingBalance) {
+        String normalizedOwner = requireOwner(owner);
+
         if (accounts.existsByOwner(normalizedOwner)) {
             throw CashAccountException.forOwner(CashAccountErrorCode.ACCOUNT_ALREADY_EXISTS, normalizedOwner);
         }
 
-        CashAccount account = CashAccount.open(normalizedOwner, normalizedCurrency, openingBalance);
+        CashAccount account = CashAccount.open(normalizedOwner, currency, openingBalance);
 
-        // saveAndFlush, not save: existsByOwner above is not atomic, so two concurrent creates of one owner can
-        // both pass it, and flushing here turns the loser's primary-key collision - the modern equivalent of the
-        // legacy INSERT's -803 (AAP 0.12.3) - into a failure at this line instead of an opaque one at commit,
-        // after the method has returned 200. The collision arises at all because domain/CashAccount declares a
-        // nullable @Version, which makes Spring Data INSERT rather than merge; a merge would have overwritten the
-        // winner's row.
+        // saveAndFlush, not save: the stripe lock in create serializes this JVM but not the estate, so two
+        // instances can still pass existsByOwner for one owner, and flushing here turns the loser's primary-key
+        // collision - the modern equivalent of the legacy INSERT's -803 (AAP 0.12.3) - into a failure at this
+        // line instead of an opaque one at commit, after the method has returned 200. The collision arises at all
+        // because domain/CashAccount declares a nullable @Version, which makes Spring Data INSERT rather than
+        // merge; a merge would have overwritten the winner's row.
         try {
             account = accounts.saveAndFlush(account);
         } catch (DataIntegrityViolationException cause) {
@@ -176,6 +231,14 @@ public class RetailCashAccountService {
             if (!isOwnerPrimaryKeyCollision(cause)) {
                 throw cause;
             }
+            // Reaching here means another INSTANCE inserted this owner while this transaction was open - the
+            // chart runs a single replica (values.yaml cashAccount.replicas), so in practice a rolling update or
+            // a scaled-out release. Recorded because a race worth serializing is worth knowing about, at INFO
+            // because the caller is answered correctly, and without the owner: ApiExceptionHandler logs this
+            // exception's owner through its own encoder, and an unencoded second copy of caller input is how a
+            // log record gets forged.
+            LOGGER.info("A concurrent create in another instance won the owner primary key; answering 409 {}",
+                    CashAccountErrorCode.ACCOUNT_ALREADY_EXISTS.name());
             throw CashAccountException.forOwner(CashAccountErrorCode.ACCOUNT_ALREADY_EXISTS, normalizedOwner, null,
                     cause);
         }
@@ -577,5 +640,16 @@ public class RetailCashAccountService {
             throw new IllegalArgumentException(name + " is required");
         }
         return collaborator;
+    }
+
+    // Allocated once, in the field initializer, so every request path finds the same stripe for an owner: locks
+    // created lazily would each have to be published safely, and a lock two callers reach by different instances
+    // serializes nothing.
+    private static ReentrantLock[] createLocks() {
+        ReentrantLock[] locks = new ReentrantLock[CREATE_LOCK_STRIPES];
+        for (int stripe = 0; stripe < locks.length; stripe++) {
+            locks[stripe] = new ReentrantLock();
+        }
+        return locks;
     }
 }

@@ -756,7 +756,8 @@ traffic on the line.
    runs with `spring.sql.init.mode=always` and
    `spring.sql.init.schema-locations=classpath:schema/cash-account-schema.sql`
    (`../src/main/resources/application.yml`), so every start creates the seven tables, the
-   `ledger_entry_reject()` function and the `ledger_entry_immutable` trigger in whatever schema the
+   `ledger_entry_reject()` function and the `ledger_entry_immutable` and `ledger_entry_immutable_truncate`
+   triggers in whatever schema the
    connection resolves to. Against the selected store that would mutate it, void the `cashaccount`
    baseline captured moments earlier, and put a `cash_account` into production before Step 3(b) — the
    one thing Step 0 exists to rule out. Nor is "turn the initializer off" the alternative:
@@ -1438,6 +1439,14 @@ caller, which is exactly its value: it measures agreement on real traffic patter
 - **The comparator runs against the rehearsal schema**, reached the same way as in Step 1
   (`--spring.datasource.hikari.schema=cash_account_rehearsal`), reloaded from the latest accepted
   export so the replay starts from the balances Step 1 signed off.
+- **Step 1's `load` is the run that prices this step's cross-currency replays.** Under
+  `tool.rate-source=legacy-table` the expected values come from the staged `frankfurt1` rows, which
+  belong to a `load` run — and a window carries its own batch id, so its batch holds no load of its
+  own. The window therefore resolves the completed `load` of its batch id when there is one and
+  otherwise **the most recent completed load in the schema**, which in the rehearsal schema is Step 1's.
+  Nothing extra is passed for this; what it requires is that Step 1's load be the newest completed load
+  in that schema when the window runs, and the window's log states which run it used (captured below).
+  Passing Step 1's batch id instead of a fresh one pins it explicitly and is equally valid.
 - **An agreed window definition and an agreed number of consecutive clean windows**, recorded before
   the first window runs. Deciding "how many is enough" after seeing the results is not a gate.
 
@@ -1459,6 +1468,19 @@ echo "shadow-compare exit=$?"
 `<window-dir>` holds that window's `transactions.csv` and `legacy-responses.csv`. The comparator
 replays each transaction through the service layer directly and writes a `migration_reconciliation`
 row for every disagreement, summarized by the window's `migration_run`.
+
+Capture the staging line the window logs — one of
+
+```text
+Legacy rate lookups resolve against staging run <run> of batch <batch>
+Batch <batch> holds no completed load, so legacy rate lookups resolve against staging run <run> of batch <batch> - this schema's most recent completed load
+```
+
+— and confirm the named run is Step 1's load. It is what makes the window's expected values attributable:
+a window whose replays were priced from a load nobody signed off measures parity against rates nobody
+accepted. If the schema holds **no** completed load, each cross-currency line is recorded
+`REJECTED_BY_TARGET / VARIANCE` with migrated value `EXCHANGE_RATE_UNAVAILABLE` and the window exits `2`
+— an unpriced window fails rather than reporting agreement it never measured.
 
 Windows are run **in capture order**, and a window is reviewed before the next one runs. A defect found
 in window *n* invalidates the clean windows after it, so running ahead of the review only creates work
@@ -1499,7 +1521,7 @@ SELECT v.variance_kind, v.status, count(*) AS row_count
 
 | Item | Class | What it is |
 | --- | --- | --- |
-| `step2-windows.txt` | change record | One `migration_run` row per window, in capture order, with `variance_count` and exit code |
+| `step2-windows.txt` | change record | One `migration_run` row per window, in capture order, with `variance_count`, exit code and the staging line naming the `load` run that priced the window |
 | `step2-review.txt` | **restricted** | Every `RATE_SOURCE` and `REJECTED_BY_TARGET` row, each either accepted with a written reason or traced to a defect with its defect reference. Per-owner variance rows, read in the store by the reviewer |
 | `step2-review-summary.txt` | change record | The roll-up query's counts by `variance_kind` × `status`, the SHA-256 of `step2-review.txt` as it was reviewed, and the review's verdict per kind — the acceptances and the defect references, without the owners they were found on |
 | `step2-window-definition.txt` | change record | The agreed window boundaries and the agreed number of consecutive clean windows, recorded before the first window ran |
@@ -1513,6 +1535,12 @@ The pass condition is **zero `VARIANCE` rows across the agreed number of consecu
 passes either: each one is reviewed individually. A `REJECTED_BY_TARGET` row is the expected shape of a
 deliberate behavioural improvement — the legacy program stored the absolute value of a negative result
 where this service answers `422 INSUFFICIENT_FUNDS` — and confirming that is what the review is for.
+Those rows carry status `ACCEPTED_EXCEPTION` and so do not count toward `variance_count`. One class of
+refusal deliberately does: a line whose migrated value is `EXCHANGE_RATE_UNAVAILABLE` is recorded
+`VARIANCE`, because the captured legacy reply succeeded with a computed balance and a target that cannot
+price the same line is reporting its own configuration — an unresolved staging load, an unreachable
+provider, a currency no staged row carries — rather than a characterized difference in behaviour. A
+window in which every cross-currency transaction went unpriced must fail this gate, not pass it.
 
 ### Sign-off required
 
@@ -1576,7 +1604,7 @@ actions in a fixed order, and it is the last point at which rollback is cheap.
   | --- | --- |
   | What it runs | The gate (b) `reconcile` invocation: `--spring.profiles.active=tool --tool.command=reconcile`, no schema override, from the image **digest** Step 0 recorded. Never `load`: a scheduled load would write into the live tables |
   | Its input | The **frozen** final export of gate (b), copied whole — every file it contains plus `step3-export.sha256` beside them — onto a read-only volume the job can reach. `reconcile` opens only `cashaccounty.csv` and `frankfurt1.csv`, which is why `--tool.history-record-length` is neither passed nor needed; the history files travel with them so the checksum file verifies against a complete directory |
-  | Its baseline | The data owner's **`ACCEPTED`** characterization document, mounted and named with `-Dcashaccount.characterization-doc=<path>`. The image carries only `/deployments/app.jar`, and the tool looks for `docs/legacy-characterization.md` relative to its working directory: with neither present it records `characterization_status = 'DRAFT'`, which Step 1's rule — a `DRAFT` baseline is never accepted against a real export — forbids for these runs, since they read the real frozen export |
+  | Its baseline | The data owner's **`ACCEPTED`** characterization document, mounted and named with `-Dcashaccount.characterization-doc=<path>`. The jar carries a copy of the document as a classpath resource, which is the revision the image was built from and the value a run without the flag would record — so the flag is not a workaround for an image that carries nothing, it is what makes the recorded value the **signed** revision when the signature came after the build. Resolution order: the flag, then `docs/legacy-characterization.md` under the working directory, then the packaged copy, then `DRAFT`. A `DRAFT` value is what Step 1's rule — a `DRAFT` baseline is never accepted against a real export — forbids for these runs, since they read the real frozen export |
   | Input verification | `sha256sum -c` on both mounts before each run, so an input or a baseline that was replaced, truncated or partially copied fails the run instead of producing a clean one |
   | Input refresh | **None, by design.** Legacy writes are frozen at gate (a), so there is nothing new to export; and a refreshed export would be a different baseline, against which the watermark `W` recorded at gate (d) would mean nothing |
   | Cadence | Hourly for the first six hours after gate (f), then every six hours until the rollback window closes. Another cadence is permitted and must be recorded in the change record **before** gate (e); one slower than the interval at which the rollback decision is revisited is not, because a criterion that is only evaluated after the window has closed is not a criterion |
@@ -1721,7 +1749,8 @@ by whether gate (e) has been applied.
 
    ```bash
    BATCH_ID=<uuid>
-   java -jar /deployments/app.jar \
+   java -Dcashaccount.characterization-doc=/characterization/legacy-characterization.md \
+        -jar /deployments/app.jar \
         --spring.profiles.active=tool \
         --tool.command=load \
         --tool.input=<dir> \
@@ -1731,13 +1760,24 @@ by whether gate (e) has been applied.
         --tool.legacy-timezone=<region-zone>
    echo "load exit=$?"
 
-   java -jar /deployments/app.jar \
+   java -Dcashaccount.characterization-doc=/characterization/legacy-characterization.md \
+        -jar /deployments/app.jar \
         --spring.profiles.active=tool \
         --tool.command=reconcile \
         --tool.input=<dir> \
         --tool.batch-id="$BATCH_ID"
    echo "reconcile exit=$?"
    ```
+
+   `-Dcashaccount.characterization-doc` names the data owner's **signed** copy — the
+   `cash-account-characterization` configMap published under
+   [Preconditions](#preconditions-3), mounted at `/characterization` — and it is passed here for the same
+   reason the scheduled reconcile passes it: these runs read the real frozen export, and
+   `characterization_status` is read by (g3) and by Step 4's criteria. The jar carries a copy of the
+   document as a classpath resource, so a container run without the flag records the revision the
+   **image** was built from rather than degrading to `DRAFT`; the flag is what makes the recorded value
+   the signed revision when the signature came after the build. Resolution order is: this flag, then
+   `docs/legacy-characterization.md` under the working directory, then the packaged copy, then `DRAFT`.
 
    *Gate:* `variance_count = 0` on the reconcile run, **zero** `migration_reconciliation` rows with
    status `VARIANCE`, and both Step 0 catalog queries re-run against the Step 3(b) row of their gate
@@ -1807,7 +1847,11 @@ by whether gate (e) has been applied.
              valueFrom:
                configMapKeyRef: { name: <release>-config, key: oidc.jwksUrl, optional: true }
            # Carried so the validation workload is configured like the Deployment gate (e) creates,
-           # rather than falling back to the built-in default endpoint.
+           # rather than falling back to the built-in default endpoint. It must be an https URL
+           # naming a host, with no user-info credentials and no fragment: the client validates it
+           # in its constructor, so a plaintext endpoint fails start-up and this pod never reaches
+           # Ready, exactly as with a blank OIDC_JWKS_URL above. The refusal reads
+           # `cashaccount.fx.url (CURRENCY_API_URL) must use the https scheme, not http`.
            - name: CURRENCY_API_URL
              valueFrom:
                configMapKeyRef: { name: <release>-config, key: cashAccount.exchangeRateUrl }
@@ -2056,7 +2100,7 @@ by whether gate (e) has been applied.
    | `cashAccount.image.repository` | `<registry>/cash-account@sha256` — the first of the two values recorded in `step0-image-digest.txt`, verbatim | The digest is the only reference that cannot be re-pointed after validation, and the chart joins these two fields with a colon (`…/templates/cash-account.yaml:L65`), so the reference is carried as `repository` = the `@sha256` prefix and `tag` = the hex. The whole `sha256:<hex>` in `tag` renders an invalid reference and the pod never starts — see [`../README.md#carrying-the-digest-through-the-charts-fixed-repositorytag-rendering`](../README.md#carrying-the-digest-through-the-charts-fixed-repositorytag-rendering) |
    | `cashAccount.image.tag` | The 64-character hex digest, with **no** `sha256:` prefix — the second recorded value, verbatim | As above; the pair renders `<registry>/cash-account@sha256:<hex>` |
    | `cashAccount.url` | `http://{{ .Release.Name }}-cash-account-service:8080/cash-account` — the chart default — **if the snapshot differs** | This is the path the controllers are mapped at; broker reads it as `CASH_ACCOUNT_URL` (`…/templates/broker.yaml:L97-L102`) |
-   | `cashAccount.exchangeRateUrl` | Unchanged | Reaches the service as `CURRENCY_API_URL` (`…/templates/cash-account.yaml:L156-L160`) |
+   | `cashAccount.exchangeRateUrl` | Unchanged — and **an `https` URL** if this cutover changes it at all | Reaches the service as `CURRENCY_API_URL` (`…/templates/cash-account.yaml:L156-L160`), which `fx/FrankfurterExchangeRateClient` validates in its constructor: the value must use the `https` scheme, name a host, and carry no user-info credentials and no fragment. The refusal is a **start-up** failure — `cashaccount.fx.url (CURRENCY_API_URL) must use the https scheme, not http`, before the port is bound — so a plaintext rate mirror yields pods that never become Ready rather than a degraded rate lookup, and no property relaxes it (the rate multiplies into every cross-currency credit and debit and is written to the immutable ledger). See [`../README.md#currency_api_url-is-https-only-and-refused-at-start-up`](../README.md#currency_api_url-is-https-only-and-refused-at-start-up) |
    | `database.*` | **Not changed by this cutover** | The release is already on PostgreSQL as a Step 0 prerequisite, signed off separately, because these values are shared with portfolio |
    | `vault.enabled` | Remains `false` | The enabled branch injects Liberty container arguments a Spring Boot image cannot execute |
 
@@ -2522,7 +2566,8 @@ In order:
    which is the only thing this gate exists to prevent.
 
    **Why the high-water mark is the whole check.** `entry_id` is `GENERATED ALWAYS AS IDENTITY` and the
-   ledger is append-only — `UPDATE` and `DELETE` are rejected by the `ledger_entry_immutable` trigger
+   ledger is append-only — `UPDATE` and `DELETE` are rejected by the `ledger_entry_immutable` trigger and
+   `TRUNCATE` by `ledger_entry_immutable_truncate`
    ([`../src/main/resources/schema/cash-account-schema.sql`](../src/main/resources/schema/cash-account-schema.sql))
    — so an unchanged maximum across the interval *is* "no row was appended", and nothing a count could
    add is missing from it. The cost differs sharply, on the one table in this schema that only ever

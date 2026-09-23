@@ -226,8 +226,12 @@ public final class JwtTestTokens {
             Path file = directory.resolve("jwtsigner-test.pem");
             Files.writeString(file, pem, StandardCharsets.US_ASCII);
             restrictToOwner(file);
-            file.toFile().deleteOnExit();
+            // Registration order is load-bearing and must not be "tidied": File.deleteOnExit deletes in REVERSE
+            // registration order, and a directory deletion fails while the directory still holds a file. The
+            // directory is therefore registered first so that on exit the PEM is removed and then the emptied
+            // directory, leaving no residue on a long-lived CI worker (AAP 0.7.5).
             directory.toFile().deleteOnExit();
+            file.toFile().deleteOnExit();
             return file;
         } catch (IOException exception) {
             throw new IllegalStateException("Could not publish the ephemeral signer certificate.", exception);

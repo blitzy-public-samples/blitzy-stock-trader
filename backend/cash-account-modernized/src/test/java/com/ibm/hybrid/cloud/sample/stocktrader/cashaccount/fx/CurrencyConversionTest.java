@@ -5,12 +5,20 @@ import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
 import static org.assertj.core.api.Assertions.assertThatNoException;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.math.BigDecimal;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -29,6 +37,7 @@ import org.springframework.test.web.client.RequestMatcher;
 import org.springframework.test.web.client.ResponseCreator;
 import org.springframework.test.web.client.match.MockRestRequestMatchers;
 import org.springframework.test.web.client.response.MockRestResponseCreators;
+import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestClientException;
 
@@ -75,6 +84,20 @@ class CurrencyConversionTest {
 
     private static final String FORGED_LOG_LINE = "INFO forged-log-record-sentinel";
 
+    // How long the stalling provider of the last drive in this file withholds the rest of its answer: long enough
+    // that waiting it out could never be mistaken for the client's own budget, short enough that the fixture
+    // cannot hold a build if the connection outlives the assertion.
+    private static final Duration DRIP_STALL = Duration.ofSeconds(15);
+
+    // The budget that drive configures, deliberately far below the shipped PT2S so it costs a fraction of a
+    // second: what is under test is that the budget bounds the body phase at all, not the value application.yml
+    // sets, which that file owns.
+    private static final Duration DRIP_BUDGET = Duration.ofMillis(400);
+
+    // One read of the client's request line and headers is enough for the fixture, and nothing in its answer
+    // depends on their content.
+    private static final int REQUEST_HEAD_BYTES = 4096;
+
     private MockRestServiceServer server;
 
     private FrankfurterExchangeRateClient client;
@@ -86,9 +109,10 @@ class CurrencyConversionTest {
 
         // mutate() carries the configuration of the bean config/FxClientConfig actually publishes, so what the
         // assertions observe - above all the absence of any default header - is the deployed client's own shape
-        // rather than a lookalike assembled here. bindTo replaces the request factory, which is why no timeout is
-        // asserted in this file: FxClientConfig's connect and read budget is out of play once the transport is a
-        // recorder, and provoking a real timeout would need a real socket.
+        // rather than a lookalike assembled here. bindTo replaces the request factory but keeps the interceptor,
+        // so the size bound stays in the path here while the time bound cannot be: a recorder answers from a byte
+        // array and has nothing to stall on. The budget is therefore proven against a real socket, in the last
+        // drive in this file.
         RestClient.Builder builder = new FxClientConfig().fxRestClient(properties).mutate();
         server = MockRestServiceServer.bindTo(builder).bufferContent().build();
         client = new FrankfurterExchangeRateClient(builder.build(), FX_URL,
@@ -416,6 +440,83 @@ class CurrencyConversionTest {
                 // own shape, which is what distinguishes this from the transport bound above.
                 .withNoCause();
         server.verify();
+    }
+
+    @Test
+    void stalledAnswerIsBoundedByTheConfiguredBudgetAndNotByTheProvider() throws IOException {
+        CashAccountProperties properties = new CashAccountProperties();
+        properties.getFx().setTimeout(DRIP_BUDGET);
+
+        // The real bean, driven directly and over a real socket, because this is the one claim in this file a
+        // recorder cannot make: a read timeout on this transport is satisfied the moment the response HEADERS
+        // arrive, so a provider that sends a status line, a declared length, ten body bytes and then stops held a
+        // request thread for as long as it cared to - a 20 s stall was answered 200 after 20.04 s with the balance
+        // updated. config/FxClientConfig bounds the whole exchange with a deadline instead, so the configured
+        // budget covers connect, headers and body reception together and a stalled provider becomes the transport
+        // failure fx/FrankfurterExchangeRateClient retries once and then renders as 503 EXCHANGE_RATE_UNAVAILABLE
+        // with the balance untouched. Plain http here on purpose: the https rule lives in requireEndpoint, which
+        // this drive does not go through.
+        RestClient transport = new FxClientConfig().fxRestClient(properties);
+
+        AtomicReference<String> providerEnd = new AtomicReference<>("still stalling");
+        try (ServerSocket provider = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+            Thread stalling = new Thread(() -> stallAfterTheFirstBodyBytes(provider, providerEnd),
+                    "fx-stalling-provider");
+            // Daemon, so nothing this fixture holds can keep the test JVM alive if the client gives up first.
+            stalling.setDaemon(true);
+            stalling.start();
+
+            URI stalled = URI.create("http://" + provider.getInetAddress().getHostAddress() + ":"
+                    + provider.getLocalPort() + "/latest?from=USD&to=EUR");
+
+            long startedAt = System.nanoTime();
+            assertThatExceptionOfType(ResourceAccessException.class)
+                    .isThrownBy(() -> transport.get().uri(stalled).retrieve().body(String.class))
+                    // The message and not only the type: a fixture that died before answering would raise the same
+                    // type from an end of stream, while naming the budget can only be the deadline firing. The type
+                    // matters too - it is the one failure the client retries, an unreachable endpoint rather than a
+                    // settled answer.
+                    .satisfies(bounded -> assertThat(bounded.getMostSpecificCause())
+                            .isInstanceOf(IOException.class)
+                            .hasMessageContaining("cashaccount.fx.timeout"));
+            Duration waited = Duration.ofNanos(System.nanoTime() - startedAt);
+
+            // Far inside the stall rather than at the budget exactly: up to sixty-four agents share this host, and
+            // the claim is that the wait belongs to the client rather than to the provider, which a bound well
+            // under the stall makes as strongly as a tight one would.
+            assertThat(waited)
+                    .as("waited %s of the provider's %s stall, which ended %s", waited, DRIP_STALL,
+                            providerEnd.get())
+                    .isLessThan(DRIP_STALL.dividedBy(3));
+        }
+    }
+
+    // The provider of the finding: a status line, a JSON content type, a length that promises the whole answer,
+    // the first ten bytes of it and then nothing. It waits on the connection rather than sleeping, so the socket
+    // is released as soon as the client gives up on it, and its socket timeout ends the fixture even if the client
+    // never does.
+    private static void stallAfterTheFirstBodyBytes(ServerSocket provider, AtomicReference<String> end) {
+        try (Socket connection = provider.accept()) {
+            connection.setSoTimeout((int) DRIP_STALL.toMillis());
+            InputStream request = connection.getInputStream();
+            request.read(new byte[REQUEST_HEAD_BYTES]);
+
+            OutputStream answer = connection.getOutputStream();
+            answer.write(("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+                    + MINIMAL_ANSWER_BODY.length() + "\r\n\r\n"
+                    + MINIMAL_ANSWER_BODY.substring(0, 10)).getBytes(StandardCharsets.US_ASCII));
+            answer.flush();
+
+            int discarded = 0;
+            while (request.read() != -1) {
+                discarded++;
+            }
+            end.set("when the client closed the connection after " + discarded + " further request bytes");
+        } catch (IOException disconnected) {
+            // Recorded rather than swallowed, and never failed on: how this connection ends is the client's
+            // choice, so it belongs in the description of the assertion that measures the client instead.
+            end.set("with " + disconnected.getClass().getSimpleName());
+        }
     }
 
     // Message and cause chain together, exactly as a start-up failure is printed, so a value hidden one level down

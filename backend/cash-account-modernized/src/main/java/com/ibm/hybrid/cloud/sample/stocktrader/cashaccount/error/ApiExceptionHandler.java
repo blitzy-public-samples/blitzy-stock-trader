@@ -16,10 +16,13 @@ import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.security.access.AccessDeniedException;
 import org.springframework.security.core.AuthenticationException;
+import org.springframework.security.web.firewall.RequestRejectedException;
 import org.springframework.transaction.CannotCreateTransactionException;
 import org.springframework.validation.FieldError;
 import org.springframework.validation.method.ParameterErrors;
 import org.springframework.validation.method.ParameterValidationResult;
+import org.springframework.web.HttpMediaTypeNotAcceptableException;
+import org.springframework.web.HttpMediaTypeNotSupportedException;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.MissingRequestHeaderException;
@@ -32,6 +35,7 @@ import org.springframework.web.servlet.NoHandlerFoundException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 import java.util.List;
+import java.util.Locale;
 
 /**
  * Renders everything that escapes a controller, or that Spring MVC raises during dispatch, as one ApiError -
@@ -72,10 +76,19 @@ public class ApiExceptionHandler {
         if (code == CashAccountErrorCode.INTERNAL) {
             LOGGER.error("Internal failure handling a request for owner {}", owner, exception);
         } else if (code.status().is5xxServerError()) {
-            // The cause chain stays in the log and never in the response body, and this is the only place an
-            // exchange-rate or datastore failure is recorded: the fx client logs the same failure at DEBUG so
-            // one provider outage cannot cost two WARN records per request.
-            LOGGER.warn("Rejecting request for owner {}: {}", owner, code.code(), exception);
+            // One bounded line per rejection, and the throwable deliberately NOT passed: a characterized upstream
+            // failure is an expected outcome of a dependency being down, and an outage drives it on every request.
+            // Passing the exception made SLF4J render the whole stack, which measured 148-154 lines per rejection
+            // and 1,024 stack frames in a 1,105-line log - a third-party outage amplifying log volume ~150x per
+            // affected request, with each frame naming an internal class and line. The root cause's simple class
+            // name is what an operator actually needs to tell a refused connection from a timeout from an
+            // unparsable body; the frames that produced it stay one level down, at DEBUG.
+            //
+            // This is still the only place an exchange-rate or datastore failure is recorded at WARN: the fx
+            // client logs the same failure at DEBUG so one provider outage cannot cost two WARN records per
+            // request. The cause chain never reaches the response body in either branch.
+            LOGGER.warn("Rejecting request for owner {}: {} ({})", owner, code.code(), rootCauseType(exception));
+            LOGGER.debug("Rejecting request for owner {}: {}", owner, code.code(), exception);
         } else {
             LOGGER.debug("Rejecting request for owner {}: {} - {}", owner, code.code(),
                     LogSafeText.ofMessage(exception.getMessage()));
@@ -112,6 +125,57 @@ public class ApiExceptionHandler {
         return respond(ApiError.of(CashAccountErrorCode.UNSUPPORTED_METHOD), exception.getHeaders());
     }
 
+    // Fail closed for the same reason as the two handlers above. Without this mapping the commonest integration
+    // mistake against a JSON API - a wrong or absent Content-Type - was answered 500 INTERNAL with an ERROR
+    // record, reporting a caller's fault as a server fault and inviting an operator to chase a defect that was
+    // never in this service. The exception's own headers travel with the response because they carry Accept
+    // naming the media types this service does read, so the rejection teaches the contract instead of leaving it
+    // to be guessed. The retail seam is untouched: no retail mapping restricts the request media type, precisely
+    // because the caller declares @Consumes(APPLICATION_JSON) even on its body-less GET and DELETE
+    // [backend/broker/src/main/java/com/ibm/hybrid/cloud/sample/stocktrader/broker/client/CashAccountClient.java:L52,
+    // L73], so only a body no configured converter can read reaches here.
+    @ExceptionHandler(HttpMediaTypeNotSupportedException.class)
+    public ResponseEntity<ApiError> handleUnsupportedMediaType(HttpMediaTypeNotSupportedException exception) {
+        LOGGER.debug("Rejecting request: media type not supported - {}",
+                LogSafeText.ofMessage(exception.getMessage()));
+        return respond(ApiError.of(CashAccountErrorCode.UNSUPPORTED_MEDIA_TYPE), exception.getHeaders());
+    }
+
+    // The same condition on the response side, and 406 rather than 500 for the same reason. respond() setting the
+    // JSON content type explicitly is also what lets this body be written at all: with a concrete content type
+    // already on the response, Spring's converter selection uses it instead of renegotiating against the Accept
+    // header it could not satisfy, so the rejection answers in the one shape every consumer parses rather than
+    // failing a second time while being rendered.
+    @ExceptionHandler(HttpMediaTypeNotAcceptableException.class)
+    public ResponseEntity<ApiError> handleNotAcceptable(HttpMediaTypeNotAcceptableException exception) {
+        LOGGER.debug("Rejecting request: no acceptable representation - {}",
+                LogSafeText.ofMessage(exception.getMessage()));
+        return respond(ApiError.of(CashAccountErrorCode.NOT_ACCEPTABLE), exception.getHeaders());
+    }
+
+    // Spring Security's StrictHttpFirewall validates a header's VALUE lazily, when the application first reads it,
+    // so a value it refuses surfaces inside the dispatch as this advice's problem rather than at the filter chain
+    // - which is why an Idempotency-Key the firewall rejects needs a mapping here at all. Unhandled it was
+    // answered 500 INTERNAL and logged at ERROR with the caller's own value in the message and a stack beneath it,
+    // so one bad header let any caller mint unbounded ERROR records carrying text it chose (CWE-117 at the sink).
+    // 400 is the honest status: the firewall refused what the caller sent, nothing was read and no state moved.
+    //
+    // The code is chosen from the header the message names, and a misclassification cannot matter: both
+    // candidates are 400s in the same payload shape, so a caller that contrives to put the header's name inside
+    // another header's rejected value gains nothing by it. The message is overridden because this condition is
+    // "present but unusable" where the code's own wording says "absent".
+    @ExceptionHandler(RequestRejectedException.class)
+    public ResponseEntity<ApiError> handleRejectedRequest(RequestRejectedException exception) {
+        String message = exception.getMessage();
+        LOGGER.debug("Rejecting request: refused by the request firewall - {}", LogSafeText.ofMessage(message));
+        if (namesIdempotencyKey(message)) {
+            return respond(ApiError.of(CashAccountErrorCode.IDEMPOTENCY_KEY_REQUIRED,
+                    "The " + IDEMPOTENCY_KEY_HEADER + " header carries a value this service cannot accept."));
+        }
+        return respond(ApiError.of(CashAccountErrorCode.INVALID_QUERY,
+                "A request header carries a value this service cannot accept."));
+    }
+
     // The value's own name selects the code. One route in is live - an absent "?amount=" on retail debit or
     // credit - because every present-but-invalid value is parsed in code and arrives as a
     // CashAccountException instead, keeping each status inside the closed set its contract fixes. The other
@@ -133,8 +197,8 @@ public class ApiExceptionHandler {
     public ResponseEntity<ApiError> handleValidationFailure(Exception exception) {
         String field = offendingField(exception);
         CashAccountErrorCode code = codeForField(field);
-        LOGGER.debug("Rejecting request: validation failed on '{}' - {}", field, code.code());
-        return respond(ApiError.of(code));
+        LOGGER.debug("Rejecting request: validation failed on '{}' - {}", LogSafeText.of(field), code.code());
+        return respond(ApiError.of(code, validationMessage(code, field)));
     }
 
     // INVALID_AMOUNT is the closed code set's designated 400 for a body-binding failure; the set holds no
@@ -267,6 +331,55 @@ public class ApiExceptionHandler {
             return CashAccountErrorCode.INVALID_AMOUNT;
         }
         return CashAccountErrorCode.INVALID_QUERY;
+    }
+
+    // The payload names the offending field because the code alone cannot: every member with no code of its own
+    // falls to INVALID_AMOUNT below, so a missing or over-length orderReference was answered "Amount is missing,
+    // not a number, or not permitted for this operation" while the amount the caller sent was perfectly valid.
+    // An error naming the wrong field is worse than a generic one - it sends the caller to correct what is
+    // already correct. The closed code set is unchanged (AAP 0.6.2 defines no code for an invalid
+    // orderReference) and the status stays 400; only the sentence gains the field.
+    //
+    // Encoded for the payload and not only the log: a field name is this module's own record or parameter name
+    // today, but a validated map or nested-collection key would be the caller's, and an encoder applied only
+    // where the danger is already proven is a control with an expiry date.
+    private static String validationMessage(CashAccountErrorCode code, String field) {
+        if (!isNamed(field)) {
+            // Null, not a fabricated sentence: ApiError defaults a blank message to the code's own wording, so a
+            // violation that reports no field keeps answering exactly as it did.
+            return null;
+        }
+        String located = "Validation failed on '" + LogSafeText.of(field) + "'.";
+        // The code's own wording is kept only where the code was chosen FROM this field, because there it is
+        // guidance - "Currency must be a supported three-letter ISO code" is what the caller needs next. On the
+        // fallback it would be a false claim about a value the caller got right, which is the whole defect this
+        // message exists to close, so the field statement stands alone.
+        return codeNamesField(field) ? code.defaultMessage() + " " + located : located;
+    }
+
+    private static boolean codeNamesField(String field) {
+        return AMOUNT.equalsIgnoreCase(field) || CURRENCY.equalsIgnoreCase(field) || OWNER.equalsIgnoreCase(field);
+    }
+
+    private static boolean namesIdempotencyKey(String message) {
+        return message != null
+                && message.toLowerCase(Locale.ROOT).contains(IDEMPOTENCY_KEY_HEADER.toLowerCase(Locale.ROOT));
+    }
+
+    // Depth-bounded and self-reference-safe for the same reason oversizedBodyCause is: it runs while an error is
+    // being rendered, where a cause graph that references itself must not turn into a spin. The SIMPLE name only,
+    // because "SocketTimeoutException" or "ConnectException" is the whole diagnostic value a package-qualified
+    // name would carry, without putting internal structure into a record an operator may forward off-host.
+    private static String rootCauseType(Throwable exception) {
+        Throwable cause = exception;
+        for (int depth = 0; depth < MAX_CAUSE_DEPTH; depth++) {
+            Throwable next = cause.getCause();
+            if (next == null || next == cause) {
+                break;
+            }
+            cause = next;
+        }
+        return cause.getClass().getSimpleName();
     }
 
     private static CashAccountErrorCode codeForField(String field) {

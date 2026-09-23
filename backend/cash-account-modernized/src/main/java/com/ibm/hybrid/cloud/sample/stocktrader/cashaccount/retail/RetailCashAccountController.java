@@ -14,6 +14,7 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.domain.Money;
+import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.domain.OwnerNormalizer;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.error.CashAccountErrorCode;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.error.CashAccountException;
 
@@ -32,9 +33,11 @@ public class RetailCashAccountController {
 
     // The service is the only collaborator: owner normalization, validation, the rate lookup and every ledger
     // write live behind it, so migration/shadow/ShadowComparator replays identical behaviour with no HTTP layer in
-    // front of it and parity is judged against one implementation. The only thing taken from domain is Money's
-    // static input-size bound on the parsed amount parameter, applied where the untrusted text first becomes a
-    // number (AAP 0.8.2 permits retail to depend on domain).
+    // front of it and parity is judged against one implementation. Two things only are taken from domain
+    // (AAP 0.8.2 permits retail to depend on it), and both are decisions about the HTTP request rather than about
+    // the account: Money's static input-size bound on the parsed amount parameter, applied where the untrusted
+    // text first becomes a number, and OwnerNormalizer's canonicalization of the path segment, used to reserve
+    // the institutional prefix. Neither reaches the replay path, which has no paths and no query strings.
     public RetailCashAccountController(RetailCashAccountService service) {
         this.service = service;
     }
@@ -48,6 +51,7 @@ public class RetailCashAccountController {
     // @Produces(APPLICATION_JSON) with those annotations.
     @GetMapping("/{owner}")
     public CashAccountResponse getCashAccount(@PathVariable("owner") String owner) {
+        rejectReservedSegment(owner);
         return service.read(owner);
     }
 
@@ -75,6 +79,7 @@ public class RetailCashAccountController {
     public CashAccountResponse createCashAccount(@PathVariable("owner") String owner,
             @RequestBody CashAccountResponse body) {
 
+        rejectReservedSegment(owner);
         return service.create(owner, body.balance(), body.currency());
     }
 
@@ -82,11 +87,13 @@ public class RetailCashAccountController {
     public CashAccountResponse updateCashAccount(@PathVariable("owner") String owner,
             @RequestBody CashAccountResponse body) {
 
+        rejectReservedSegment(owner);
         return service.update(owner, body.balance(), body.currency());
     }
 
     @DeleteMapping("/{owner}")
     public CashAccountResponse deleteCashAccount(@PathVariable("owner") String owner) {
+        rejectReservedSegment(owner);
         return service.delete(owner);
     }
 
@@ -103,6 +110,7 @@ public class RetailCashAccountController {
     public CashAccountResponse debit(@PathVariable("owner") String owner,
             @RequestParam(name = "amount") String amount) {
 
+        rejectReservedSegment(owner);
         return service.debit(owner, parseAmount(amount));
     }
 
@@ -110,7 +118,27 @@ public class RetailCashAccountController {
     public CashAccountResponse credit(@PathVariable("owner") String owner,
             @RequestParam(name = "amount") String amount) {
 
+        rejectReservedSegment(owner);
         return service.credit(owner, parseAmount(amount));
+    }
+
+    // The institutional surface is "a separate, additive path space" under /cash-account (AAP 0.6.2), but its own
+    // first segment is one path segment long, so /cash-account/institutional and its /debit and /credit reach
+    // THESE mappings with owner "institutional". Unreserved that made the prefix a usable retail account: a POST
+    // created a row named INSTITUTIONAL and the GET and DELETE then served and removed it, so one path was both
+    // the institutional namespace and a retail resource. 404 UNSUPPORTED_PATH is the fail-closed answer the rest
+    // of this service already gives an unmapped path (AAP 0.4.3), and it is checked before the amount is parsed
+    // because a request to a path this seam does not serve is not a request with a bad amount.
+    //
+    // Reserved as a ROUTE and not as an identity: domain/OwnerNormalizer still normalizes this owner like any
+    // other, so the single-transaction bulk load (AAP 0.6.3) carries a legacy row named INSTITUTIONAL and the
+    // institutional endpoints - /cash-account/institutional/accounts/INSTITUTIONAL and its ledger - read it. What
+    // no longer exists is a way to create or serve it through the retail seam, which is the reservation's whole
+    // extent and its accepted cost.
+    private static void rejectReservedSegment(String owner) {
+        if (OwnerNormalizer.isInstitutionalPathSegment(owner)) {
+            throw CashAccountException.of(CashAccountErrorCode.UNSUPPORTED_PATH);
+        }
     }
 
     // Nothing here rescales or rounds the parsed value: domain/Money holds the module's single truncation point,

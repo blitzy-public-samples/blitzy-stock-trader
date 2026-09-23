@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.fail;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.FileSystemNotFoundException;
@@ -18,11 +19,16 @@ import org.junit.jupiter.api.Test;
 class CharacterizationDocPresentTest {
 
     /**
-     * Module-relative, because docs/ is not a resource root: getResource("/docs/legacy-characterization.md") is
-     * always null, so the document is resolved from the module directory. Written by another module file, never
-     * by this test.
+     * Module-relative: {@code docs/} is not a resource root, so the document is authored and read here from the
+     * module directory. Written by another module file, never by this test.
      */
     private static final String DOCUMENT_PATH = "docs/legacy-characterization.md";
+
+    /**
+     * The same document as a classpath resource, which pom.xml's {@code copy-characterization-document}
+     * execution puts there so the built artifact carries its own baseline.
+     */
+    private static final String DOCUMENT_RESOURCE = "/" + DOCUMENT_PATH;
 
     /** The file whose presence marks a candidate directory as this module's base directory. */
     private static final String MODULE_MARKER = "pom.xml";
@@ -131,6 +137,35 @@ class CharacterizationDocPresentTest {
     @Test
     void characterizationDocumentCarriesTheHeadingsTheConstantsQuote() {
         assertLoadBearingSectionHeadings(readCharacterizationDocument());
+    }
+
+    @Test
+    void characterizationDocumentIsPackagedWithTheArtifactAndMatchesTheAuthoredFile() {
+        // The document's trailing Status: line is copied into migration_run.characterization_status, which
+        // runbook Step 1's sign-off and Step 3's gates read. Resolved only from the working directory, it read
+        // DRAFT for every invocation started anywhere but the module root - and for every container run, the
+        // image carrying the jar alone - whatever the real document said. Packaged, the artifact answers the
+        // question wherever it runs, so the packaging is asserted here rather than trusted to the build file.
+        String packaged;
+        try (InputStream carried = CharacterizationDocPresentTest.class.getResourceAsStream(DOCUMENT_RESOURCE)) {
+            if (carried == null) {
+                packaged = fail(("the characterization document must be packaged at classpath:%s; pom.xml's "
+                        + "copy-characterization-document execution puts it there, and without it a tool run "
+                        + "outside the module directory records characterization_status DRAFT however the "
+                        + "document reads").formatted(DOCUMENT_RESOURCE));
+            } else {
+                packaged = new String(carried.readAllBytes(), StandardCharsets.UTF_8);
+            }
+        } catch (IOException e) {
+            packaged = fail("the packaged characterization document at classpath:%s could not be read as UTF-8"
+                    .formatted(DOCUMENT_RESOURCE), e);
+        }
+
+        // Byte-for-byte, not merely present: a stale copy would report a baseline the module no longer holds,
+        // which is worse than none at all because it is signable.
+        assertThat(packaged)
+                .as("the packaged copy must be the authored %s verbatim", DOCUMENT_PATH)
+                .isEqualTo(readCharacterizationDocument());
     }
 
     /**

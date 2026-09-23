@@ -24,6 +24,10 @@ class DataSourceGuardConfigTest {
     private static final String DATABASE = "trader";
     private static final String URL_BASE = "jdbc:postgresql://" + HOST + ":" + PORT + "/" + DATABASE;
 
+    // The driver bounds application.yml declares, appended to every URL the guard resolves: the pool's
+    // connection-timeout governs obtaining a connection, and only these two bound dialling and reading with one.
+    private static final String DRIVER_BOUNDS = "connectTimeout=2&socketTimeout=30";
+
     // The chart delivers cert_defaultTrustStore from the configMap's "ssl.certs" block scalar
     // [infra/stocktrader-operator/helm-charts/stocktrader/templates/config.yaml:L92-L93], so the value reaching
     // the service carries embedded newlines with no trailing one, and a single-line fixture would hide the
@@ -118,9 +122,11 @@ class DataSourceGuardConfigTest {
 
         assertThat(url).startsWith(URL_BASE + "?ssl=true&sslmode=verify-ca&sslrootcert=");
         assertThat(url).doesNotContain("sslfactory=");
+        assertThat(url).endsWith("&" + DRIVER_BOUNDS);
 
         String marker = "&sslrootcert=";
-        Path staged = Path.of(url.substring(url.indexOf(marker) + marker.length()));
+        String certificateAndBounds = url.substring(url.indexOf(marker) + marker.length());
+        Path staged = Path.of(certificateAndBounds.substring(0, certificateAndBounds.indexOf('&')));
         try {
             assertThat(staged).exists().isRegularFile();
             assertThat(Files.readString(staged, StandardCharsets.UTF_8)).isEqualTo(TRUST_STORE_PEM);
@@ -147,8 +153,42 @@ class DataSourceGuardConfigTest {
         String url = new DataSourceGuardConfig(new CashAccountProperties(), environment).resolveJdbcUrl();
 
         assertThat(url).isEqualTo(URL_BASE
-                + "?ssl=true&sslmode=verify-ca&sslfactory=org.postgresql.ssl.DefaultJavaSSLFactory");
+                + "?ssl=true&sslmode=verify-ca&sslfactory=org.postgresql.ssl.DefaultJavaSSLFactory&"
+                + DRIVER_BOUNDS);
         assertThat(url).doesNotContain("sslrootcert=");
+    }
+
+    // Both bounds exist because a database outage otherwise reaches a caller as a wait rather than as an answer:
+    // the pool's connection-timeout caps the wait for a connection, connectTimeout caps dialling for one, and
+    // socketTimeout is the only bound on a read that has already begun - pgJDBC leaves that one infinite.
+    @Test
+    void boundsDiallingAndReadingOnEveryAssembledUrlAndRefusesATimeoutTheDriverWouldReadAsUnbounded() {
+        assertThat(new DataSourceGuardConfig(new CashAccountProperties(), chartVariables()).resolveJdbcUrl())
+                .isEqualTo(URL_BASE + "?" + DRIVER_BOUNDS);
+
+        // A deployment retunes either bound with no chart change, through relaxed binding of the same key.
+        assertThat(new DataSourceGuardConfig(new CashAccountProperties(), chartVariables()
+                .withProperty("cashaccount.jdbc.connect-timeout", "PT5S")
+                .withProperty("cashaccount.jdbc.socket-timeout", "PT60S")).resolveJdbcUrl())
+                .isEqualTo(URL_BASE + "?connectTimeout=5&socketTimeout=60");
+
+        // A parameter a supplied URL names is the operator's and is neither overridden nor duplicated: pgJDBC
+        // keeps the last occurrence of a repeated parameter, so appending ours beside it would leave the URL
+        // saying one thing and the connection doing another. The bound the URL leaves out is still added.
+        assertThat(resolve("jdbc:postgresql://" + HOST + "/" + DATABASE + "?socketTimeout=90"))
+                .isEqualTo(URL_BASE + "?socketTimeout=90&connectTimeout=2");
+
+        // A fraction of a second is refused rather than truncated, because the driver takes whole seconds and
+        // reads 0 as no timeout at all - the silent downgrade back to the 30 s stall these bounds remove.
+        assertThatThrownBy(() -> new DataSourceGuardConfig(new CashAccountProperties(), chartVariables()
+                .withProperty("cashaccount.jdbc.socket-timeout", "PT0.5S")).resolveJdbcUrl())
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("cashaccount.jdbc.socket-timeout")
+                .hasMessageContaining("whole seconds");
+        assertThatThrownBy(() -> new DataSourceGuardConfig(new CashAccountProperties(), chartVariables()
+                .withProperty("cashaccount.jdbc.connect-timeout", "PT0S")).resolveJdbcUrl())
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("cashaccount.jdbc.connect-timeout");
     }
 
     // A supplied spring.datasource.url is the one input able to carry a whole connection - dialect, host,
@@ -159,15 +199,16 @@ class DataSourceGuardConfigTest {
     @Test
     void normalizesASuppliedJdbcUrlAndRefusesEveryTlsCredentialOrDialectBypass() {
         // The shape audit/LedgerImmutabilityIT's second application context starts in: no chart variables at all and
-        // a Testcontainers URL, which survives byte-identically because loggerLevel decides nothing about
-        // credentials, TLS, the transport or which server is reached.
+        // a Testcontainers URL, whose own text survives unchanged because loggerLevel decides nothing about
+        // credentials, TLS, the transport or which server is reached. The driver bounds are appended to it as to
+        // every other resolved URL, since a hand-started run has the same outage to fail fast on.
         assertThat(resolve("jdbc:postgresql://localhost:32771/test?loggerLevel=OFF"))
-                .isEqualTo("jdbc:postgresql://localhost:32771/test?loggerLevel=OFF");
+                .isEqualTo("jdbc:postgresql://localhost:32771/test?loggerLevel=OFF&" + DRIVER_BOUNDS);
 
         // An omitted port normalizes to PostgreSQL's own, and a parameter that decides neither credentials, TLS nor
         // the server is kept as it stands.
         assertThat(resolve("jdbc:postgresql://" + HOST + "/" + DATABASE + "?currentSchema=cash_account_rehearsal"))
-                .isEqualTo(URL_BASE + "?currentSchema=cash_account_rehearsal");
+                .isEqualTo(URL_BASE + "?currentSchema=cash_account_rehearsal&" + DRIVER_BOUNDS);
 
         // Under TLS the host is itself a trust decision, because verify-ca checks the certificate chain and not the
         // hostname: a URL naming its own host could reach another server holding any certificate the same CA signed.
@@ -244,6 +285,14 @@ class DataSourceGuardConfigTest {
                             .isInstanceOf(IllegalStateException.class)
                             .hasMessageContaining("spring.datasource.url");
                 });
+    }
+
+    // What a chart deployment supplies and nothing else: host, port and database, with no URL and no TLS.
+    private static MockEnvironment chartVariables() {
+        return new MockEnvironment()
+                .withProperty("JDBC_HOST", HOST)
+                .withProperty("JDBC_PORT", PORT)
+                .withProperty("JDBC_DB", DATABASE);
     }
 
     private static String resolve(String configuredUrl) {

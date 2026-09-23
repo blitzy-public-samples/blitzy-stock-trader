@@ -21,6 +21,14 @@ ENV LANGUAGE='en_US:en'
 # than by error, so the image would boot whichever jar landed last.
 COPY --chown=185 target/cash-account-modernized-*.jar /deployments/app.jar
 
+# Nothing else is copied, and docs/legacy-characterization.md in particular is NOT a second COPY: pom.xml's
+# copy-characterization-document execution packages it inside that jar, so a container `--tool.command=load` or
+# `reconcile` records migration_run.characterization_status from the revision this image was built from rather
+# than degrading to DRAFT for want of a working directory. A document signed ACCEPTED after the build is newer
+# than the image and is named with -Dcashaccount.characterization-doc=<mounted path>, which outranks the
+# packaged copy; the runbook's scheduled reconcile mounts it exactly that way. A copy at a second path here
+# would be a third answer to "which baseline did this run read", with no way to tell which one it used.
+
 # No JAVA_OPTS_APPEND: the sibling's value is Quarkus-specific, and pinning a profile here would override
 # the one the migration tooling selects per invocation (--spring.profiles.active=tool).
 ENV JAVA_APP_JAR="/deployments/app.jar"

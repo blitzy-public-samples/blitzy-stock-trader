@@ -8,6 +8,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
@@ -84,10 +85,21 @@ public class ShadowComparator {
     // one of these codes is the sanctioned replacement for something the legacy program did silently and
     // records an ACCEPTED_EXCEPTION, while any other code is a VARIANCE for review - so a real target
     // defect can never be signed off as an accepted difference.
+    //
+    // EXCHANGE_RATE_UNAVAILABLE is deliberately NOT a member, though answering 503 where the legacy committed
+    // undefined arithmetic from an uninitialized RATES host variable (CASH00.cbl:L214-L231) is itself an
+    // authorized deviation. The distinction is what each side of the comparison says: a captured legacy reply
+    // that succeeded with a computed balance means the legacy HAD its rate, so a target that cannot price the
+    // same line is reporting its own environment - a missing staging load, an unreachable provider, a currency
+    // no staged row carries - and not a characterized difference in behaviour. Accepting it meant the dual-run
+    // gate of AAP 0.3.3 Step 2 could close CLEAN on a window in which every cross-currency transaction went
+    // unpriced: variance_count counts only VARIANCE rows, so the evidence of the omission raised neither the
+    // count nor the exit code. As a VARIANCE the window fails until the rate question is answered, which is the
+    // only reading under which "zero VARIANCE rows for N consecutive windows" measures parity. AAP 0.10.3's
+    // seeded expectation is unaffected: RAUNAK's over-debit is INSUFFICIENT_FUNDS, which remains a member.
     private static final Set<CashAccountErrorCode> AUTHORIZED_DEVIATIONS = Set.of(
             CashAccountErrorCode.INSUFFICIENT_FUNDS,
             CashAccountErrorCode.AMOUNT_OUT_OF_RANGE,
-            CashAccountErrorCode.EXCHANGE_RATE_UNAVAILABLE,
             CashAccountErrorCode.INVALID_CURRENCY,
             CashAccountErrorCode.INVALID_OWNER,
             CashAccountErrorCode.UNSUPPORTED_PATH,
@@ -114,10 +126,12 @@ public class ShadowComparator {
 
     private final CashAccountRepository accounts;
 
-    // Held as the canonicalized type rather than as raw text: the delegate that prices the replay reads the
-    // same property, so comparing the raw value here could leave a live-priced window classified as the
-    // legacy-table parity gate, whose rows would then contradict the rates behind them.
-    private final MigrationRun.RateSource rateSource;
+    // Held as inert text and canonicalized on use, never in the constructor: an unusable tool.rate-source must
+    // reach an operator as MigrationToolRunner's one-line argument error, and resolving it during bean creation
+    // made that same message the innermost Caused-by of a 90-line refresh failure instead. Canonicalization
+    // still happens exactly once per window, through the one policy the delegate pricing the replay also reads,
+    // so a live-priced window can never be classified as the legacy-table parity gate.
+    private final String configuredRateSource;
 
     // Constructed, not injected: DelimitedExportReader carries no Spring stereotype, holds no state and is
     // thread-safe.
@@ -150,7 +164,7 @@ public class ShadowComparator {
         this.runs = Objects.requireNonNull(runs, "runs");
         this.legacyRates = Objects.requireNonNull(legacyRates, "legacyRates");
         this.accounts = Objects.requireNonNull(accounts, "accounts");
-        this.rateSource = MigrationRun.RateSource.of(rateSourceFrom(environment));
+        this.configuredRateSource = rateSourceFrom(environment);
         this.exportReader = new DelimitedExportReader();
     }
 
@@ -222,6 +236,11 @@ public class ShadowComparator {
         Objects.requireNonNull(run, "run");
         Objects.requireNonNull(transactions, "transactions");
         Objects.requireNonNull(legacyResponses, "legacyResponses");
+
+        // Canonicalized before a single line is replayed, so an unusable tool.rate-source still stops the window
+        // with the accepted tokens named and nothing applied - the fail-closed backstop for a caller that did
+        // not pass MigrationToolRunner's validation, which rejects the value before any command runs.
+        MigrationRun.RateSource rateSource = MigrationRun.RateSource.of(configuredRateSource);
 
         // Joined on the sequence number plus the normalized owner, never on file order or ordinal position:
         // EBCDIC and UTF-8 collate differently, so two exports of one window can arrive in different orders
@@ -503,16 +522,21 @@ public class ShadowComparator {
     }
 
     // The staged rate table's owning run, resolved from the batch rather than from this run: the table was
-    // staged by the batch's LOAD invocation, and a shadow window is a different run_id under the same
-    // batch_id. MigrationRunRepository's shared selector admits only CLEAN and VARIANCE, so a window, a
-    // reconcile of the same batch and fx/LegacyRateTableSource price against one run and a newer RUNNING
-    // attempt that staged nothing cannot stand in for it. null rather than a throw for a batch with no
-    // completed load, so the window reports the difference as an outstanding VARIANCE instead of absorbing it.
+    // staged by a LOAD invocation, and a shadow window is a different run_id. MigrationRunRepository's shared
+    // selectors admit only CLEAN and VARIANCE, so a window, a reconcile of the same batch and
+    // fx/LegacyRateTableSource price against one run and a newer RUNNING attempt that staged nothing cannot
+    // stand in for it. Batch first, then the schema's most recent completed load - the same two-step rule
+    // fx/LegacyRateTableSource applies to the replay itself, and for the same reason: a window carries its own
+    // --tool.batch-id (AAP 0.3.3 Step 2), so its batch holds no load and the rows it must explain against were
+    // staged under another one. A reconcile deliberately does NOT take that second step: it judges the load it
+    // names through the shared batch id (AAP 0.6.3), where a window names none. null rather than a throw when
+    // the schema holds no completed load at all, so the window reports the difference as an outstanding
+    // VARIANCE instead of absorbing it.
     private UUID latestLoadRunId(UUID batchId) {
-        if (batchId == null) {
-            return null;
-        }
-        return runs.findLatestCompletedLoad(batchId)
+        Optional<MigrationRun> inBatch = batchId == null
+                ? Optional.empty()
+                : runs.findLatestCompletedLoad(batchId);
+        return inBatch.or(runs::findLatestCompletedLoadInSchema)
                 .map(MigrationRun::runId)
                 .orElse(null);
     }

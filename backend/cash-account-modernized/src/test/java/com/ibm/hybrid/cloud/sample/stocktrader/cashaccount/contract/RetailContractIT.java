@@ -77,6 +77,12 @@ class RetailContractIT extends PostgresTestSupport {
     private static final String SUBCENT_OWNER = "CTSUBCENT";
     private static final String CEILING_OWNER = "CTCEILING";
 
+    // The two owners whose accounts carry held funds when a retail write arrives - the 409
+    // RESERVATIONS_OUTSTANDING pair AAP 0.6.2 declares. One owner each, because a refused PUT and a refused
+    // DELETE are each judged by what the account still holds afterwards, which a shared owner would confuse.
+    private static final String HELD_PUT_OWNER = "CTHELDPUT";
+    private static final String HELD_DELETE_OWNER = "CTHELDDELETE";
+
     /** Never created by any scenario, which is what makes the 404 assertion mean something. */
     private static final String MISSING_OWNER = "CTMISSING";
 
@@ -101,6 +107,7 @@ class RetailContractIT extends PostgresTestSupport {
     private static final int INSUFFICIENT_FUNDS_STATUS = 422;
     private static final int INVALID_AMOUNT_STATUS = 400;
     private static final int AMOUNT_OUT_OF_RANGE_STATUS = 422;
+    private static final int RESERVATIONS_OUTSTANDING_STATUS = 409;
 
     /** The retail seam's published prefix, which the chart hands broker as {@code cashAccount.url}. */
     private static final String RETAIL_BASE = BrokerClientFactory.RETAIL_BASE_PATH;
@@ -511,6 +518,89 @@ class RetailContractIT extends PostgresTestSupport {
         assertThat(credits.get(0).amount()).isEqualByComparingTo(new BigDecimal("999.99"));
         assertThat(credits.get(0).availableAfter()).isEqualByComparingTo(new BigDecimal("9999749.99"));
         assertThat(credits.get(0).reservedAfter()).isEqualByComparingTo(new BigDecimal("250.00"));
+    }
+
+    @Test
+    void updateIsRefusedWhileFundsAreHeldAndLeavesBothHalvesOfThePositionUntouched() throws Exception {
+        // PUT is an absolute overwrite of the available balance, so performing it while funds are held would
+        // strand the reservation against a balance that no longer backs it - which is why AAP 0.6.2 declares
+        // 409 RESERVATIONS_OUTSTANDING for this exact condition, one of only two retail-visible interactions the
+        // institutional surface introduces. Both halves of the position are read back because the reserved
+        // balance AAP 0.6.3 splits out is the value the overwrite would have silently orphaned.
+        seedAccount(HELD_PUT_OWNER, 600.00);
+        placeHold(HELD_PUT_OWNER, "200.00");
+
+        AtomicReference<String> responseBody = new AtomicReference<>();
+        CashAccountClient capturingClient = capturingClient(responseBody::set);
+
+        assertThatExceptionOfType(WebApplicationException.class)
+                .isThrownBy(() -> capturingClient.updateCashAccount(HELD_PUT_OWNER,
+                        new CashAccount(HELD_PUT_OWNER, 1.00, ACCOUNT_CURRENCY)))
+                .satisfies(rejection -> assertThat(rejection.getResponse().getStatus())
+                        .as("PUT /cash-account/{owner} while a reservation is HELD must answer"
+                                + " 409 RESERVATIONS_OUTSTANDING")
+                        .isEqualTo(RESERVATIONS_OUTSTANDING_STATUS));
+
+        // Only the code is asserted, for the reason the insufficient-funds case states: the message is the error
+        // code's own wording and the timestamp is unstable, while the code is what AAP 0.6.2 binds to the status.
+        assertThat(responseBody.get())
+                .as("PUT /cash-account/{owner} rejection must carry the ApiError code")
+                .isNotNull()
+                .contains("\"code\":\"RESERVATIONS_OUTSTANDING\"");
+
+        // The status alone cannot show this: a refused overwrite is also required to have written nothing, and a
+        // guard evaluated after the write would still answer 409 over an account it had already overwritten.
+        InstitutionalAccountResponse account = institutionalAccount(HELD_PUT_OWNER);
+        assertThat(account.availableBalance()).as("a refused PUT must not move the available balance")
+                .isEqualByComparingTo(new BigDecimal("400.00"));
+        assertThat(account.reservedBalance()).as("a refused PUT must leave the hold at its full amount")
+                .isEqualByComparingTo(new BigDecimal("200.00"));
+        assertThat(account.totalBalance()).as("a refused PUT must not change the total position")
+                .isEqualByComparingTo(new BigDecimal("600.00"));
+
+        assertThat(ledgerRows(HELD_PUT_OWNER, LedgerEventType.ACCOUNT_UPDATED))
+                .as("a refused PUT must write no ACCOUNT_UPDATED ledger row")
+                .isEmpty();
+    }
+
+    @Test
+    void deleteIsRefusedWhileFundsAreHeldAndLeavesTheAccountReadable() throws Exception {
+        // AAP 0.6.2 declares the same 409 for DELETE, and the consequence there is worse than a stranded
+        // balance: reservation and ledger rows carry no foreign key to cash_account and outlive it (AAP 0.6.3),
+        // so removing the account under a HELD hold would leave that hold permanently unable to return its funds
+        // to anything. The account therefore has to remain readable afterwards, not merely the request refused.
+        seedAccount(HELD_DELETE_OWNER, 800.00);
+        placeHold(HELD_DELETE_OWNER, "300.00");
+
+        AtomicReference<String> responseBody = new AtomicReference<>();
+        CashAccountClient capturingClient = capturingClient(responseBody::set);
+
+        assertThatExceptionOfType(WebApplicationException.class)
+                .isThrownBy(() -> capturingClient.deleteCashAccount(HELD_DELETE_OWNER))
+                .satisfies(rejection -> assertThat(rejection.getResponse().getStatus())
+                        .as("DELETE /cash-account/{owner} while a reservation is HELD must answer"
+                                + " 409 RESERVATIONS_OUTSTANDING")
+                        .isEqualTo(RESERVATIONS_OUTSTANDING_STATUS));
+
+        assertThat(responseBody.get())
+                .as("DELETE /cash-account/{owner} rejection must carry the ApiError code")
+                .isNotNull()
+                .contains("\"code\":\"RESERVATIONS_OUTSTANDING\"");
+
+        // 500.00 rather than the seeded 800.00 because retail reports the AVAILABLE balance (AAP 0.6.2) and the
+        // hold moved 300.00 out of it; a 404 here would be the signature of the delete having gone through.
+        assertAccount(client.getCashAccount(HELD_DELETE_OWNER), HELD_DELETE_OWNER, 500.00,
+                "GET /cash-account/{owner} after a DELETE refused for held funds");
+
+        InstitutionalAccountResponse account = institutionalAccount(HELD_DELETE_OWNER);
+        assertThat(account.reservedBalance()).as("a refused DELETE must leave the hold at its full amount")
+                .isEqualByComparingTo(new BigDecimal("300.00"));
+        assertThat(account.totalBalance()).as("a refused DELETE must not change the total position")
+                .isEqualByComparingTo(new BigDecimal("800.00"));
+
+        assertThat(ledgerRows(HELD_DELETE_OWNER, LedgerEventType.ACCOUNT_DELETED))
+                .as("a refused DELETE must write no ACCOUNT_DELETED ledger row")
+                .isEmpty();
     }
 
     // Seeding goes through the contract's own create endpoint rather than a repository or a JdbcTemplate: a

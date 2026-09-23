@@ -117,7 +117,12 @@ public class ReconciliationService {
     // Canonicalized through MigrationRun.RateSource rather than kept as raw text, because fx/ToolExchangeRateSource
     // picks the delegate that prices a replay from the same property the same way: a raw comparison here could
     // classify a live-priced difference as one the parity gate produced.
-    private final MigrationRun.RateSource rateSource;
+    // Held as inert text and canonicalized once per reconcile, never in the constructor: an unusable
+    // tool.rate-source must reach an operator as MigrationToolRunner's one-line argument error, and resolving it
+    // during bean creation made that same message the innermost Caused-by of a 90-line refresh failure. This
+    // service is also on the deployed classpath, where no tool.* key is passed at all, so a tool-only value has
+    // no business deciding whether the pod starts.
+    private final String configuredRateSource;
 
     private final int batchChunkSize;
 
@@ -132,8 +137,8 @@ public class ReconciliationService {
     // Binder, never @Value, for the two scalars as well as the accepted-currency sequence: a @Value placeholder is
     // resolved and its resolved text is then handed to Spring's expression resolver, so either scalar written as
     // #{...} would execute while this service was being created. Binder resolves ${...} and converts, evaluating
-    // nothing, so an unusable rate source is refused by MigrationRun.RateSource.of and an unusable chunk size by
-    // the check below.
+    // nothing, so an unusable rate source stays text until reconcile(...) canonicalizes it and an unusable chunk
+    // size is refused by the check below.
     public ReconciliationService(CashAccountRepository accounts,
                                  CashReservationRepository reservations,
                                  LedgerEntryRepository ledgerEntries,
@@ -148,8 +153,7 @@ public class ReconciliationService {
         this.reconciliations = Objects.requireNonNull(reconciliations, "reconciliations");
         this.runs = Objects.requireNonNull(runs, "runs");
         this.exportReader = new DelimitedExportReader();
-        this.rateSource = MigrationRun.RateSource.of(
-                stringProperty(environment, RATE_SOURCE_PROPERTY, DEFAULT_RATE_SOURCE));
+        this.configuredRateSource = stringProperty(environment, RATE_SOURCE_PROPERTY, DEFAULT_RATE_SOURCE);
         int batchChunkSize = integerProperty(environment, BATCH_CHUNK_SIZE_PROPERTY, DEFAULT_BATCH_CHUNK_SIZE);
         // Refused rather than defaulted away: a zero or negative chunk size would make the compare loop below
         // advance by nothing, which is a hang in a migration window rather than a slow run.
@@ -366,6 +370,12 @@ public class ReconciliationService {
         Objects.requireNonNull(run, "run");
         Objects.requireNonNull(inputDirectory, "inputDirectory");
 
+        // Canonicalized before anything is read or written, so an unusable tool.rate-source stops the reconcile
+        // with the accepted tokens named and no row touched - the fail-closed backstop for a caller that did not
+        // pass MigrationToolRunner's validation, which rejects the value before any command runs. Once per run,
+        // and carried on the comparison below, so every owner is judged by one reading of it (AAP 0.12.5).
+        MigrationRun.RateSource rateSource = MigrationRun.RateSource.of(configuredRateSource);
+
         // Materialized and flushed before the first finding because migration_reconciliation.run_id references
         // migration_run, so a finding written under a run whose own row does not exist yet fails on the foreign
         // key - relying on the ordering hibernate.order_inserts chooses (application.yml) would not be enough.
@@ -395,7 +405,7 @@ public class ReconciliationService {
         // rate table (AAP 0.12.5).
         Map<String, BigDecimal> stagedRates = stagedRatesOfBatchLoad(run.batchId());
 
-        TargetComparison comparison = new TargetComparison(stagedRates);
+        TargetComparison comparison = new TargetComparison(stagedRates, rateSource);
         exportReader.streamCashAccounts(accountFile, record -> {
             String owner = OwnerNormalizer.normalize(record.owner());
 
@@ -554,7 +564,7 @@ public class ReconciliationService {
             // which BigDecimal.equals reports as a difference and an operator would have to triage as one.
             if (legacyBalance.compareTo(targetBalance) != 0) {
                 recordBalanceDifference(run, owner, legacyCurrency, legacyBalance, targetBalance,
-                        comparison.stagedRates);
+                        comparison.stagedRates, comparison.rateSource);
             }
 
             // An agreeing owner gets no row at all, not even a MATCHED one: the acceptance criteria are "zero
@@ -591,7 +601,8 @@ public class ReconciliationService {
      */
     private void recordBalanceDifference(MigrationRun run, String owner, String currency,
                                          BigDecimal legacyBalance, BigDecimal targetBalance,
-                                         Map<String, BigDecimal> stagedRates) {
+                                         Map<String, BigDecimal> stagedRates,
+                                         MigrationRun.RateSource rateSource) {
         // With the default tool.rate-source=legacy-table nothing is reclassified: both sides were computed from
         // the same staged RATES, so a difference cannot be a rate difference (AAP 0.12.5).
         if (rateSource.isLive() && rateExplains(stagedRates, currency, legacyBalance, targetBalance)) {
@@ -867,14 +878,19 @@ public class ReconciliationService {
         // and empty for a batch with no completed load.
         private final Map<String, BigDecimal> stagedRates;
 
+        // The one canonicalization of tool.rate-source this run uses, taken before the first owner for the same
+        // reason the rates are: a source read per owner could reclassify half a comparison and not the rest.
+        private final MigrationRun.RateSource rateSource;
+
         private final Set<String> namedByExport = new LinkedHashSet<>();
 
         private final Map<String, LegacyCashAccountRecord> chunk = new LinkedHashMap<>();
 
         private int consideredTargetRows;
 
-        private TargetComparison(Map<String, BigDecimal> stagedRates) {
+        private TargetComparison(Map<String, BigDecimal> stagedRates, MigrationRun.RateSource rateSource) {
             this.stagedRates = Objects.requireNonNull(stagedRates, "stagedRates");
+            this.rateSource = Objects.requireNonNull(rateSource, "rateSource");
         }
     }
 }

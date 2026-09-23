@@ -16,6 +16,14 @@ public final class OwnerNormalizer {
     // code points that VARCHAR(32) stores without complaint.
     public static final int MAX_LENGTH = 32;
 
+    /**
+     * The canonical form of the one path segment the institutional surface owns under {@code /cash-account}.
+     *
+     * <p>It is a routing fact rather than a rule about identity: {@link #normalize(String)} accepts this value
+     * like any other, so a legacy export row carrying it still loads.
+     */
+    public static final String INSTITUTIONAL_PATH_SEGMENT = "INSTITUTIONAL";
+
     private OwnerNormalizer() {
     }
 
@@ -85,5 +93,28 @@ public final class OwnerNormalizer {
         // method by adding a pattern - the encoding at the boundary is the fix, and narrowing identity here would
         // change which accounts exist.
         return canonical;
+    }
+
+    /**
+     * Returns whether {@code raw} canonicalizes to {@link #INSTITUTIONAL_PATH_SEGMENT}.
+     *
+     * @param raw the path segment exactly as it arrived from a caller
+     * @return {@code true} when this value names the institutional surface's own path segment in any casing
+     */
+    // A predicate, deliberately not a rejection inside normalize. The two are different concerns: the
+    // institutional surface is "a separate, additive path space" under /cash-account (AAP 0.6.2), and
+    // /cash-account/institutional is a segment of it - but AAP 0.4.2 and 0.6.2 fix owner identity to exactly
+    // blank-or-over-32, so refusing this value as an OWNER would change which accounts can exist and would fail a
+    // whole single-transaction bulk load (AAP 0.6.3) over one legacy row. What is reserved is the retail ROUTE:
+    // retail/RetailCashAccountController answers 404 UNSUPPORTED_PATH for it, while the loader, the reconciler and
+    // the institutional endpoints carry the same owner unchanged.
+    //
+    // Canonicalized rather than compared literally, and that is the point of it living here: MVC matches a path
+    // segment case-sensitively, so reserving only the lower-case spelling would leave /cash-account/INSTITUTIONAL
+    // serving the very account /cash-account/institutional refuses - one identifier with two answers, which is
+    // worse than the overlap it set out to close. The strip and the fold are normalize's own, applied through this
+    // method so the module keeps ONE canonicalization.
+    public static boolean isInstitutionalPathSegment(String raw) {
+        return raw != null && INSTITUTIONAL_PATH_SEGMENT.equals(raw.strip().toUpperCase(Locale.ROOT));
     }
 }

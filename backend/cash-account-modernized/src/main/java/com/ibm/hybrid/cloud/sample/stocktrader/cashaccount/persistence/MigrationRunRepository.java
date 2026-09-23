@@ -39,4 +39,27 @@ public interface MigrationRunRepository extends JpaRepository<MigrationRun, UUID
     // ordering on it alone would let two commands of one batch resolve different loads.
     Optional<MigrationRun> findFirstByBatchIdAndModeAndStatusInOrderByStartedAtDescRunIdDesc(
             UUID batchId, MigrationRun.Mode mode, Collection<MigrationRun.Status> statuses);
+
+    /**
+     * The most recent completed load anywhere in the current schema, or empty when the schema holds none.
+     *
+     * @return the schema's most recent completed load, whatever batch it belongs to
+     */
+    // For the one reader whose own batch cannot hold a load: a shadow window is a distinct invocation with its
+    // own --tool.batch-id (AAP 0.3.3 Step 2), so the rates its cross-currency replays are priced from were staged
+    // by the migration step's load under a different batch. Resolving that load batch-first and only then
+    // schema-wide keeps a batch that does hold one authoritative - a reconcile still judges the load it names -
+    // while making the documented per-window invocation price from the load the rehearsal schema was built by,
+    // instead of finding no rate at all. Deliberately NOT named findLatestCompletedLoad: the batch-scoped
+    // selector's name is what ReconciliationIT's counting proxy matches, and an overload would make its count
+    // ambiguous. Same status set and the same started_at DESC, run_id DESC ordering, so the two selectors cannot
+    // disagree about which run "completed" and "most recent" mean.
+    default Optional<MigrationRun> findLatestCompletedLoadInSchema() {
+        return findFirstByModeAndStatusInOrderByStartedAtDescRunIdDesc(
+                MigrationRun.Mode.LOAD, COMPLETED_LOAD_STATUSES);
+    }
+
+    // Intended to be called only through the schema-wide selector above, for the same reason as its sibling.
+    Optional<MigrationRun> findFirstByModeAndStatusInOrderByStartedAtDescRunIdDesc(
+            MigrationRun.Mode mode, Collection<MigrationRun.Status> statuses);
 }

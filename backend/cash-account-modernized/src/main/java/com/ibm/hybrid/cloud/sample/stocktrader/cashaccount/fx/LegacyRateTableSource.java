@@ -203,14 +203,30 @@ public class LegacyRateTableSource implements ExchangeRateSource {
     private UUID loadStagingRunId() {
         UUID batchId = requireBatchId();
 
-        // Fails closed rather than falling back to an older load or to the live client: a replay whose expected
-        // values came from a run the operator did not name proves nothing about the run they did.
-        MigrationRun stagingRun = migrationRuns.findLatestCompletedLoad(batchId)
-                .orElseThrow(() -> new ExchangeRateUnavailableException("no completed load run for --tool.batch-id="
-                        + batchId + "; a load must stage STOCKTRD.FRANKFURT1 and end CLEAN or VARIANCE before a"
-                        + " reconcile or shadow-compare runs under the same batch id"));
+        Optional<MigrationRun> stagingRunOfBatch = migrationRuns.findLatestCompletedLoad(batchId);
+        if (stagingRunOfBatch.isPresent()) {
+            UUID stagingRunId = stagingRunOfBatch.get().runId();
+            LOGGER.info("Legacy rate lookups resolve against staging run {} of batch {}", stagingRunId, batchId);
+            return stagingRunId;
+        }
 
-        LOGGER.info("Legacy rate lookups resolve against staging run {} of batch {}", stagingRun.runId(), batchId);
+        // A window whose own batch holds no load is the DOCUMENTED shape, not a fault: the runbook's dual-run
+        // step replays one window per invocation, each with its own --tool.batch-id, against the rehearsal schema
+        // the migration step's load built - so the staged FRANKFURT1 rows this replay must be priced from belong
+        // to a run of another batch. Requiring the batch's own load made every cross-currency line of such a
+        // window fail for want of a rate, and the window then closed with nothing priced. The schema's most
+        // recent completed load is that run, and the line below names it, so a review reads which rates priced
+        // the window rather than inferring it. Batch-first ordering is what keeps this additive: a batch that
+        // does hold a completed load still resolves to it, untouched.
+        MigrationRun stagingRun = migrationRuns.findLatestCompletedLoadInSchema()
+                .orElseThrow(() -> new ExchangeRateUnavailableException("no completed load run for --tool.batch-id="
+                        + batchId + " and none anywhere in this schema; a load must stage STOCKTRD.FRANKFURT1 and"
+                        + " end CLEAN or VARIANCE before a reconcile or shadow-compare can price a"
+                        + " cross-currency line"));
+
+        LOGGER.info("Batch {} holds no completed load, so legacy rate lookups resolve against staging run {} of"
+                + " batch {} - this schema's most recent completed load", batchId, stagingRun.runId(),
+                stagingRun.batchId());
         return stagingRun.runId();
     }
 
