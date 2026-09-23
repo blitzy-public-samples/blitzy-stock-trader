@@ -12,12 +12,27 @@ public enum CashAccountErrorCode {
 
     ACCOUNT_ALREADY_EXISTS(HttpStatus.CONFLICT, "Cash account already exists."),
 
-    INVALID_OWNER(HttpStatus.BAD_REQUEST, "Owner must be 1 to 32 characters."),
+    // The message names the permitted set rather than only the bound, because that is the whole of the rule a
+    // caller has to satisfy and a refusal that states only the length sends the caller to count characters it
+    // already got right. The set itself is domain/OwnerNormalizer's, and its rationale is stated there.
+    INVALID_OWNER(HttpStatus.BAD_REQUEST,
+            "Owner must be 1 to 32 characters of A-Z, 0-9, dot, underscore or hyphen."),
 
     INVALID_AMOUNT(HttpStatus.BAD_REQUEST,
             "Amount is missing, not a number, or not permitted for this operation."),
 
     INVALID_CURRENCY(HttpStatus.BAD_REQUEST, "Currency must be a supported three-letter ISO code."),
+
+    // The 400 for a request member that has no code of its own - an institutional hold's orderReference or
+    // expiresAt - and the fourth code beyond the AAP 0.6.2 vocabulary, on the same signable register row as
+    // REQUEST_TOO_LARGE and the media-type pair (README, decision row D2). It exists because the alternative was
+    // untrue rather than merely imprecise: every such failure fell to INVALID_AMOUNT below, so a missing or
+    // over-length orderReference was answered "Amount is missing, not a number, or not permitted for this
+    // operation" while the amount the caller sent was perfectly valid - a rejection that sends a caller to correct
+    // what is already correct, and one an automated client cannot tell from a genuine amount fault. Reusing
+    // INVALID_QUERY was rejected for the same reason: a JSON body member is not a query parameter. The status is
+    // the 400 the AAP fixes for every validation condition, so no endpoint's status class changes with it.
+    INVALID_REQUEST_FIELD(HttpStatus.BAD_REQUEST, "A request field carries a value this service cannot accept."),
 
     CURRENCY_MISMATCH(HttpStatus.BAD_REQUEST, "Hold currency must equal the account currency."),
 

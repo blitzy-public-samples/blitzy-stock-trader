@@ -36,20 +36,33 @@
         <java.version>21</java.version>
         <maven.compiler.release>21</maven.compiler.release>
 
-        <!-- The next three are deliberate OVERRIDES of versions the Spring Boot BOM does manage, and each one
-             exists for a single reason: the version 3.3.13 manages is affected by the CVE named against it and
-             the mandated 3.3 line ships no newer parent to inherit the fix from. They are the only overrides
-             in this file, one property per coordinate set, each with its own advisory: everywhere else the BOM
-             remains this module's single version authority, and these three are that rule's stated exceptions
-             rather than a second authority beside it.
-             All three also depart from the frozen dependency inventory (AAP 0.9.1, which pins pgJDBC 42.7.7 and
-             leaves Tomcat and Micrometer to the BOM), so each is carried as a row of README.md's "Deviations
-             from the frozen AAP inventory" register, where the advisory, the reason no BOM version remediates
-             it and the decision row that authorizes it (D1, PENDING until the requesting organization signs it)
-             are stated together - including that Micrometer 1.15.12 sits two minor lines above Boot 3.3.13's
-             tested matrix and is proven only on the surfaces ActuatorProbesIT exercises. A version moved here
-             moves in that register in the same edit, and reverting one to its inventory value reinstates the
-             vulnerability. -->
+        <!-- The nine properties below carry this module's advisory-driven version decisions, and each exists
+             for a single reason: the version Spring Boot 3.3.13 resolves is affected by the advisory named
+             against it and the mandated 3.3 line ships no newer parent to inherit the fix from. Eight of them
+             OVERRIDE versions the BOM does manage; the ninth, nimbus-jose-jwt.version, pins a coordinate the
+             BOM does not manage at all and is applied through <dependencyManagement> below. One property per
+             coordinate set, each with its own advisory: everywhere else the BOM remains this module's single
+             version authority, and these nine are that rule's stated exceptions rather than a second
+             authority beside it.
+             WHAT NO PROPERTY HERE CAN REACH, so that its absence from this list is not read as safety: the
+             spring-boot and spring-boot-autoconfigure artifacts carry the PARENT's version. CVE-2026-22733
+             (authentication bypass under the actuator CloudFoundry endpoints, CVSS 8.1, fixed 3.5.12/4.0.4),
+             CVE-2026-40973 (fixed 3.5.14/4.0.6) and CVE-2026-41001 (fixed 3.5.15/4.0.7) therefore still ship,
+             and are remediable only by leaving the 3.3 line - which AAP 0.14.1 freezes and AAP 0.11.2 records
+             as an organizational decision, not a build change. The compensating control for the CloudFoundry
+             advisory is structural rather than hopeful: SecurityConfig's anyRequest().denyAll() covers
+             /cloudfoundryapplication and everything under it, the CloudFoundry actuator auto-configuration
+             activates only in the presence of VCAP_APPLICATION, and this module declares no endpoint in that
+             path space. README.md's open items carry that residual exposure as the production gate it is.
+             All nine also depart from the frozen dependency inventory (AAP 0.9.1, which pins pgJDBC 42.7.7 and
+             leaves the rest to the BOM), so each is carried as a row of README.md's "Deviations from the frozen
+             AAP inventory" register, where the advisory, the reason no BOM version remediates it and the
+             decision row that authorizes it (D1, PENDING until the requesting organization signs it) are stated
+             together - including that this set moves the Spring, Spring Data, Jackson, Logback and Micrometer
+             lines above
+             Boot 3.3.13's tested matrix, a combination no Spring compatibility statement covers and whose
+             evidence here is this module's own gate. A version moved here moves in that register in the same
+             edit, and reverting one to its inventory value reinstates the vulnerability. -->
         <!-- CVE-2026-42198: in pgJDBC 42.2.0 up to but excluding 42.7.11 the SERVER dictates the
              SCRAM-SHA-256 PBKDF2 iteration count, so an impersonated or compromised database can force
              unbounded client-side CPU work at login, which loginTimeout does not bound. 42.7.11 adds the
@@ -75,6 +88,66 @@
              micrometer-bom import, so micrometer-core, -observation, -commons and -registry-prometheus move
              together. -->
         <micrometer.version>1.15.12</micrometer.version>
+        <!-- CVE-2026-22732 is the one CRITICAL advisory against anything this module ships: spring-security-web
+             up to 6.5.8 (the BOM's 6.3.10 among them), fixed in 6.5.9 and 7.0.4. 6.5.11 is the lowest version
+             that also closes CVE-2026-22746 (spring-security-core) and CVE-2026-22748 (-oauth2-jose), both
+             fixed 6.5.10, and CVE-2026-41706 and CVE-2026-47838 (spring-security-web), both fixed 6.5.11; no
+             6.3.x or 6.4.x release remediates any of them. This is the parent's own property, so it drives the
+             spring-security-bom import and the whole org.springframework.security:* set moves as one release -
+             the only safe way to move Spring Security, whose modules are built and tested together, and the
+             reason -test moves with it. SecurityConfig's eager header-writing workaround for CVE-2026-22732
+             stays in place beside this bump rather than being retired by it: the bump removes the vulnerable
+             code, the workaround keeps the header contract true on every rejection path, and the two are
+             independent. 6.5.x requires Spring Framework 6.2.x, which is the bump below. -->
+        <spring-security.version>6.5.11</spring-security.version>
+        <!-- CVE-2025-41249 (spring-core, fixed 6.2.11), CVE-2026-41842 and CVE-2026-41845 (spring-webmvc) and
+             CVE-2026-41850 (spring-expression), plus thirteen further MEDIUM/LOW advisories across those
+             three artifacts whose highest fixed version is also 6.2.19. Every fix lies on 6.2.x, so no 6.1.x release
+             remediates anything and 6.2.19 is the lowest version that closes all of them. The parent's own
+             property drives the spring-framework-bom import, so the entire org.springframework:* set moves
+             together; lifting one artifact out of its release is not an option for a framework whose modules
+             share internal APIs. 6.2.19 is not an independent guess either: it is the exact spring-core version
+             spring-security-web 6.5.11 declares, so the two overrides are one consistent pairing rather than
+             two versions chosen separately and hoped to agree. -->
+        <spring-framework.version>6.2.19</spring-framework.version>
+        <!-- CVE-2026-41716 (HIGH) with CVE-2026-41711 and CVE-2026-41721 against spring-data-commons, all
+             fixed in 3.5.12, which the 2025.0.x release train carries and the BOM's 2024.0.13 train (commons
+             3.3.13) cannot. 2025.0.13 is the current 2025.0.x, so it carries every later fix of that train.
+             Spring Data JPA moves with it to 3.5.13 while Hibernate stays at the BOM's 6.5.3.Final: no
+             Hibernate advisory is outstanding, so nothing justifies moving the ORM as well, and the pairing is
+             proven on exactly the repository surfaces this module's integration tests exercise. -->
+        <spring-data-bom.version>2025.0.13</spring-data-bom.version>
+        <!-- GHSA-r7wm-3cxj-wff9 (jackson-core) and CVE-2026-54512, CVE-2026-54513, CVE-2026-54514 and
+             CVE-2026-59888 (jackson-databind) are fixed in 2.18.8; CVE-2026-54515 in 2.18.9 and
+             CVE-2026-18401 (jackson-core) in 2.18.6. Nothing on 2.17.x remediates any of them. 2.18.11 is the
+             current 2.18.x and the lowest line that closes the whole set; the 2.21.x/2.22.x lines also carry
+             the fixes and are deliberately not taken, because 2.18.x is the line Spring Boot's own next minor
+             (3.4.x) is built against and is therefore the smallest step away from the mandated matrix. The
+             property drives the jackson-bom import, so databind, core and the annotations move together -
+             which matters here because the money wire contract depends on them: JacksonConfig's
+             USE_BIG_DECIMAL_FOR_FLOATS and WRITE_BIGDECIMAL_AS_PLAIN must keep rendering balance as a plain
+             decimal, which RetailContractIT asserts on the raw response text. -->
+        <jackson-bom.version>2.18.11</jackson-bom.version>
+        <!-- CVE-2025-11226 (arbitrary code execution, fixed 1.5.19) with CVE-2026-1225 (1.5.25),
+             CVE-2026-9828 (1.5.33), CVE-2026-10532 (1.5.34) and CVE-2026-13006 (1.5.37) against logback-core;
+             1.5.38 is the current 1.5.x and the lowest version that closes all five. The 1.6.x line is not
+             taken: it is a new minor whose configuration surface this module has no reason to adopt. The
+             CVE-2025-11226 exploitation precondition - Janino on the classpath, reached through a conditional
+             logback configuration - is absent here and must stay absent: no janino or commons-compiler
+             artifact is on any classpath of this module, so the bump removes the vulnerable code and that
+             absence keeps the precondition unmet. slf4j stays at the BOM's 2.0.17, which 1.5.38 requires. -->
+        <logback.version>1.5.38</logback.version>
+        <!-- CVE-2025-53864: nimbus-jose-jwt up to 9.37.3 parses a JWT claim set with no nesting bound, so a
+             deeply nested claim set can exhaust the stack; 9.37.4 is the drop-in patch. The BOM manages no
+             version for this coordinate - it arrives transitively through spring-security-oauth2-jose - which
+             is why it is pinned in <dependencyManagement> rather than here alone, and why 9.37.3 shipped
+             unnoticed in the first place. 9.37.4 is also what spring-security 6.5.11 resolves, so the pin
+             changes nothing today and exists to make the floor explicit: any future change to the security
+             line can no longer take the recursion fix away silently. The 10.x line is not taken - a major
+             version whose API the security line does not ask for. Tomcat's 8KB request-header ceiling, which
+             bounds a bearer token's reachable nesting depth, stays in place as defence in depth beside the
+             bump, not instead of it. -->
+        <nimbus-jose-jwt.version>9.37.4</nimbus-jose-jwt.version>
 
         <!-- Everything below is a coordinate the BOM does not manage, with one stated exception: jakarta.ws.rs
              below restates the BOM's own 3.1.0 (spring-boot-dependencies-3.3.13 jakarta-ws-rs.version) rather
@@ -100,6 +173,21 @@
         <microprofile.config.version>3.1</microprofile.config.version>
         <smallrye.config.version>3.9.1</smallrye.config.version>
     </properties>
+
+    <!-- The one advisory-driven version this module cannot state as a property override, because the Spring
+         Boot BOM manages no version for the coordinate at all: nimbus-jose-jwt is a transitive dependency of
+         spring-security-oauth2-jose, so a managed entry is the only way to fix its floor. Scope and exclusions
+         are deliberately absent - this pins the version of a dependency the security starter already brings,
+         and does not introduce it as a direct one. -->
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>com.nimbusds</groupId>
+                <artifactId>nimbus-jose-jwt</artifactId>
+                <version>${nimbus-jose-jwt.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
 
     <!-- No Flyway and no Liquibase: the estate ships no migration framework (backend/portfolio
          hand-applies createTables.ddl), so the schema is applied by Spring Boot SQL initialization over

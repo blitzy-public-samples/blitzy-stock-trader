@@ -145,8 +145,10 @@ public class ReservationService {
      * @throws CashAccountException {@link CashAccountErrorCode#IDEMPOTENCY_KEY_REQUIRED},
      *         {@link CashAccountErrorCode#INVALID_OWNER}, {@link CashAccountErrorCode#INVALID_AMOUNT},
      *         {@link CashAccountErrorCode#INVALID_CURRENCY}, {@link CashAccountErrorCode#CURRENCY_MISMATCH},
+     *         {@link CashAccountErrorCode#INVALID_REQUEST_FIELD},
      *         {@link CashAccountErrorCode#ACCOUNT_NOT_FOUND},
      *         {@link CashAccountErrorCode#INSUFFICIENT_FUNDS},
+     *         {@link CashAccountErrorCode#AMOUNT_OUT_OF_RANGE},
      *         {@link CashAccountErrorCode#IDEMPOTENCY_KEY_REUSED} or
      *         {@link CashAccountErrorCode#CONCURRENT_MODIFICATION}
      */
@@ -605,10 +607,14 @@ public class ReservationService {
         return candidate;
     }
 
-    // Compared before Money is constructed, because Money.of answers anything above the NUMERIC(9,2) ceiling
-    // with AMOUNT_OUT_OF_RANGE, which the closed hold error set does not contain (AAP 0.6.2); no balance can
-    // exceed that ceiling either, so such a hold is more than the account can cover. The authoritative
-    // sufficiency check stays in Money.minus under the account lock, shared with the retail debit.
+    // Compared before Money is constructed so the ceiling is judged once, here, with the owner in hand. The code
+    // is AMOUNT_OUT_OF_RANGE and not INSUFFICIENT_FUNDS: both are 422, but the two describe different faults, and
+    // the retail credit and debit paths answer the identical input class - an amount past the NUMERIC(9,2)
+    // ceiling, the deliberate replacement for the legacy COMPUTE that dropped high-order digits
+    // [backend/cash-account-cobol/COBOL/CASH00.cbl:L17, L222] - with AMOUNT_OUT_OF_RANGE through Money.of. One
+    // service answering two codes for one condition, depending on which surface received it, is a contract a
+    // caller cannot write against; INSUFFICIENT_FUNDS stays for what it names, a hold larger than the available
+    // balance, which Money.minus decides under the account lock exactly as the retail debit does.
     private static Money requireHoldAmount(BigDecimal raw, String owner) {
         if (raw == null) {
             throw CashAccountException.forOwner(CashAccountErrorCode.INVALID_AMOUNT, owner);
@@ -622,7 +628,7 @@ public class ReservationService {
             throw CashAccountException.forOwner(CashAccountErrorCode.INVALID_AMOUNT, owner);
         }
         if (normalized.compareTo(Money.MAX_VALUE) > 0) {
-            throw CashAccountException.forOwner(CashAccountErrorCode.INSUFFICIENT_FUNDS, owner,
+            throw CashAccountException.forOwner(CashAccountErrorCode.AMOUNT_OUT_OF_RANGE, owner,
                     "The hold exceeds the largest balance an account can hold.");
         }
         return Money.of(normalized);

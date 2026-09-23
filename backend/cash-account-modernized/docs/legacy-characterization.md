@@ -239,6 +239,28 @@ fields out of the response and never reads the owner back; and replacing silent 
 explicit rejection removes the collision the 15-character limit created. `OwnerNormalizer` is the
 single place this holds.
 
+Decision — **an owner is spelled from `A-Z 0-9 . _ -`**, and anything else is `400 INVALID_OWNER`.
+This one is *not* read out of the legacy source: the stored column is `CHAR(32)` with no character
+restriction (`DB2-DDL/DB2DDL.jcl:L47`) and the program constrains nothing either, so the legacy
+system would have accepted any byte a COMMAREA could carry. It is a target decision taken against a
+runtime security finding — the unconstrained path segment accepted and persisted markup, shell and
+template metacharacters, SQL fragments and arbitrary unicode as account identifiers, and echoed each
+one back in the `owner` field of a `200` response. Nothing was injected by it, because every
+statement binds parameters, but an identifier is the value this service echoes to callers, writes
+into log records and joins reconciliation on. The three separators are admitted because real user
+identifiers carry them.
+
+Because the legacy column was wider than this rule, the rule is applied in two forms rather than one,
+and the distinction matters to anyone reading the migration tooling: `OwnerNormalizer.normalize`
+decides *identity* and refuses, while `OwnerNormalizer.canonicalize` only folds and bounds, and is
+what a legacy row is carried under. A legacy account whose owner the rule refuses is recorded as a
+`STATE` / `INVALID_OWNER_IN_LEGACY` reconciliation row and not loaded — the same treatment a NULL
+balance or an out-of-set currency gets (section 5.1) — so one such owner cannot fail a whole
+single-transaction bulk load, and the data owner renames it upstream or reclassifies the row. Legacy
+*history* is different again: `WS-VR-NAME` is the caller's own text (L114), so a staged history row
+keeps its raw name and an uppercased join key whatever it is spelled with, because staging is
+lossless.
+
 ## 3. Unrecognized request codes
 
 `EVALUATE WS-REQ` (L89-L102) has branches for `A` (L90-L91), `Q` (L92-L93), `U` (L94-L95), `X`
@@ -416,6 +438,7 @@ broker behavior as something read from the legacy program.
 | Nullable `CHAR(8)` currency, rate keyed on its first five characters (L213, L217-L218) | DELIBERATELY CHANGED | The API accepts only trimmed, upper-case codes from the accepted set; imports trim padding and classify nulls and out-of-set values as variances (section 5.1) |
 | Owner echoed in three different casings (L144, L158, L108) | DELIBERATELY CHANGED | Always the stored upper-case owner (section 2) |
 | Owner silently truncated to 15 characters (L55) | DELIBERATELY CHANGED | Up to 32 accepted, longer rejected with `400 INVALID_OWNER` |
+| Owner unrestricted in character, being `CHAR(32)` with no constraint (`DB2-DDL/DB2DDL.jcl:L47`) | DELIBERATELY CHANGED (target decision, not a legacy fact) | Spelled from `A-Z 0-9 . _ -` or `400 INVALID_OWNER`, with a matching `CHECK` on every owner column; a legacy export row outside the rule becomes a `STATE` / `INVALID_OWNER_IN_LEGACY` finding rather than a failed load (section 2) |
 | Negative result stored as its absolute value (L17, L222/L256, L225/L259) | DELIBERATELY CHANGED | `422 INSUFFICIENT_FUNDS` and no write (section 1.5) |
 | High-order digits dropped on overflow (L17, no `ON SIZE ERROR` at L222/L256) | DELIBERATELY CHANGED | `422 AMOUNT_OUT_OF_RANGE` (section 1.6) |
 | Unrecognized request code falls through as success (L89-L102, L104-L108) | DELIBERATELY CHANGED | Fail closed: `404 UNSUPPORTED_PATH` / `405 UNSUPPORTED_METHOD` (section 3) |

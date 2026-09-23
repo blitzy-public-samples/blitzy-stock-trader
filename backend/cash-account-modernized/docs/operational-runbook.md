@@ -123,8 +123,13 @@ written into one.
 - A pasted value is *interpreted*, not passed. `JDBC_PASSWORD=p@ss w;rd$1` runs `rd` as a command,
   expands `$1` to nothing, and leaves the tool authenticating as `p@ss` — a failure that looks like a
   wrong password rather than a mangled one.
-- An owner is any non-blank value of up to 32 characters (`OwnerNormalizer` imposes no character
-  class), so `/`, `;`, `&`, `?`, `#`, `%`, a quote and even an embedded newline are all legal owners.
+- An owner the SERVICE accepts is 1 to 32 characters of `A-Z 0-9 . _ -` (`OwnerNormalizer`), so it is
+  shell-safe by construction. An owner in a LEGACY EXPORT is not: the DB2 column is `CHAR(32)` with no
+  character restriction (`backend/cash-account-cobol/DB2-DDL/DB2DDL.jcl:L47`), so `/`, `;`, `&`, `?`,
+  `#`, `%`, a quote and even an embedded newline can all appear in an export row, in a captured shadow
+  line, and in the `owner` column of the reconciliation findings that refuse them. Every rule below
+  therefore still applies to an owner read out of legacy data — which is most of the owners an
+  operator handles in Steps 1 and 2.
 
 **Secrets — database passwords and bearer tokens — come from a 0600 file.** Write it with the shell's
 own `printf`, which is a builtin and therefore never becomes another process's `argv`:
@@ -306,7 +311,7 @@ sealed original remains, which is hygiene and not a disposal decision.
 
 | Step | Name | Executed by | Signed off by |
 | --- | --- | --- | --- |
-| 0 | Prerequisites | Platform operator | Platform owner; data owner |
+| 0 | Prerequisites | Platform operator | Platform owner; data owner; requesting organization with risk (framework support, deviation row D1) |
 | 1 | Bulk migration rehearsal and reconciliation | Mainframe operator; platform operator | Cash-account data owner |
 | 2 | Shadow-mode dual-run | Platform operator | Product owner; risk |
 | 3 | Controlled cutover | Platform operator; mainframe operator | Platform operator and data owner at gates (b)-(c); product owner after (g) |
@@ -363,10 +368,158 @@ traffic on the line.
 
 - **The service image is built, scanned and pushed, and its digest is recorded.** See
   [Image build, scan and push](../README.md#image-build-scan-and-push) — that is the only place the
-  path is documented, and it is not restated here so the two cannot drift.
+  path is documented, and it is not restated here so the two cannot drift. Three properties of that run
+  are Step 0's business rather than the README's, because each one is a gate somebody can skip:
+
+  - **The blocking image scan was evaluated on the exact artifact being promoted.** It fails on any
+    CRITICAL or HIGH finding that has a fix available — the single question a promotion can act on,
+    namely whether a patched package exists that this image did not take. Without it a stale base is
+    invisible: the pin this module shipped before the current one lagged its own release stream by a
+    year and carried 64 fixable HIGH findings, ten of them against the JDK, while every step of the
+    build path completed cleanly around it.
+
+    A non-zero exit blocks promotion unless the sign-off below carries that finding by name, the reason
+    no available version removes it, and the compensating control. Read the two package layers
+    separately to know which kind of failure it is: as the module stands the base-image layer passes and
+    the shipped-jar layer does not, and the second is the framework-line decision only the requesting
+    organization can close. Making the gate pass by suppressing a finding is never the answer — that is
+    the state the previous base image was already in, discovered a year late.
+  - **The base-image pin was re-checked at promotion rather than inherited from the last build.** A pin
+    goes stale by sitting still, so the tag, its manifest-list digest and the OS and JDK package
+    versions inside it are re-derived and recorded with the date — the commands are in the README
+    section above. A digest that no longer matches its tag's stream head is not itself a failure; not
+    knowing which it is means the gate was evaluated against an unknown.
+  - **The informational scan's output is recorded in full even when nothing blocked.** Findings with no
+    fix available do not gate and must not therefore go unrecorded: the current base carries eleven of
+    them, and the record is what makes them re-read at the next promotion instead of forgotten.
+
+- **A vulnerability feed for the dependency scan is provisioned on the promotion runner.** The NVD scan
+  of the resolved dependency set cannot run without one: the plugin refuses to contact the NVD 2.0 API
+  with no credential, and the JSON 1.1 feeds its older generation downloaded are retired and answer
+  `403 Forbidden`. It is a provisioning question rather than a network one, and any **one** of an NVD
+  API key, an internal NVD 2.0 API mirror, an internal datafeed mirror, or a pre-populated offline
+  cache satisfies it — the four forms, and the property each is passed as, are in
+  [Dependency scanning needs a vulnerability feed the pipeline must provision](../README.md#dependency-scanning-needs-a-vulnerability-feed-the-pipeline-must-provision).
+  A key is a credential and reaches the runner the way every other secret here does: out of the secret
+  manager into a `0600` settings file the run names with `-s`, never as a command argument. An
+  environment variable is not the escape it looks like — the shell expands `-DnvdApiKey="$VAR"` before
+  `exec`, so the key is in `argv` either way, which is the same trap
+  [Operator command safety](#operator-command-safety) describes for every other credential in this
+  document.
+
+  **Its absence is not a silent pass.** With no feed there is no NVD report, and the sign-off below must
+  say so in as many words, naming the two Trivy scans — the build-input scan and the image scan — as the
+  coverage that stood in for it. They are not a formality: the build-input scan resolves the parent POM
+  chain and so reports advisories against coordinates the parent *manages* but never ships, which no
+  image scan can see, and the image scan is the only view of the base image's own OS packages. Both stay
+  in the pipeline after a feed is provisioned. What is not acceptable is a Step 0 signed off as
+  "scanned" by somebody who could not have run the scan.
+
+- **A written framework-support determination for the line this service is built on, and with it the
+  requesting organization's authorization of the nine dependency overrides.** Spring Boot 3.3.13 is
+  past open-source end of life — as is every 3.x line — and 3.3 is the line the plan mandates. The
+  module's nine per-artifact overrides close every advisory raised against the Spring, Spring Data,
+  Jackson, Logback, Micrometer, Tomcat, pgJDBC and Nimbus artifacts it ships, the single CRITICAL one
+  among them; what they cannot reach is the `spring-boot` and `spring-boot-autoconfigure` artifacts,
+  whose version **is** the parent's. Three advisories therefore ship: CVE-2026-22733
+  (authentication bypass under the actuator CloudFoundry endpoints, CVSS 8.1, fixed 3.5.12/4.0.4),
+  CVE-2026-40973 (3.5.14/4.0.6) and CVE-2026-41001 (3.5.15/4.0.7). Each is unreachable in this
+  deployment — `anyRequest().denyAll()` covers that whole path space, the CloudFoundry actuator
+  auto-configuration never activates without `VCAP_APPLICATION`, and only `health`, `startup` and
+  `prometheus` are exposed — and none is patchable while the line is frozen. Both halves of that
+  statement are in
+  [what the nine cannot reach](../README.md#what-the-nine-cannot-reach-and-the-controls-that-stand-in-their-place),
+  and a control standing in for a patch is precisely what needs a decision rather than a note.
+
+  The determination is one of three, in writing: **stay** on 3.3.13 with those controls and the
+  residual risk accepted; **buy** commercial support for the line; or **authorize a later minor line**,
+  in which case the module is rebuilt, re-gated with `./mvnw -B clean verify` and re-scanned before
+  Step 1 begins, and the two deprecated-for-removal call sites the current overrides create
+  (`config/SecurityConfig.java`'s `addObjectPostProcessor`, `error/ApiExceptionHandler.java`'s
+  `MethodValidationResult.getAllValidationResults`) are rewritten as part of that move, not after it.
+
+  It belongs in Step 0 for the same reason the image digest does: it is a decision about the artifact
+  every step below deploys, taken against the scan evidence this step already captures. Taken later it
+  would be taken with traffic on the line. Row **D1** of the README's
+  [authorization record](../README.md#authorization-record) is collected here too, since Step 0 is
+  already where the sign-offs are gathered — and D1 and this determination answer the same question
+  from opposite ends: D1 authorizes the versions that moved, this determination decides what happens
+  about the two artifacts that could not.
 
 - **A database identity with `CREATE SCHEMA`** for the rehearsal schema Step 1 needs, and the
   connection details for the store above.
+
+- **A decision, in writing, on which database-identity posture the release runs** — and it is a
+  decision rather than a default, because the weaker of the two is what a chart deployment starts with.
+
+  The chart renders **one** database identity into the pod (`database.id` / `database.password`,
+  `…/templates/cash-account.yaml:L110-L119`). With `spring.sql.init.mode` at its `always` default the
+  pod applies `schema/cash-account-schema.sql` itself, so that same identity **owns** `ledger_entry` —
+  and in PostgreSQL `DROP`, `ALTER` and `ALTER TABLE … DISABLE TRIGGER` follow ownership rather than a
+  grantable privilege. Measured on PostgreSQL 12.22 as that identity, `DROP TRIGGER
+  ledger_entry_immutable ON ledger_entry` succeeds and a following `UPDATE ledger_entry SET amount = 0`
+  rewrites an audit row. The append-only ledger is the audit record this whole migration is reconciled
+  against, so the credential that serves requests being able to rewrite it is a posture somebody must
+  choose knowingly. The two admissible choices:
+
+  1. **Split identities (recommended).** The DDL-owning role applies the script once; the pod runs as a
+     runtime role that owns nothing and holds only `SELECT`, `INSERT`, `UPDATE`, `DELETE`; and
+     `SPRING_SQL_INIT_MODE=never` is set on the Deployment. The role's grants and the refusals it then
+     receives are in [Hardened production posture](../README.md#schema-application) — that is the only
+     place they are written, so the two cannot drift. **This needs a second secret key in the chart**
+     (the runtime role's credentials), which is a chart-owner change: this module may not make it
+     (AAP 0.3.4), so the change must be in place before this option can be selected.
+  2. **Single identity, with the residual accepted in writing** by the cash-account data owner. The
+     compensating control is real but partial: the script is idempotent, so the next start-up
+     re-creates both guards and the exposure is a window rather than a permanent loss; and the
+     application itself has no code path that can `UPDATE`, `DELETE` or `TRUNCATE` the ledger. What is
+     accepted is that a leaked `JDBC_PASSWORD` — or any flaw reaching the datasource — can rewrite
+     audit history between restarts.
+
+  Either way the chosen posture, its authority and its date are recorded in `step0-db-identity.txt` and
+  signed below. **An unrecorded posture blocks Step 1**, for the same reason the retention requirement
+  may not be defaulted: the party who carries the risk has to be the party who accepted it.
+
+- **A network-layer constraint on who may reach `/actuator` and `/metrics`, or the residual accepted in
+  writing.** Both surfaces are `permitAll` by necessity — a kubelet and a Prometheus scraper present no
+  credential, and the chart probes and scrapes them by path (`…/templates/cash-account.yaml:L51-L54`,
+  `L204-L222`). The module bounds what they disclose (the start-up recorder is filtered to six
+  lifecycle steps, and `env`, `beans`, `configprops`, `heapdump`, `threaddump` and the rest are not
+  exposed at all — [Run locally](../README.md#run-locally)); what it cannot bound is who may ask. The
+  residual is the Spring Boot version the startup endpoint's own descriptor carries, and the
+  `uri`-templated request metrics. A NetworkPolicy restricting ingress to port 8080 to the node (for
+  the kubelet) and the monitoring namespace (for the scrape) closes it without touching the chart's own
+  templates:
+
+  ```yaml
+  # Applied by the platform owner alongside the release, not part of the chart.
+  apiVersion: networking.k8s.io/v1
+  kind: NetworkPolicy
+  metadata:
+    name: cash-account-actuator-ingress
+    namespace: <namespace>
+  spec:
+    podSelector:
+      matchLabels: { app.kubernetes.io/name: <release>-cash-account }
+    policyTypes: [Ingress]
+    ingress:
+      # The retail and institutional surface, from the callers that use it.
+      - from:
+          - podSelector: { matchLabels: { app.kubernetes.io/name: <release>-broker } }
+          - podSelector: { matchLabels: { app.kubernetes.io/name: <release>-portfolio } }
+        ports: [{ port: 8080, protocol: TCP }]
+      # The scrape. The kubelet's probes originate on the node and are not matched by a
+      # namespaceSelector, so confirm against this cluster's CNI that node-sourced traffic is
+      # permitted before applying this - a policy that blocks the probes fails every pod.
+      - from:
+          - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: <monitoring-namespace> } }
+        ports: [{ port: 8080, protocol: TCP }]
+  ```
+
+  Verify the probes still pass after applying it (`kubectl -n <namespace> get pod … -o wide` showing
+  Ready, and no `Startup probe failed` event), and record the outcome in
+  `step0-actuator-reachability.txt`. If the cluster's CNI cannot express it, record that instead: the
+  disclosure is rated LOW and does not block, but the decision is evidence either way.
 
 - **A Prometheus scrape of the service's `/metrics` endpoint is in place**, because Step 3's error-rate
   rollback criterion is evaluated from it. The chart already annotates the pod for scraping with no
@@ -731,6 +884,37 @@ traffic on the line.
    answers for every role, and `on_search_path` names which schema is "production" for this
    session — the one Step 3 will use — without hard-coding `public`.
 
+   **One further query, and only where a `cash_account` table already exists** — a database some
+   earlier build of this service has already started against. The owner columns carry a `CHECK`
+   constraint that the start-up script adds to an existing table `NOT VALID`, so that rows written
+   before the constraint existed cannot stop a pod from starting. It is therefore possible for such a
+   database to hold an owner the service would now refuse, and Step 0 is where that is found:
+
+   ```sql
+   SELECT conrelid::regclass AS table_name, conname, convalidated
+     FROM pg_catalog.pg_constraint
+    WHERE conname LIKE '%\_owner\_identifier'
+    ORDER BY 1;
+
+   SELECT 'cash_account' AS table_name, owner FROM cash_account
+    WHERE owner !~ '^[A-Z0-9._-]{1,32}$'
+   UNION ALL
+   SELECT 'cash_reservation', owner FROM cash_reservation
+    WHERE owner !~ '^[A-Z0-9._-]{1,32}$'
+   UNION ALL
+   SELECT 'ledger_entry', owner FROM ledger_entry
+    WHERE owner !~ '^[A-Z0-9._-]{1,32}$'
+    ORDER BY 1,2;
+   ```
+
+   Pass condition: the first query returns the three constraints, and the second returns **no rows**.
+   With no rows outstanding, promote each constraint once — `ALTER TABLE <table> VALIDATE CONSTRAINT
+   ck_<table>_owner_identifier;` — and keep the re-run of the first query, now reporting
+   `convalidated = t`, as the evidence. If the second query does return rows, they are data to correct
+   with the data owner **before** cutover, not rows to delete here: a `ledger_entry` row cannot be
+   deleted at all (it is append-only), so an owner that reached the ledger is a finding for the data
+   owner and the reason `VALIDATE` is a separate, deliberate step rather than part of start-up.
+
    The pass condition, in schema terms:
 
    | Gate | `cash_account` | `cashaccount` |
@@ -839,6 +1023,80 @@ traffic on the line.
    the state to the cash-account data owner and the DDL-owning role before Step 1 begins. Step 0 is
    signed off on the claim that it changed no state this migration owns, and that claim has to be true.
 
+5. **Record the database-identity posture, and — if it is the split one — provision and verify the
+   runtime role.** This action changes no state in the selected store under either choice: option 2
+   writes a file, and option 1's `CREATE ROLE`/`GRANT` touch the catalog's role and privilege
+   metadata, never a table of this migration's. The schema itself is applied at Step 3(b), not here.
+
+   **Option 2 (single identity).** Record the acceptance and stop. Nothing is provisioned:
+
+   ```bash
+   # Written by the cash-account data owner, not on their behalf.
+   cat > step0-db-identity.txt <<'TXT'
+   posture: single-identity (chart-supplied database.id performs DDL and DML)
+   residual accepted: the request-handling identity owns ledger_entry and can DROP TRIGGER
+                      ledger_entry_immutable, then UPDATE/DELETE/TRUNCATE audit rows
+   compensating control: schema/cash-account-schema.sql is idempotent, so the next start-up
+                      re-creates ledger_entry_immutable and ledger_entry_immutable_truncate;
+                      no application code path can update, delete or truncate the ledger
+   accepted by: <name, role>
+   date: <YYYY-MM-DD>
+   reference: <change record / risk acceptance / ticket>
+   TXT
+   ```
+
+   **Option 1 (split identities).** The chart change carrying the second secret key must already be in
+   place. Provision as the DDL-owning role, with the connection coordinates and the `PGPASSFILE`
+   discipline of [Operator command safety](#operator-command-safety); the grants are the ones
+   [Hardened production posture](../README.md#schema-application) prescribes, and `<schema>` is the
+   schema the service's connection resolves to (the one action 3 reported as `on_search_path = t`):
+
+   ```bash
+   umask 077
+   psql -w -v ON_ERROR_STOP=1 <<'SQL' | tee step0-db-identity-grants.txt
+   \set QUIET on
+   -- The runtime role's password is supplied out of band by the secret manager and set with
+   -- \password or a separate ALTER ROLE, so it reaches neither this file nor the psql history.
+   CREATE ROLE :"runtime_role" LOGIN;
+   GRANT CONNECT ON DATABASE :"database" TO :"runtime_role";
+   GRANT USAGE ON SCHEMA :"schema" TO :"runtime_role";
+   GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA :"schema" TO :"runtime_role";
+   ALTER DEFAULT PRIVILEGES IN SCHEMA :"schema"
+     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO :"runtime_role";
+   SQL
+   ```
+
+   Then set `SPRING_SQL_INIT_MODE=never` on the cash-account Deployment and point `database.id` /
+   `database.password` at the runtime role. **Order matters**: with that setting the pod applies no
+   schema, and `spring.jpa.hibernate.ddl-auto=validate` fails start-up against a store that has none —
+   which is why the switch is applied together with gate 3(b), the action that applies the schema to
+   the production search path, and never before it.
+
+   Verify the separation once the tables exist — after 3(b) — as the **runtime role**, and keep the
+   output. Every statement must be refused and the row count must not move:
+
+   ```bash
+   psql -w -v ON_ERROR_STOP=0 <<'SQL' | tee step0-ledger-guard-privileges.txt
+   \set VERBOSITY verbose
+   SELECT count(*) AS ledger_rows_before FROM ledger_entry;
+   DROP TRIGGER ledger_entry_immutable ON ledger_entry;              -- 42501 must be owner of relation
+   ALTER TABLE ledger_entry DISABLE TRIGGER ledger_entry_immutable;  -- 42501 must be owner of table
+   DROP FUNCTION ledger_entry_reject() CASCADE;                      -- 42501 must be owner of function
+   TRUNCATE ledger_entry;                                            -- 42501 permission denied for table
+   UPDATE ledger_entry SET amount = 0;                               -- P0001 append-only: UPDATE rejected
+   DELETE FROM ledger_entry;                                         -- P0001 append-only: DELETE rejected
+   SELECT count(*) AS ledger_rows_after FROM ledger_entry;
+   SQL
+   ```
+
+   *Gate:* `step0-db-identity.txt` exists, names an authority and a date, and matches what the
+   Deployment actually runs — the effective `SPRING_SQL_INIT_MODE` and `database.id`. Under option 1,
+   all six statements above are refused with those two SQLSTATE classes and `ledger_rows_after` equals
+   `ledger_rows_before`. A statement that **succeeds** is a provisioning error: the role owns something
+   it should not, so revisit ownership before routing any traffic — `audit/LedgerImmutabilityIT`
+   asserts the same six refusals against a container, so a divergence here is the deployment's, not
+   the module's.
+
 ### Evidence to capture
 
 | Item | Class | What it is |
@@ -848,21 +1106,49 @@ traffic on the line.
 | `step0-snapshot-pointer.txt` | change record | The pointer line for the sealed snapshot: file name, class, checksum from `step0-snapshot.sha256`, store locator, custodian and named readers |
 | `step0-values-snapshot.yaml` / `step0-cr-snapshot.yaml`, with their `-o json` counterparts | **restricted** | The live values or CR, verbatim — the rollback target Step 3's post-(e) restore applies byte-for-byte. It embeds `database.password`, `oidc.clientId`/`clientSecret` and every other credential the release carries, so it is sealed and never attached |
 | `step0-image-digest.txt` | change record | The pushed image digest from `docker inspect`, and the `cashAccount.image.repository` / `.tag` values it splits into, which gate 3(e) applies verbatim |
+| `step0-image-scan.txt` | change record | Both image scans of the promoted artifact: the informational pass in full — every finding, including the ones with no fix available — and the blocking gate's exit status, each naming the scanner version and its vulnerability-database timestamp, because a scan is only as current as the database it ran against |
+| `step0-base-image.txt` | change record | The base image tag, its manifest-list digest, the OS and JDK package versions read out of the image, and the date the stream head was re-derived. This is what makes "the base was current when we promoted" a dated claim rather than an impression |
+| `step0-dependency-scan.txt` | change record | The NVD dependency-scan report — or, where no feed was provisioned, the recorded failure verbatim together with the build-input scan that stood in for it, which is what the sign-off then refers to |
 | `step0-catalog-baseline.txt` | change record | Both catalog queries' output, schema-qualified: `cash_account` absent from every schema, `cashaccount` as the estate created it, and which schema reports `on_search_path = t`. Catalog metadata only — relation, column and type names, no row of either table |
 | `step0-memory-fit.txt` | change record | The readiness status code and the heap line under `--memory=2g --cpus=1`, **naming the throwaway instance it ran against** and recording that it was destroyed. A memory-fit record that names the release's store is a Step 0 failure, not evidence |
 | `step0-store.txt` | change record | The effective `database.kind` and the server version reported by `SELECT version();` |
+| `step0-framework-support.txt` | change record | The written framework-support determination — which of **stay / buy support / move line** was chosen, by whom, dated — together with the artifact inventory and image-scan output it was decided against (`./mvnw -B dependency:tree` and the Trivy image scan of the digest recorded above), so the decision and the evidence under it are one record. If the choice is *move line*, this file also carries the re-gate and re-scan of the rebuilt artifact |
+| `step0-authorization-record.txt` | change record | The status of rows D1–D6 of the README's authorization record at the moment Step 0 is signed, each with its authorizer, date and reference — a `PENDING` row here is an open deviation entering the cutover, which is the fact this evidence item exists to make visible |
+| `step0-db-identity.txt` | change record | The chosen database-identity posture, the authority who chose it and the date — and, for the single-identity option, the accepted residual verbatim. This file **is** the decision; its absence blocks Step 1 |
+| `step0-db-identity-grants.txt` | change record | Option 1 only: the `CREATE ROLE` / `GRANT` transcript for the runtime role. Role and database names, no password — the secret manager supplies that out of band |
+| `step0-ledger-guard-privileges.txt` | change record | Option 1 only: the six refused statements as the runtime role, with their SQLSTATEs, and the `ledger_rows_before` / `ledger_rows_after` counts that must match. Captured after gate 3(b), when the tables exist |
+| `step0-actuator-reachability.txt` | change record | Whether a NetworkPolicy now constrains ingress to port 8080, the probe outcome after applying it, or the recorded decision to accept the LOW residual disclosure of `/actuator` and `/metrics` |
 
 ### Sign-off required
 
 - **Platform owner** — the PostgreSQL move (`database.kind: postgres`, version ≥ 12, `database.*`
   pointing at it) and `vault.enabled: false`, each as a change completed in its own right.
+- **Platform owner** — the promoted image's scan result and the base-image pin, as one sign-off over
+  `step0-image-scan.txt`, `step0-base-image.txt` and `step0-dependency-scan.txt`. Where no
+  vulnerability feed was provisioned, this sign-off states that the NVD scan did not run and names the
+  two Trivy scans as the coverage accepted in its place; where a fixable CRITICAL or HIGH finding is
+  being carried, it names the finding, why no newer base or dependency version removes it, and the
+  compensating control — an outstanding decision for the requesting organization, never a suppression
+  applied at the scanner.
 - **Cash-account data owner** — the catalog-query baseline, because they are the party who must later
   be able to say that `cashaccount` was never touched.
+- **Cash-account data owner** — the database-identity posture in `step0-db-identity.txt`. Under option
+  1 they are signing that the request-handling role owns nothing and that the six refusals were
+  observed; under option 2 they are signing the residual itself, which is that the ledger they will
+  reconcile against can be rewritten by the service's own credential between restarts. Nobody else may
+  sign this, and it may not be defaulted — the same rule the retention requirement carries.
+- **Platform owner** — the actuator reachability decision in `step0-actuator-reachability.txt`, since
+  the NetworkPolicy and the monitoring topology are theirs; a recorded acceptance of the LOW residual
+  is a valid outcome, an unrecorded one is not.
 - **Platform owner and cash-account data owner** — the evidence-handling determination, the restricted
   store and the secret-manager location, and that the snapshot reached the store rather than the change
   record: the platform owner for the release-configuration class they are custodian of, the data owner
   for the owner-level class every step below produces. This sign-off is what makes the classification a
   decision somebody made rather than a convention somebody followed.
+- **Requesting organization, with risk** — the framework-support determination and the authorization of
+  the nine dependency overrides (row D1). Nobody building, reviewing or operating this module may
+  record either on the organization's behalf, for the same reason the retention requirement may not be
+  defaulted: an acceptance nobody granted is worse than an exposure plainly marked outstanding.
 
 ### Rollback criterion
 
@@ -871,6 +1157,13 @@ is a **block**: any unmet prerequisite stops every step below from beginning. In
 
 - `database.kind` still `db2`, or a server older than PostgreSQL 12;
 - no recorded image digest, or a digest that does not match the artifact that passed `./mvnw -B clean verify`;
+- a blocking image scan that was not run, exited non-zero, or was run against an artifact other than
+  the digest being promoted — in which case what passed the gate and what the pod would run are two
+  different images;
+- no recorded base-image check, or a scan whose database timestamp predates the build: both mean the
+  gate's verdict describes something other than what is being promoted;
+- a dependency scan recorded as done when no feed was provisioned to do it with, which is the one
+  failure mode of this prerequisite that leaves no trace in the evidence;
 - a catalog query showing a pre-existing `cash_account` in any schema — which means something already
   applied this schema, and the "final load into an empty production schema" gate in Step 3(b) cannot
   be evaluated;
@@ -878,10 +1171,21 @@ is a **block**: any unmet prerequisite stops every step below from beginning. In
   exactly that `cash_account` and voids the baseline;
 - `vault.enabled` true;
 - no `CREATE SCHEMA` identity, which makes Step 1's isolation impossible;
+- **no recorded database-identity posture**, or a `step0-db-identity.txt` that contradicts what the
+  Deployment runs — option 1 recorded while `SPRING_SQL_INIT_MODE` is unset, or the runtime role
+  recorded while `database.id` still carries the owner. Step 3(c) validates owner balances and every
+  scheduled reconcile judges the ledger, so who can rewrite it has to be settled before either runs;
+- under option 1, any of the six guard statements **succeeding** as the runtime role, which means that
+  role owns an object it should not;
 - **no restricted evidence store, no secret-manager location, or no written evidence-handling
   determination** — which blocks every step below rather than only this one, because the first thing
   action 2 captures is a file holding the release's credentials and the first thing Step 1 queries is a
-  set of owner balances. There is nowhere to put either until those three exist.
+  set of owner balances. There is nowhere to put either until those three exist;
+- **no written framework-support determination** — the artifact every step below deploys carries three
+  advisories that no in-module change can patch, and the only thing standing between them and a
+  financial write surface is this deployment's own configuration. Proceeding without the determination
+  is accepting that risk without anybody having accepted it. A rebuilt artifact on a later line that
+  has not been re-gated and re-scanned is the same block.
 
 Resolve the item and re-capture the affected evidence. Do not proceed with a noted exception: each of
 these is load-bearing for a later gate, and a step whose gate cannot be evaluated has failed.
@@ -1085,6 +1389,14 @@ the artifacts in this repository and must be reconciled with the deployed catalo
    - **`DIGITS` zero-pads**, which is correct here because the reader accepts leading zeros but
      right-trims only: a leading blank is data to it, so a mask that blank-suppresses would produce
      fields it rejects.
+
+   Worth stating once, because it looks like a contradiction of the service's own owner rule: the
+   quoting below still has to handle an owner full of quotes and newlines even though no such owner
+   can exist in the target. The export is legacy data from a `CHAR(32)` column that restricted nothing
+   (`backend/cash-account-cobol/DB2-DDL/DB2DDL.jcl:L47`), and such a row must arrive **intact** to be
+   recorded as a `STATE` / `INVALID_OWNER_IN_LEGACY` finding naming the owner it refused. A row mangled
+   by an under-quoted unload is a finding an operator cannot act on; a row that fails the reader's
+   parse aborts the whole single-transaction load and records nothing at all.
 
    The `CAST` widths are the worst case, not the typical one, because a `CAST` that is too narrow
    truncates silently: an owner of 32 characters that are all quotes doubles to 64 and quotes to 66,
@@ -2315,7 +2627,8 @@ by whether gate (e) has been applied.
                 -- Rows that describe the export or the load itself, not an account's movement: no caller
                 -- write can account for them, and gate (b) required the export to produce none.
                 WHEN COALESCE(v.legacy_value, '') IN
-                     ('NULL_IN_LEGACY', 'INVALID_IN_LEGACY', 'MISSING_IN_LEGACY')
+                     ('NULL_IN_LEGACY', 'INVALID_IN_LEGACY', 'INVALID_OWNER_IN_LEGACY',
+                      'MISSING_IN_LEGACY')
                   OR COALESCE(v.migrated_value, '') = 'RESERVATIONS_OUTSTANDING'
                   OR v.variance_kind IN ('RATE_SOURCE', 'TRANSACTION_COUNT')
                   THEN 'SOURCE_ROW'
@@ -3071,6 +3384,9 @@ pending, each against the step that closes it.
 
 | Criterion | Closed by | Status |
 | --- | --- | --- |
+| A supported framework line, or written acceptance of the residual advisories that ship on the mandated one | [Step 0](#step-0--prerequisites), on the requesting organization's written determination — stay on 3.3.13 with the stated controls, buy commercial support, or authorize a later minor line — recorded with the authorization of the nine dependency overrides (row D1) | **Pending** |
+| The database-identity posture — split DDL-owning and DML-only roles with `SPRING_SQL_INIT_MODE=never` (which needs the chart's second secret key), or the single identity with its residual accepted | Step 0, on the cash-account data owner's recorded decision in `step0-db-identity.txt` | **Pending** |
+| Network-layer constraint on who may reach `/actuator` and `/metrics`, or a recorded acceptance of the LOW residual disclosure | Step 0, on the platform owner's record in `step0-actuator-reachability.txt` | **Pending** |
 | Legacy balances migrated with zero variance against real DB2 for z/OS and VSAM data | Step 1, on the cash-account data owner's acceptance of every variance row | **Pending** |
 | Dual-run clean for the agreed number of consecutive windows | Step 2, on the product owner's and risk's joint sign-off | **Pending** |
 | Cutover completed and routing through broker confirmed | Step 3, on the platform operator's and data owner's gate sign-offs and the product owner's post-(g) sign-off | **Pending** |
@@ -3093,6 +3409,7 @@ it is not evidence about any real data set.
 | --- | --- |
 | [`../README.md`](../README.md) | The build → scan → push → digest path, the environment↔property map, the tooling command reference, the chart values consumed, and the open items |
 | [`../README.md#image-build-scan-and-push`](../README.md#image-build-scan-and-push) | The exact image path Step 0 requires, including the `docker inspect` digest capture |
+| [`../README.md#the-nine-dependency-overrides-and-why-no-bom-version-remediates-them`](../README.md#the-nine-dependency-overrides-and-why-no-bom-version-remediates-them) | The nine advisory-driven version overrides this service ships, the three advisories on the `spring-boot` artifacts that no override can reach with the controls that stand in their place, and the authorization record Step 0 collects — the evidence the framework-support determination is made against |
 | [`legacy-characterization.md`](legacy-characterization.md) | The legacy behaviour, cited to `file:line`. §10 **Acceptance** carries the `Status` field that Step 1's `characterization_status` gate reads; §9.5 is the record-length open item; §9.6 the code page and time zone; §9.7 the `cyrrnbase` / `CURRNBASE` spelling |
 | [`../src/test/resources/fixtures/legacy-export/`](../src/test/resources/fixtures/legacy-export/) | The export shapes Steps 1 and 3 must produce — `cashaccounty.csv`, `frankfurt1.csv`, `history.csv`, `history.cp037.bin` — in matched and seeded-mismatch variants, each with a `MANIFEST.md` |
 | [`../src/test/resources/fixtures/shadow/`](../src/test/resources/fixtures/shadow/) | The Step 2 stream shapes (`transactions.csv`, `legacy-responses.csv`) and `rollback-replay.csv`, the worked example of the Step 3 replay-file contract |

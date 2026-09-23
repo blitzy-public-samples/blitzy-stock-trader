@@ -86,6 +86,12 @@ class RetailContractIT extends PostgresTestSupport {
     /** Never created by any scenario, which is what makes the 404 assertion mean something. */
     private static final String MISSING_OWNER = "CTMISSING";
 
+    /**
+     * The owner the runtime security pass created through this seam, in the form it was stored in - upper-cased
+     * markup. Nothing may hold it now, which is what the F03 scenario reads the repository for.
+     */
+    private static final String MARKUP_OWNER_CANONICAL = "SEC1<IMG SRC=X ONERROR=ALERT(1)>";
+
     // Every account is USD, the configured fx base, where a same-currency operation short-circuits to a rate of
     // exactly 1 with no outbound call (AAP 0.7.2) - so no scenario here reaches the fx url application-test.yml
     // points at a refused port. It is also broker's own default account currency
@@ -271,6 +277,43 @@ class RetailContractIT extends PostgresTestSupport {
                         .as("GET /cash-account/{owner} for a never-created owner must answer"
                                 + " 404 ACCOUNT_NOT_FOUND")
                         .isEqualTo(ACCOUNT_NOT_FOUND_STATUS));
+    }
+
+    // The seam's own answer to QA finding F03, asserted here rather than only as a unit: the runtime pass drove
+    // this exact request and received 200 with a persisted row, so the contract is where the repair has to show.
+    // Sent through TestRestTemplate with a pre-built URI rather than through the typed client, because the client
+    // re-encodes a @PathParam and the point is the percent-encoded segment a caller can actually put on the wire.
+    @Test
+    void ownerCarryingMarkupIsRejectedAsInvalidOwnerAndCreatesNoAccount() {
+        URI markupOwner = URI.create(url(RETAIL_BASE) + "/SEC1%3Cimg%20src%3Dx%20onerror%3Dalert(1)%3E");
+
+        ResponseEntity<String> created = rest.exchange(markupOwner, HttpMethod.POST,
+                new HttpEntity<>("{\"balance\":1,\"currency\":\"" + ACCOUNT_CURRENCY + "\"}", jsonHeaders()),
+                String.class);
+
+        assertThat(created.getStatusCode())
+                .as("POST /cash-account/{owner} with markup in the path must answer 400 INVALID_OWNER")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(created.getBody())
+                .as("the refusal must carry the ApiError code rather than a framework body")
+                .isNotNull()
+                .contains("\"code\":\"INVALID_OWNER\"");
+
+        // The status alone is not the finding: what F03 recorded was a ROW, created and then echoed back to
+        // callers, so the account's absence is the assertion that closes it.
+        assertThat(accounts.findByOwner(MARKUP_OWNER_CANONICAL))
+                .as("a refused owner must leave no cash_account row behind")
+                .isEmpty();
+
+        // Refused on the way in, not answered 404 after a lookup: the same value is invalid on a read, which is
+        // what keeps the rule one rule instead of a write-side check.
+        ResponseEntity<String> read = rest.exchange(markupOwner, HttpMethod.GET,
+                new HttpEntity<>(jsonHeaders()), String.class);
+
+        assertThat(read.getStatusCode())
+                .as("GET /cash-account/{owner} with markup in the path must answer 400, not 404")
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(read.getBody()).isNotNull().contains("\"code\":\"INVALID_OWNER\"");
     }
 
     @Test

@@ -1,6 +1,7 @@
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.domain;
 
 import java.util.Locale;
+import java.util.regex.Pattern;
 
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.error.CashAccountErrorCode;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.error.CashAccountException;
@@ -12,9 +13,27 @@ public final class OwnerNormalizer {
     // [backend/cash-account-cobol/COBOL/DCLCASH.cpy:L9] and in the DDL
     // [backend/cash-account-cobol/DB2-DDL/DB2DDL.jcl:L47] - and it is the width of every owner column in
     // cash-account-schema.sql. It is measured in Unicode code points because PostgreSQL counts character
-    // varying in characters, so counting UTF-16 units instead would refuse an owner of 32 supplementary
-    // code points that VARCHAR(32) stores without complaint.
+    // varying in characters, so counting UTF-16 units instead would refuse a value of 32 supplementary code
+    // points that VARCHAR(32) stores without complaint. That is load-bearing for canonicalize(...) rather than
+    // for normalize(...): a stored owner is ASCII by the character rule below, while a legacy staging key is
+    // whatever the export decoded to.
     public static final int MAX_LENGTH = 32;
+
+    /**
+     * The character set a stored owner may be spelled with, once canonical: upper-case ASCII letters, digits,
+     * and the three separators real user identifiers carry - {@code .}, {@code _} and {@code -}.
+     *
+     * <p>Public and unanchored so the identical text can be anchored into the {@code CHECK} constraint on every
+     * owner column of {@code src/main/resources/schema/cash-account-schema.sql}: one expression, written once,
+     * with {@code OwnerNormalizerTest} asserting the schema still carries it. Two copies of an identity rule
+     * drift, and a drifted copy either refuses an owner the database would accept or accepts one the database
+     * then rejects with a constraint violation instead of a {@code 400}.
+     */
+    public static final String PERMITTED_OWNER_REGEX = "[A-Z0-9._-]{1," + MAX_LENGTH + "}";
+
+    // Applied to the canonical form, never to the raw value: the fold is what makes a single pattern sufficient,
+    // since a lower-case caller value is upper-cased before it is judged rather than refused for its casing.
+    private static final Pattern PERMITTED_OWNER = Pattern.compile(PERMITTED_OWNER_REGEX);
 
     /**
      * The canonical form of the one path segment the institutional surface owns under {@code /cash-account}.
@@ -28,15 +47,71 @@ public final class OwnerNormalizer {
     }
 
     /**
-     * Returns the canonical stored form of {@code raw}: stripped and upper-cased.
+     * Returns the stored form of {@code raw}: stripped, upper-cased, and spelled with permitted characters only.
      *
-     * @param raw the owner exactly as it arrived from a caller, an export row or a replay stream
-     * @return the canonical owner, 1 to {@value #MAX_LENGTH} Unicode code points, upper case
-     * @throws CashAccountException with {@link CashAccountErrorCode#INVALID_OWNER} (HTTP 400) when
-     *         {@code raw} is null, blank, or whose canonical form exceeds {@value #MAX_LENGTH} Unicode
-     *         code points once stripped and upper-cased
+     * <p>This is the identity rule for every owner a caller can name - retail and institutional alike - and for
+     * every owner this service stores. A legacy export row is judged by the same rule but is never applied
+     * through it; see {@link #canonicalize(String)}.
+     *
+     * @param raw the owner exactly as it arrived from a caller
+     * @return the canonical owner, 1 to {@value #MAX_LENGTH} characters of {@value #PERMITTED_OWNER_REGEX}
+     * @throws CashAccountException with {@link CashAccountErrorCode#INVALID_OWNER} (HTTP 400) when {@code raw}
+     *         is null, is blank, exceeds {@value #MAX_LENGTH} Unicode code points once stripped and upper-cased,
+     *         or carries any character outside {@value #PERMITTED_OWNER_REGEX}
      */
+    // The character rule is a deliberate narrowing of AAP 0.4.2 and 0.6.2, which fix INVALID_OWNER to
+    // blank-or-over-32 and state no character class, adopted to close QA finding F03 (CWE-20, downstream CWE-79
+    // risk): the unconstrained segment accepted and PERSISTED markup, shell and template metacharacters, SQL
+    // fragments and arbitrary unicode as account identifiers - 12 such rows were created through this seam - and
+    // every one of them was then reflected back in the owner field of a 200 response. Nothing was ever injected,
+    // because JPA binds parameters and the ledger stores text, but an identifier is the one value this service
+    // echoes to callers, writes into log records and joins reconciliation on, so it is spelled from a set chosen
+    // rather than from whatever a URL can carry. The legacy CHAR(32) column carried no character restriction
+    // [backend/cash-account-cobol/DB2-DDL/DB2DDL.jcl:L47], which is exactly why refusing here must not refuse a
+    // legacy export row on the way in: canonicalize(...) below is that path, and the tooling records such a row
+    // as a reviewable finding instead of failing a whole single-transaction bulk load (AAP 0.6.3).
     public static String normalize(String raw) {
+        String canonical = canonicalize(raw);
+
+        if (!permits(canonical)) {
+            throw CashAccountException.forOwner(CashAccountErrorCode.INVALID_OWNER, raw);
+        }
+
+        return canonical;
+    }
+
+    /**
+     * Returns whether {@code canonical} is spelled entirely from {@value #PERMITTED_OWNER_REGEX}.
+     *
+     * @param canonical a canonical owner, as {@link #canonicalize(String)} returns
+     * @return {@code true} when a value of this spelling may be stored as an owner
+     */
+    // A predicate rather than a caught exception, because the migration tooling has to ASK the question: an
+    // export row it must classify is not an error to unwind, and exception-as-control-flow inside a bulk load
+    // would put the refusal on the same footing as an unreadable file. Callers:
+    // migration/reconcile/ReconciliationService, which records the refusal as a finding.
+    public static boolean permits(String canonical) {
+        return canonical != null && PERMITTED_OWNER.matcher(canonical).matches();
+    }
+
+    /**
+     * Returns the canonical form of {@code raw} - stripped, upper-cased and bounded - without judging how it is
+     * spelled, which is the join key a legacy row is carried under.
+     *
+     * <p>Two consumers, both reading legacy data rather than serving a caller: the loader's uppercased
+     * {@code legacy_history.owner_key}, whose raw {@code WS-VR-NAME} could hold any byte a COMMAREA carried, and
+     * the reconciler, which needs the owner NAMED in the finding that refuses it.
+     *
+     * @param raw the owner exactly as it arrived from an export row, a replay stream or the target's own column
+     * @return the canonical owner, 1 to {@value #MAX_LENGTH} Unicode code points, upper case
+     * @throws CashAccountException with {@link CashAccountErrorCode#INVALID_OWNER} (HTTP 400) when {@code raw}
+     *         is null, blank, or exceeds {@value #MAX_LENGTH} Unicode code points once stripped and upper-cased
+     */
+    // Blank and over-length still throw here, and deliberately: neither is a value the VARCHAR(32) staging key
+    // can hold at all, so an export carrying one is a file to fix rather than a row to lose (staging is
+    // lossless). What this form does NOT do is decide identity - that is normalize's job - so a legacy owner
+    // spelled with a byte the target refuses still reaches a finding under its own name.
+    public static String canonicalize(String raw) {
         // Null carries no value worth echoing back, so this one rejection travels without an owner field
         // while the others use forOwner so ApiError can name what was refused.
         if (raw == null) {
@@ -78,20 +153,18 @@ public final class OwnerNormalizer {
             throw CashAccountException.forOwner(CashAccountErrorCode.INVALID_OWNER, raw);
         }
 
-        // Blank and over-length are the ONLY rejections, and the absence of a character-class check is a recorded
-        // decision rather than an oversight. Length and casing are the whole of owner identity here: the legacy
-        // CHAR(32) column carried no character restriction, AAP 0.4.2 and 0.6.2 fix INVALID_OWNER to exactly these
-        // two conditions, and a narrower set would refuse export rows that migration/load/LegacyLoader must be able
-        // to carry - failing a whole single-transaction bulk load (AAP 0.6.3) over a byte the ledger stores
-        // harmlessly. strip() removes leading and trailing whitespace, U+2028 and U+2029 among it, but an INTERIOR
-        // control or formatting code point survives into the canonical form by design.
+        // Blank and over-length are this form's only rejections: strip() removes leading and trailing whitespace,
+        // U+2028 and U+2029 among it, while an INTERIOR control or formatting code point survives into the
+        // canonical form. That is correct for a legacy join key and is why normalize(...) applies the character
+        // rule on top of this rather than inside it - a byte the legacy CHAR(32) column carried
+        // [backend/cash-account-cobol/DB2-DDL/DB2DDL.jcl:L47] must still be able to reach a reconciliation
+        // finding under its own name.
         //
-        // What that costs is contained where it can do damage, which is not here: a value carrying a line
-        // separator forges structure when it is written into a line-oriented format, so every log record that
-        // names an owner encodes it through error/LogSafeText (the only place in this module that logs one is
-        // error/ApiExceptionHandler), and the JSON payload escapes it as a matter of course. Do not "fix" this
-        // method by adding a pattern - the encoding at the boundary is the fix, and narrowing identity here would
-        // change which accounts exist.
+        // The two boundaries that value crosses are therefore both encoded rather than trusted: a line separator
+        // forges structure in a line-oriented format, so every log record naming an owner goes through
+        // error/LogSafeText (error/ApiExceptionHandler is the only place in this module that logs one), and the
+        // JSON payload escapes it as a matter of course. Both still matter after F03, because a REFUSED owner is
+        // echoed back raw - that is the value the rejection has to name.
         return canonical;
     }
 
@@ -103,9 +176,9 @@ public final class OwnerNormalizer {
      */
     // A predicate, deliberately not a rejection inside normalize. The two are different concerns: the
     // institutional surface is "a separate, additive path space" under /cash-account (AAP 0.6.2), and
-    // /cash-account/institutional is a segment of it - but AAP 0.4.2 and 0.6.2 fix owner identity to exactly
-    // blank-or-over-32, so refusing this value as an OWNER would change which accounts can exist and would fail a
-    // whole single-transaction bulk load (AAP 0.6.3) over one legacy row. What is reserved is the retail ROUTE:
+    // /cash-account/institutional is a segment of it - but INSTITUTIONAL is an ordinarily spelled owner that the
+    // character rule admits, so refusing the VALUE would change which accounts can exist and would refuse a
+    // legacy export row the CHAR(32) column could hold. What is reserved is the retail ROUTE:
     // retail/RetailCashAccountController answers 404 UNSUPPORTED_PATH for it, while the loader, the reconciler and
     // the institutional endpoints carry the same owner unchanged.
     //

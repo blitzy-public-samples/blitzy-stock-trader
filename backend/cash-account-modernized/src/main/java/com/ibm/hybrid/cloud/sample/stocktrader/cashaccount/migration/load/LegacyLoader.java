@@ -385,7 +385,12 @@ public class LegacyLoader {
                               ReconciliationService.SourceValidation validation,
                               LegacyCashAccountRecord record,
                               LoadTally tally) {
-        String owner = OwnerNormalizer.normalize(record.owner());
+        // canonicalize, not normalize: the key this pass compares against the validation's refusals has to exist
+        // for every row of the export, refused rows included. An owner spelled with a character the target's
+        // identifier rule refuses is already a finding of validateSource above, so raising here would abort the
+        // whole load - one transaction, AAP 0.6.3 - over a row the run had already classified. The applying path
+        // below is still strict: CashAccount.open normalizes, so nothing outside the rule is ever inserted.
+        String owner = OwnerNormalizer.canonicalize(record.owner());
 
         // A repeated owner is malformed input rather than a last-write-wins case: the legacy primary key was
         // the owner itself, stored upper case (CASH00.cbl:L155), so a well-formed unload cannot produce one
@@ -522,8 +527,13 @@ public class LegacyLoader {
         // folded no case (CASH00.cbl:L111) while the account table stored upper case, so "John"+stamp and
         // "JOHN"+stamp were distinct 29-byte keys (DEFKSDS.jcl:L14) that a fold here would merge. A blank
         // name propagates as INVALID_OWNER: staging is lossless, so it is a file to fix, not a row to lose.
+        //
+        // canonicalize, not normalize, and for the reason the key exists at all: WS-VR-NAME is whatever the
+        // caller put in the COMMAREA (CASH00.cbl:L114), so a history record may legitimately name an owner the
+        // target's identifier rule refuses. Folding it stages the row and simply joins no account, which is the
+        // lossless outcome; judging identity here would fail the load over a byte in an audit record.
         stage(legacyHistory.save(LegacyHistory.staged(run.runId(), record,
-                OwnerNormalizer.normalize(record.name()), eventAt(record, legacyTimeZone))), tally);
+                OwnerNormalizer.canonicalize(record.name()), eventAt(record, legacyTimeZone))), tally);
     }
 
     // The duplicate-key check is the database's, not a set in memory: the staging tables declare the legacy

@@ -23,8 +23,9 @@ import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestClientException;
 
 /**
- * Publishes the single bounded, header-free HTTP client used for the outbound exchange-rate lookup, the rate lookup
- * itself and its {@code ExchangeRateSource} bean staying in {@code fx}.
+ * Publishes the single bounded HTTP client used for the outbound exchange-rate lookup, carrying one compiled-in
+ * default header and nothing caller-derived, the rate lookup itself and its {@code ExchangeRateSource} bean staying
+ * in {@code fx}.
  */
 @Configuration
 public class FxClientConfig {
@@ -48,6 +49,25 @@ public class FxClientConfig {
      */
     public static final int MAX_RESPONSE_BYTES = 64 * 1024;
 
+    /**
+     * The one default header this client carries: a fixed, version-free identity for the outbound rate request.
+     *
+     * <p>A deliberate deviation from AAP 0.7.5, whose parenthetical describes this class as setting <em>no</em>
+     * default headers. The normative requirement behind that parenthetical is untouched - the caller's credential
+     * is never forwarded to the public rate provider, and the block in {@code fxRestClient} still attaches nothing
+     * caller-derived. Carrying no User-Agent at all turned out to be the weaker posture: the JDK client supplies
+     * its own {@code Java-http-client/<patch>} whenever a request arrives without one, so the absence published
+     * this runtime's exact patch level to a third party and to anything on the path between - the CWE-200
+     * disclosure that helps an attacker pick which JDK CVE to try against the base image.
+     *
+     * <p>No version, no host and nothing derived from the caller, which is the point rather than brevity: a
+     * version string would re-create the same disclosure one layer up, and a caller-derived value would make this
+     * header the very leak the {@code Authorization} prohibition exists to prevent. Public so
+     * {@code fx/CurrencyConversionTest}, which lives in another package, asserts this constant rather than a copy
+     * of its text.
+     */
+    public static final String USER_AGENT = "cash-account-service";
+
     // Not a @Bean, and that is a wiring constraint rather than a style choice: this application runs
     // @EnableScheduling for the reservation expiry sweep, and Spring's ScheduledAnnotationBeanPostProcessor adopts
     // a context ScheduledExecutorService when no TaskScheduler is defined, which would move that sweep onto this
@@ -63,7 +83,8 @@ public class FxClientConfig {
      * {@code @Qualifier("fxRestClient")} all resolve to it.
      *
      * @param properties source of {@code cashaccount.fx.timeout}, the budget for the whole exchange applied below
-     * @return a client with a bounded exchange deadline and response size, no default headers and no base URL
+     * @return a client with a bounded exchange deadline and response size, exactly one default header - the fixed
+     *         {@link #USER_AGENT} - and no base URL
      */
     @Bean
     public RestClient fxRestClient(CashAccountProperties properties) {
@@ -96,15 +117,18 @@ public class FxClientConfig {
 
         // Broker propagates the caller's credential into this service
         // [backend/broker/src/main/resources/META-INF/microprofile-config.properties:L1] and the public FX provider
-        // requires none, so no default header is attached and the plain builder is used rather than the
-        // auto-configured one, which a customizer contributed elsewhere in the context could reach. No base URL
-        // either: the chart supplies the endpoint as CURRENCY_API_URL and the client sends it as an absolute URI.
-        // The one interceptor exists to take something away rather than add anything: it sets no header and reads
-        // nothing of the request, and it bounds the answer in both dimensions no timeout on this transport can -
-        // its total time (see boundedAnswer) and its size (see MAX_RESPONSE_BYTES) - before a message converter
-        // sees it.
+        // requires none, so the only default header attached is the compiled-in USER_AGENT and nothing
+        // caller-derived - no credential, no cookie, no forwarded request attribute - ever travels with a rate
+        // lookup. The plain builder is used rather than the auto-configured one for that same reason: a
+        // customizer contributed elsewhere in the context could reach the auto-configured one and add a header
+        // this class never chose. No base URL either: the chart supplies the endpoint as CURRENCY_API_URL and the
+        // client sends it as an absolute URI. The one interceptor exists to take something away rather than add
+        // anything: it sets no header and reads nothing of the request, and it bounds the answer in both
+        // dimensions no timeout on this transport can - its total time (see boundedAnswer) and its size (see
+        // MAX_RESPONSE_BYTES) - before a message converter sees it.
         return RestClient.builder()
                 .requestFactory(requestFactory)
+                .defaultHeader(HttpHeaders.USER_AGENT, USER_AGENT)
                 .requestInterceptor((request, body, execution) -> {
                     // Taken before the exchange starts, so the one configured budget covers connect, headers and
                     // body reception together for this attempt rather than each phase separately: the deadline is

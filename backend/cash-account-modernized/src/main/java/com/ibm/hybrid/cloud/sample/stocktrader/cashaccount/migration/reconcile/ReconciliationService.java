@@ -58,6 +58,11 @@ public class ReconciliationService {
 
     private static final String INVALID_IN_LEGACY = "INVALID_IN_LEGACY";
 
+    // Distinct from INVALID_IN_LEGACY above, which names an out-of-set CURRENCY: an operator triaging these rows
+    // acts on them differently - a currency is reclassified, an owner has to be renamed upstream - and one token
+    // for both would put that decision back in the reviewer's head.
+    private static final String INVALID_OWNER_IN_LEGACY = "INVALID_OWNER_IN_LEGACY";
+
     private static final String NULL_RATE = "NULL_RATE";
 
     private static final String MISSING_IN_TARGET = "MISSING_IN_TARGET";
@@ -168,7 +173,8 @@ public class ReconciliationService {
     /**
      * What the source validation established about one legacy export, for the loader that has to act on it.
      *
-     * @param rejectedOwners   owners refused, normalized by {@link OwnerNormalizer#normalize(String)}; refusals
+     * @param rejectedOwners   owners refused, keyed by {@link OwnerNormalizer#canonicalize(String)} so that an
+     *                         owner refused FOR its spelling is still named here; refusals
      *                         rather than acceptances, so this stays proportional to the findings a data owner
      *                         reviews instead of growing with a whole DB2 unload
      * @param rejectedRateKeys rate keys refused, exactly as the export's {@code currnkey} column held them,
@@ -297,10 +303,25 @@ public class ReconciliationService {
         classification.legacyAccountCount++;
         boundFindings(classification);
 
-        // An owner the legacy CHAR(32) column could not have held is a malformed export rather than a variance:
-        // normalize(...) raises, the transaction aborts and the run is recorded FAILED, which is the right
-        // outcome for a file that cannot be trusted at all.
-        String owner = OwnerNormalizer.normalize(record.owner());
+        // An owner the legacy CHAR(32) column could not have held at all - blank, or over 32 characters - is a
+        // malformed export rather than a variance: canonicalize(...) raises, the transaction aborts and the run
+        // is recorded FAILED, which is the right outcome for a file that cannot be trusted at all. A value the
+        // column COULD hold is a different matter and is classified below, under its own name.
+        String owner = OwnerNormalizer.canonicalize(record.owner());
+
+        // The legacy column restricted no character (DB2DDL.jcl:L47) while the target's identifier rule does
+        // (domain/OwnerNormalizer, closing QA finding F03), so an export may legitimately name an owner no
+        // cash_account row can carry. Recorded and not loaded, exactly as a NULL or an out-of-set currency is:
+        // the data owner renames the account upstream or reclassifies the row, and until then the account is
+        // visibly absent rather than silently mangled into a spelling nobody chose. This is checked before the
+        // NULL test because it disqualifies the row whatever its other columns hold.
+        if (!OwnerNormalizer.permits(owner)) {
+            record(run, owner, VarianceKind.STATE, ReconciliationStatus.VARIANCE,
+                    INVALID_OWNER_IN_LEGACY, null, null, null);
+            classification.rejectedOwners.add(owner);
+            classification.variances++;
+            return;
+        }
 
         // Selecting a NULL balance or currency into a host variable with no indicator was the SQLCODE -305 case,
         // so the legacy account was unreachable through Q/U/X/C/D while the null stood (CASH00.cbl:L136-L150,
@@ -407,7 +428,9 @@ public class ReconciliationService {
 
         TargetComparison comparison = new TargetComparison(stagedRates, rateSource);
         exportReader.streamCashAccounts(accountFile, record -> {
-            String owner = OwnerNormalizer.normalize(record.owner());
+            // The validation's own key, so the refusal check below actually matches: an owner refused for its
+            // spelling has to reach that check rather than raise on the way to it.
+            String owner = OwnerNormalizer.canonicalize(record.owner());
 
             // The owner was the legacy primary key, stored upper case (CASH00.cbl:L155), so a repeat is a
             // malformed export: the first occurrence is compared and the repeat passed over, because comparing
@@ -442,7 +465,10 @@ public class ReconciliationService {
             // a target of N accounts makes every one a candidate, so a per-owner read would be O(N) statements.
             Map<String, CashAccount> targetOnlyByOwner = new LinkedHashMap<>();
             for (CashAccount target : targetRows) {
-                String owner = OwnerNormalizer.normalize(target.owner());
+                // A fold of a value this service already stored, never a fresh identity decision: the owner
+                // column's CHECK constraint is what guarantees its spelling, and re-judging it here would turn a
+                // row written before that constraint existed into an aborted reconcile instead of a finding.
+                String owner = OwnerNormalizer.canonicalize(target.owner());
                 if (!comparison.namedByExport.contains(owner)) {
                     targetOnlyByOwner.put(owner, target);
                 }
@@ -516,7 +542,7 @@ public class ReconciliationService {
         // how a stored owner happens to be cased.
         Map<String, CashAccount> targetByOwner = new LinkedHashMap<>();
         for (CashAccount account : accounts.findAllById(comparison.chunk.keySet())) {
-            targetByOwner.put(OwnerNormalizer.normalize(account.owner()), account);
+            targetByOwner.put(OwnerNormalizer.canonicalize(account.owner()), account);
         }
 
         for (Map.Entry<String, LegacyCashAccountRecord> entry : comparison.chunk.entrySet()) {

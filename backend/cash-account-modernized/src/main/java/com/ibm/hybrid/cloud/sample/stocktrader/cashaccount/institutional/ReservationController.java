@@ -67,8 +67,10 @@ public class ReservationController {
      * @return {@code 201} with the new hold, or {@code 200} with the stored hold and
      *     {@code Idempotent-Replayed: true} when the key and payload replay an earlier call
      * @throws CashAccountException {@code 400} INVALID_OWNER / IDEMPOTENCY_KEY_REQUIRED / INVALID_AMOUNT /
-     *     INVALID_CURRENCY / CURRENCY_MISMATCH, {@code 404} ACCOUNT_NOT_FOUND, {@code 422} INSUFFICIENT_FUNDS
-     *     or IDEMPOTENCY_KEY_REUSED, {@code 409} CONCURRENT_MODIFICATION
+     *     INVALID_CURRENCY / CURRENCY_MISMATCH / INVALID_REQUEST_FIELD (an {@code orderReference} or
+     *     {@code expiresAt} this service cannot accept), {@code 404} ACCOUNT_NOT_FOUND, {@code 422}
+     *     INSUFFICIENT_FUNDS / AMOUNT_OUT_OF_RANGE / IDEMPOTENCY_KEY_REUSED, {@code 409}
+     *     CONCURRENT_MODIFICATION
      */
     @PostMapping(path = "/accounts/{owner}/holds", consumes = MediaType.APPLICATION_JSON_VALUE)
     public ResponseEntity<ReservationResponse> hold(@PathVariable("owner") String owner,

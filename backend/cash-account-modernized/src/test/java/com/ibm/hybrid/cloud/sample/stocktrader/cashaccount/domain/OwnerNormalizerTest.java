@@ -3,6 +3,10 @@ package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.domain;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.catchThrowableOfType;
 
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
 import java.util.Locale;
 
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.error.CashAccountErrorCode;
@@ -10,7 +14,7 @@ import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.error.CashAccountExce
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.error.LogSafeText;
 import org.junit.jupiter.api.Test;
 
-/** Unit tests for owner identity normalization: trim, upper case, and the 1-32 character bound. */
+/** Unit tests for owner identity: trim, upper case, the 1-32 character bound and the permitted character set. */
 class OwnerNormalizerTest {
 
     @Test
@@ -87,30 +91,37 @@ class OwnerNormalizerTest {
 
         // Counted in code points, not UTF-16 units, because code points are the unit the destination column
         // bounds: PostgreSQL measures character varying in characters. U+1D400 is one character costing two
-        // UTF-16 units, so counting units would refuse an owner that VARCHAR(32) stores without complaint
-        // (verified on postgres 12.22). It folds to itself, so the canonical form is the input.
+        // UTF-16 units, so counting units would refuse a value that VARCHAR(32) stores without complaint
+        // (verified on postgres 12.22). It folds to itself, so the canonical form is the input. Asserted on
+        // canonicalize, because that is the form the bound now governs alone: as an OWNER the value is refused
+        // for its spelling, and as a legacy_history join key it is stored.
         String oneCharacterTwoUnits = "\uD835\uDC00";
         String fullWidthInCodePoints = oneCharacterTwoUnits.repeat(OwnerNormalizer.MAX_LENGTH);
         assertThat(fullWidthInCodePoints).hasSize(OwnerNormalizer.MAX_LENGTH * 2);
-        String normalized = OwnerNormalizer.normalize(fullWidthInCodePoints);
-        assertThat(normalized).isEqualTo(fullWidthInCodePoints);
-        assertThat(normalized.codePointCount(0, normalized.length())).isEqualTo(OwnerNormalizer.MAX_LENGTH);
+        String canonical = OwnerNormalizer.canonicalize(fullWidthInCodePoints);
+        assertThat(canonical).isEqualTo(fullWidthInCodePoints);
+        assertThat(canonical.codePointCount(0, canonical.length())).isEqualTo(OwnerNormalizer.MAX_LENGTH);
 
-        assertThat(rejectionCodeFor(oneCharacterTwoUnits.repeat(OwnerNormalizer.MAX_LENGTH + 1)))
+        assertThat(canonicalizationCodeFor(oneCharacterTwoUnits.repeat(OwnerNormalizer.MAX_LENGTH + 1)))
                 .isEqualTo(CashAccountErrorCode.INVALID_OWNER);
     }
 
-    // The two halves of one contract, asserted together because each is only safe given the other. An owner may
-    // carry an interior control or line-separator code point - the legacy CHAR(32) column restricted none and AAP
-    // 0.4.2 and 0.6.2 fix INVALID_OWNER to blank-or-over-32, so narrowing identity here would change which accounts
-    // exist and would refuse export rows the migration loader must carry. That makes the value dangerous in exactly
-    // one place: a line-oriented log record, where a newline ends the record and whatever follows reads as a
-    // separate line this service wrote (CWE-117). error/LogSafeText is where it is neutralized, and every record
-    // naming an owner goes through it.
+    // The two halves of one contract, asserted together because each is only safe given the other. An owner
+    // carrying an interior control or line-separator code point is refused outright (QA finding F03), but the
+    // value a refusal ECHOES is the raw one - that is what lets the ApiError payload and the log record name what
+    // was rejected - so the hazard moves rather than disappearing: in a line-oriented log record a newline ends
+    // the record and whatever follows reads as a separate line this service wrote (CWE-117). error/LogSafeText is
+    // where it is neutralized, and every record naming an owner goes through it.
     @Test
-    void controlCharactersSurviveNormalizationAndAreEncodedAtTheLoggingBoundary() {
-        // Normalization is unchanged: case-folded, stripped at the edges, interior code points intact.
-        assertThat(OwnerNormalizer.normalize("  jo\nhn  ")).isEqualTo("JO\nHN");
+    void controlCharactersAreRefusedAndTheEchoedValueIsEncodedAtTheLoggingBoundary() {
+        // An interior control code point is not an identifier, whatever the edges look like after stripping.
+        assertThat(rejectionCodeFor("  jo\nhn  ")).isEqualTo(CashAccountErrorCode.INVALID_OWNER);
+        assertThat(rejectionCodeFor("JO\u0000HN")).isEqualTo(CashAccountErrorCode.INVALID_OWNER);
+        assertThat(rejectionCodeFor("JOHN\u2028X")).isEqualTo(CashAccountErrorCode.INVALID_OWNER);
+
+        // Still the canonical join key of a legacy row, because staging is lossless: the character rule is
+        // normalize's, and canonicalize is the form a decoded VSAM name is carried under (CASH00.cbl:L114).
+        assertThat(OwnerNormalizer.canonicalize("  jo\nhn  ")).isEqualTo("JO\nHN");
 
         // The value that reaches a log record is the RAW one, because a rejection echoes back what it refused so
         // the ApiError payload can name it - which is why the encoder, not the normalizer, is the control.
@@ -189,10 +200,107 @@ class OwnerNormalizerTest {
         assertThat(CashAccountErrorCode.INVALID_OWNER.status().value()).isEqualTo(400);
     }
 
+    // The character rule, one case per class of value the runtime security pass actually created through the
+    // retail seam (QA finding F03): markup, an SQL fragment, a comment marker, a command substitution, a
+    // backquoted command, a template expression, an arithmetic sign and non-ASCII text. Every one of them was
+    // accepted as an owner, persisted, and echoed back in the owner field of a 200 response.
+    @Test
+    void refusesOwnersSpelledWithAnythingOutsideThePermittedSet() {
+        assertThat(rejectionCodeFor("SEC1<img src=x onerror=alert(1)>"))
+                .isEqualTo(CashAccountErrorCode.INVALID_OWNER);
+        assertThat(rejectionCodeFor("<b>x")).isEqualTo(CashAccountErrorCode.INVALID_OWNER);
+        assertThat(rejectionCodeFor("SEC1' OR '1'='1")).isEqualTo(CashAccountErrorCode.INVALID_OWNER);
+        assertThat(rejectionCodeFor("SEC1\" OR \"\"=\"")).isEqualTo(CashAccountErrorCode.INVALID_OWNER);
+        assertThat(rejectionCodeFor("$(whoami)")).isEqualTo(CashAccountErrorCode.INVALID_OWNER);
+        assertThat(rejectionCodeFor("`id`")).isEqualTo(CashAccountErrorCode.INVALID_OWNER);
+        assertThat(rejectionCodeFor("{{7*7}}")).isEqualTo(CashAccountErrorCode.INVALID_OWNER);
+        assertThat(rejectionCodeFor("SEC1+1")).isEqualTo(CashAccountErrorCode.INVALID_OWNER);
+        assertThat(rejectionCodeFor("über")).isEqualTo(CashAccountErrorCode.INVALID_OWNER);
+        assertThat(rejectionCodeFor("日本")).isEqualTo(CashAccountErrorCode.INVALID_OWNER);
+        // A space is refused with them: the legacy column could hold one, so this is the deliberate line - an
+        // identifier is not a display name, and two owners differing only in spacing are a support incident.
+        assertThat(rejectionCodeFor("MARY JANE")).isEqualTo(CashAccountErrorCode.INVALID_OWNER);
+
+        // What the set DOES admit, and why it is these three separators: real user identifiers carry them, this
+        // module's own documented example owners are spelled with them, and a legacy account named this way must
+        // still be loadable. Two values from that same runtime pass are therefore accepted BY DESIGN - SEC1_ and
+        // SEC1-- - because both are spelled entirely from the set the F03 suggested fix names,
+        // ^[A-Z0-9._-]{1,32}$. Neither is markup, a shell metacharacter or a template expression; SEC1-- reads as
+        // a SQL comment only where an identifier is concatenated into SQL text, which nothing here does (every
+        // statement binds parameters). Refusing a doubled or trailing separator would be a rule of this test's
+        // invention, and it would refuse legacy owners the export may legitimately carry.
+        assertThat(OwnerNormalizer.normalize("john.doe-1")).isEqualTo("JOHN.DOE-1");
+        assertThat(OwnerNormalizer.normalize("sec1_")).isEqualTo("SEC1_");
+        assertThat(OwnerNormalizer.normalize("sec1--")).isEqualTo("SEC1--");
+        assertThat(OwnerNormalizer.normalize("RAUNAK")).isEqualTo("RAUNAK");
+        assertThat(OwnerNormalizer.normalize("desk-07.eu_1")).isEqualTo("DESK-07.EU_1");
+
+        // The predicate the migration tooling asks the question with, so a refused export row becomes a finding
+        // instead of an aborted single-transaction load (AAP 0.6.3). It judges the canonical form, which is why
+        // a lower-case value answers false: migration/reconcile/ReconciliationService canonicalizes first.
+        assertThat(OwnerNormalizer.permits("JOHN.DOE-1")).isTrue();
+        assertThat(OwnerNormalizer.permits("MARY JANE")).isFalse();
+        assertThat(OwnerNormalizer.permits("john")).isFalse();
+        assertThat(OwnerNormalizer.permits("")).isFalse();
+        assertThat(OwnerNormalizer.permits(null)).isFalse();
+        assertThat(OwnerNormalizer.permits("A".repeat(OwnerNormalizer.MAX_LENGTH))).isTrue();
+        assertThat(OwnerNormalizer.permits("A".repeat(OwnerNormalizer.MAX_LENGTH + 1))).isFalse();
+
+        // And the legacy path is genuinely still open, which is the other half of the fix: the same value that
+        // cannot be an owner is carried as a staging join key rather than failing the file it arrived in.
+        assertThat(OwnerNormalizer.canonicalize("mary jane")).isEqualTo("MARY JANE");
+        assertThat(OwnerNormalizer.canonicalize("o'brien")).isEqualTo("O'BRIEN");
+    }
+
+    // One rule, written once. The database is the backstop for every path that does not go through this class -
+    // a hand-run UPDATE, a future endpoint, the loader - so the two expressions have to be the same expression,
+    // and a test is the only thing that can say so: nothing at build time compares a Java pattern with SQL text.
+    @Test
+    void theSchemaConstraintCarriesTheSamePermittedSetAsThisClass() {
+        assertThat(OwnerNormalizer.PERMITTED_OWNER_REGEX).isEqualTo("[A-Z0-9._-]{1,32}");
+
+        String schema = schemaText();
+        String anchored = "'^" + OwnerNormalizer.PERMITTED_OWNER_REGEX + "$'";
+
+        // Every owner column that stores an identity, named individually: a CHECK silently dropped from one of
+        // them would leave that table able to hold what the other two refuse.
+        for (String table : new String[] {"cash_account", "cash_reservation", "ledger_entry"}) {
+            assertThat(schema)
+                    .as("%s must carry the owner CHECK with the normalizer's own expression", table)
+                    .contains("CONSTRAINT ck_" + table + "_owner_identifier CHECK (owner ~ " + anchored + ")");
+        }
+
+        // The upgrade half: CREATE TABLE IF NOT EXISTS cannot add a constraint to a database that already holds
+        // these tables, so the guarded ALTER is what carries the rule to one - and it must carry the same text.
+        assertThat(schema)
+                .as("the guarded ALTER path must add the same expression to an existing database")
+                .contains("ADD CONSTRAINT ck_cash_account_owner_identifier\n"
+                        + "            CHECK (owner ~ " + anchored + ") NOT VALID");
+    }
+
+    private static String schemaText() {
+        // Read from the classpath, so the file this asserts against is the one that is packaged and applied.
+        try (InputStream schema =
+                     OwnerNormalizerTest.class.getResourceAsStream("/schema/cash-account-schema.sql")) {
+            assertThat(schema).as("schema/cash-account-schema.sql must be on the classpath").isNotNull();
+            return new String(schema.readAllBytes(), StandardCharsets.UTF_8);
+        } catch (IOException unreadable) {
+            throw new UncheckedIOException("schema/cash-account-schema.sql could not be read", unreadable);
+        }
+    }
+
     private static CashAccountErrorCode rejectionCodeFor(String raw) {
         CashAccountException thrown =
                 catchThrowableOfType(() -> OwnerNormalizer.normalize(raw), CashAccountException.class);
         assertThat(thrown).as("normalize(\"%s\") must be rejected", raw).isNotNull();
+        return thrown.errorCode();
+    }
+
+    // The same assertion for the lenient form, kept separate so a case can state which of the two refused it.
+    private static CashAccountErrorCode canonicalizationCodeFor(String raw) {
+        CashAccountException thrown =
+                catchThrowableOfType(() -> OwnerNormalizer.canonicalize(raw), CashAccountException.class);
+        assertThat(thrown).as("canonicalize(\"%s\") must be rejected", raw).isNotNull();
         return thrown.errorCode();
     }
 }

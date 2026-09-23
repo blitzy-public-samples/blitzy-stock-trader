@@ -7,7 +7,9 @@ import java.util.stream.Collectors;
 
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.error.ApiErrorAccessDeniedHandler;
 import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.error.ApiErrorAuthenticationEntryPoint;
+import com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.error.ApiErrorRequestRejectedHandler;
 
+import jakarta.servlet.DispatcherType;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 
@@ -21,6 +23,7 @@ import org.springframework.http.HttpMethod;
 import org.springframework.security.config.annotation.ObjectPostProcessor;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.annotation.web.configuration.WebSecurityCustomizer;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
 import org.springframework.security.config.annotation.web.configurers.AuthorizeHttpRequestsConfigurer;
 import org.springframework.security.config.http.SessionCreationPolicy;
@@ -190,6 +193,30 @@ public class SecurityConfig {
     }
 
     /**
+     * Points the firewall's rejection path at the {@code error} package's renderer.
+     *
+     * <p>The firewall refuses a request before any filter of the chain runs, so this rejection is the one
+     * response neither {@code ApiExceptionHandler} nor the entry point above can shape. Left at the default,
+     * Spring Security's {@code HttpStatusRequestRejectedHandler} answered with {@code sendError(400)} and no
+     * body, which the container turned into an ERROR dispatch to {@code /error}; the chain then ran on that
+     * dispatch with no principal -- {@code BearerTokenAuthenticationFilter} is a {@code OncePerRequestFilter} and
+     * error dispatches are skipped -- so {@code anyRequest().denyAll()} refused it and the caller received
+     * {@code 401 UNAUTHORIZED}. A double slash from a proxy was reported as an authentication failure, and so
+     * was an unauthenticated {@code GET /actuator/health;x=y} on a path that requires no authentication at all.
+     *
+     * @param requestRejectedHandler the renderer, which writes {@code 400 INVALID_QUERY} as an ApiError
+     * @return the customizer that installs it on the {@code WebSecurity} that builds the FilterChainProxy
+     */
+    @Bean
+    public WebSecurityCustomizer cashAccountRequestRejectedHandlerCustomizer(
+            ApiErrorRequestRejectedHandler requestRejectedHandler) {
+
+        // Set on WebSecurity rather than on the SecurityFilterChain because the firewall and its handler belong
+        // to the FilterChainProxy that wraps every chain, not to a chain.
+        return web -> web.requestRejectedHandler(requestRejectedHandler);
+    }
+
+    /**
      * Registers the method-policy guard over this service's own path space.
      *
      * <p>Declared {@code static} so registering an interceptor never forces this configuration - and with it the
@@ -254,6 +281,19 @@ public class SecurityConfig {
     private static void authorize(
             AuthorizeHttpRequestsConfigurer<HttpSecurity>.AuthorizationManagerRequestMatcherRegistry registry,
             boolean authenticating) {
+
+        // First, and only for the dispatch type the CONTAINER sets. An error dispatch is the container re-entering
+        // the application to render a rejection it has already decided - a malformed request line, a body over the
+        // intake bound, a failure thrown out of the chain - and it arrives with no principal, because
+        // BearerTokenAuthenticationFilter is a OncePerRequestFilter and error dispatches are skipped. Covered by
+        // rule (6) below it was therefore denied, and error/ApiErrorController's payload was replaced by
+        // 401 UNAUTHORIZED: a caller was told to authenticate for a request that had already been refused on its
+        // shape, on paths that require no authentication. Admitting it opens nothing a caller can reach directly -
+        // the dispatch type is set by the container and cannot be forged, so a GET of /error as an ordinary
+        // request is still a REQUEST dispatch, still matches no rule above, and is still denied by rule (6);
+        // error/FailClosedIT asserts exactly that. The dispatched request also carries no authorization of its
+        // own: whatever the original request was refused for, it was refused before reaching a controller.
+        registry.dispatcherTypeMatchers(DispatcherType.ERROR).permitAll();
 
         // Kubernetes presents no credential. The chart's startupProbe, readinessProbe and livenessProbe GET
         // /actuator/startup, /actuator/health/readiness and /actuator/health/liveness on port 8080

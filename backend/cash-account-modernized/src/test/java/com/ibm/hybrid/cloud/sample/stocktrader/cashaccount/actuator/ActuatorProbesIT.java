@@ -42,6 +42,22 @@ class ActuatorProbesIT extends PostgresTestSupport {
     // instrumentation a test failure here rather than an unreadable rollback criterion during a change window.
     private static final String ROLLBACK_CRITERION_METER = "http_server_requests_seconds_count";
 
+    // The startup probe's body is asserted as well as its status, because this path is permitAll - a kubelet
+    // presents no credential - so whatever CashAccountApplication's recorder buffers is readable by any peer that
+    // reaches the port, and a GET re-serves it on every probe. The lifecycle step below is the positive half: a
+    // Boot release that renamed it would leave an endpoint answering 200 with an empty timeline, which no status
+    // assertion can distinguish from a working one.
+    private static final String STARTUP_LIFECYCLE_STEP = "spring.boot.application.ready";
+
+    // The negative half: the tag and the step that carried the internal inventory. Unfiltered, this payload
+    // measured 170,993 bytes with 447 beanName tags and 221 fully-qualified class names.
+    private static final String STARTUP_BEAN_TAG = "beanName";
+    private static final String STARTUP_BEAN_STEP = "spring.beans.instantiate";
+
+    // A ceiling rather than an exact size: the filtered payload is a little over 1KB of step names and durations,
+    // so 8KB fails on a returning inventory while staying indifferent to timings and to a step gained or lost.
+    private static final int STARTUP_PAYLOAD_CEILING_BYTES = 8 * 1024;
+
     @LocalServerPort
     private int port;
 
@@ -51,15 +67,26 @@ class ActuatorProbesIT extends PostgresTestSupport {
     private TestRestTemplate probeClient;
 
     @Test
-    void chartProbedActuatorPathsAnswer200AtRoot() {
+    void chartProbedActuatorPathsAnswer200AtRootAndStartupPublishesNoInternalInventory() {
+        // The whole response, not just its status: the startup body is half of what this test protects.
+        ResponseEntity<String> startup = responseAt(STARTUP_PROBE_PATH);
+        String startupBody = startup.getBody() == null ? "" : startup.getBody();
+
         // Softly, because a context path or a lost permitAll breaks all three probes at once and an operator
         // reading the failure needs the full set, not whichever path happens to be asserted first.
         SoftAssertions.assertSoftly(probes -> {
-            probes.assertThat(statusOf(STARTUP_PROBE_PATH)).as(STARTUP_PROBE_PATH).isEqualTo(HttpStatus.OK);
+            probes.assertThat(startup.getStatusCode()).as(STARTUP_PROBE_PATH).isEqualTo(HttpStatus.OK);
             // The readiness group is readinessState,db (application.yml), so this answers 503 unless the
             // PostgreSQL the base class publishes through @ServiceConnection is reachable.
             probes.assertThat(statusOf(READINESS_PROBE_PATH)).as(READINESS_PROBE_PATH).isEqualTo(HttpStatus.OK);
             probes.assertThat(statusOf(LIVENESS_PROBE_PATH)).as(LIVENESS_PROBE_PATH).isEqualTo(HttpStatus.OK);
+
+            probes.assertThat(startupBody).as(STARTUP_PROBE_PATH + " lifecycle timeline")
+                    .contains(STARTUP_LIFECYCLE_STEP);
+            probes.assertThat(startupBody).as(STARTUP_PROBE_PATH + " internal inventory")
+                    .doesNotContain(STARTUP_BEAN_TAG, STARTUP_BEAN_STEP);
+            probes.assertThat(startupBody.length()).as(STARTUP_PROBE_PATH + " payload size")
+                    .isLessThan(STARTUP_PAYLOAD_CEILING_BYTES);
         });
     }
 

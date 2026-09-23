@@ -94,8 +94,8 @@ class CurrencyConversionTest {
     // sets, which that file owns.
     private static final Duration DRIP_BUDGET = Duration.ofMillis(400);
 
-    // One read of the client's request line and headers is enough for the fixture, and nothing in its answer
-    // depends on their content.
+    // A ceiling on the client's request line and headers, which the fixture reads to the blank line and publishes
+    // for the wire-level User-Agent assertion; nothing in its answer depends on their content.
     private static final int REQUEST_HEAD_BYTES = 4096;
 
     private MockRestServiceServer server;
@@ -108,11 +108,11 @@ class CurrencyConversionTest {
         properties.getFx().setUrl(FX_URL);
 
         // mutate() carries the configuration of the bean config/FxClientConfig actually publishes, so what the
-        // assertions observe - above all the absence of any default header - is the deployed client's own shape
-        // rather than a lookalike assembled here. bindTo replaces the request factory but keeps the interceptor,
-        // so the size bound stays in the path here while the time bound cannot be: a recorder answers from a byte
-        // array and has nothing to stall on. The budget is therefore proven against a real socket, in the last
-        // drive in this file.
+        // assertions observe - above all its one default header and the credential headers it never sets - is the
+        // deployed client's own shape rather than a lookalike assembled here. bindTo replaces the request factory
+        // but keeps the interceptor, so the size bound stays in the path here while the time bound cannot be: a
+        // recorder answers from a byte array and has nothing to stall on. The budget is therefore proven against
+        // a real socket, in the last drive in this file.
         RestClient.Builder builder = new FxClientConfig().fxRestClient(properties).mutate();
         server = MockRestServiceServer.bindTo(builder).bufferContent().build();
         client = new FrankfurterExchangeRateClient(builder.build(), FX_URL,
@@ -286,18 +286,22 @@ class CurrencyConversionTest {
     }
 
     @Test
-    void fxRequestCarriesNoAuthorizationHeader() {
+    void fxRequestCarriesTheFixedUserAgentAndNoCredentialHeaders() {
         server.expect(ExpectedCount.once(), requestToFxEndpointIgnoringQuery())
                 .andExpect(MockRestRequestMatchers.headerDoesNotExist(HttpHeaders.AUTHORIZATION))
                 .andExpect(MockRestRequestMatchers.headerDoesNotExist(HttpHeaders.PROXY_AUTHORIZATION))
                 .andExpect(MockRestRequestMatchers.headerDoesNotExist(HttpHeaders.COOKIE))
+                .andExpect(MockRestRequestMatchers.header(HttpHeaders.USER_AGENT, FxClientConfig.USER_AGENT))
                 .andRespond(recordedFrankfurterResponse());
 
         // A structural security proof rather than a style check: broker propagates the caller's credentials into
         // this service, which validates them, while this service's only outbound hop is to a public rate API that
         // requires no credential at all - so a token arriving there would hand a third party the caller's identity
         // for nothing in return. All three header shapes are checked because a credential can travel as any of
-        // them, and the absence asserted is that of the bean config/FxClientConfig publishes.
+        // them, and the absence asserted is that of the bean config/FxClientConfig publishes. The single header
+        // asserted present is asserted in the same place and for the same reason: this recorder observes the shape
+        // of that bean, so it is where the fixed, deliberately version-free identity is pinned to the published
+        // constant rather than to a copy of its text.
         assertThat(client.rate("USD", "EUR")).isEqualTo(new BigDecimal("0.92"));
         server.verify();
     }
@@ -459,8 +463,11 @@ class CurrencyConversionTest {
         RestClient transport = new FxClientConfig().fxRestClient(properties);
 
         AtomicReference<String> providerEnd = new AtomicReference<>("still stalling");
+        // Published the way providerEnd is, and read only after the provider has answered, so the bytes are
+        // already visible to this thread when the assertion below looks at them.
+        AtomicReference<String> requestHead = new AtomicReference<>("");
         try (ServerSocket provider = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
-            Thread stalling = new Thread(() -> stallAfterTheFirstBodyBytes(provider, providerEnd),
+            Thread stalling = new Thread(() -> stallAfterTheFirstBodyBytes(provider, providerEnd, requestHead),
                     "fx-stalling-provider");
             // Daemon, so nothing this fixture holds can keep the test JVM alive if the client gives up first.
             stalling.setDaemon(true);
@@ -488,6 +495,18 @@ class CurrencyConversionTest {
                     .as("waited %s of the provider's %s stall, which ended %s", waited, DRIP_STALL,
                             providerEnd.get())
                     .isLessThan(DRIP_STALL.dividedBy(3));
+
+            // The wire-level half of the User-Agent claim, and it lives in this drive because this is the file's
+            // only real socket: the recorder above can only show the header Spring's builder carries, while these
+            // bytes are the sole place it is observable that the JDK substituted no Java-http-client/<patch>
+            // identity of its own - the patch level whose disclosure to the third-party rate provider is what the
+            // fixed value exists to remove. The absence is asserted ignoring case while the presence is not: the
+            // value sent is this module's own constant and exact, whereas an identity leaking back in under any
+            // spelling is still the disclosure.
+            assertThat(requestHead.get())
+                    .as("the request head this client put on the wire")
+                    .contains(HttpHeaders.USER_AGENT + ": " + FxClientConfig.USER_AGENT)
+                    .doesNotContainIgnoringCase("Java-http-client");
         }
     }
 
@@ -495,11 +514,29 @@ class CurrencyConversionTest {
     // the first ten bytes of it and then nothing. It waits on the connection rather than sleeping, so the socket
     // is released as soon as the client gives up on it, and its socket timeout ends the fixture even if the client
     // never does.
-    private static void stallAfterTheFirstBodyBytes(ServerSocket provider, AtomicReference<String> end) {
+    private static void stallAfterTheFirstBodyBytes(ServerSocket provider, AtomicReference<String> end,
+            AtomicReference<String> head) {
         try (Socket connection = provider.accept()) {
             connection.setSoTimeout((int) DRIP_STALL.toMillis());
             InputStream request = connection.getInputStream();
-            request.read(new byte[REQUEST_HEAD_BYTES]);
+            // Read to the blank line rather than to whatever one read happens to deliver, and published rather
+            // than discarded: the head is now asserted on, so neither a segment boundary inside it nor the
+            // fixture's own convenience may decide what the assertion sees. A GET's head is its whole request, so
+            // stopping at the terminator is what keeps this read from waiting out the socket timeout, and the
+            // buffer bounds it if a client ever sends no terminator at all.
+            byte[] received = new byte[REQUEST_HEAD_BYTES];
+            int filled = 0;
+            while (filled < received.length) {
+                int read = request.read(received, filled, received.length - filled);
+                if (read < 0) {
+                    break;
+                }
+                filled += read;
+                if (new String(received, 0, filled, StandardCharsets.US_ASCII).contains("\r\n\r\n")) {
+                    break;
+                }
+            }
+            head.set(new String(received, 0, filled, StandardCharsets.US_ASCII));
 
             OutputStream answer = connection.getOutputStream();
             answer.write(("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "

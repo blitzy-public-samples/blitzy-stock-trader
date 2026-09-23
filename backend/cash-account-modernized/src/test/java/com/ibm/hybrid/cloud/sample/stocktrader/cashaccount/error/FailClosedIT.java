@@ -220,10 +220,13 @@ class FailClosedIT extends PostgresTestSupport {
                 .isEqualTo(CashAccountErrorCode.ACCOUNT_NOT_FOUND.status().value());
     }
 
-    // A validation failure on any member with no code of its own falls to INVALID_AMOUNT, so a missing or
-    // over-length orderReference was answered "Amount is missing, not a number, or not permitted for this
-    // operation" while the amount the caller sent was valid - an error that sends a caller to correct what is
-    // already correct. The closed code set is unchanged; the payload now names the field.
+    // Every member with no code of its own used to fall to INVALID_AMOUNT, so a missing or over-length
+    // orderReference and an unparsable expiresAt were all answered "Amount is missing, not a number, or not
+    // permitted for this operation" while the amount the caller sent was valid. The message named the field, but
+    // the code - which is what an automated client reads - sent the caller to correct a value it had got right.
+    // INVALID_REQUEST_FIELD is that condition stated truthfully, at the same 400, and the last case is the
+    // control that keeps it from swallowing the members the AAP's vocabulary does name: an amount failure is
+    // still INVALID_AMOUNT.
     @Test
     void aValidationFailureNamesTheFieldThatFailed() {
         String hold = "/cash-account/institutional/accounts/" + OWNER + "/holds";
@@ -231,17 +234,91 @@ class FailClosedIT extends PostgresTestSupport {
         ResponseEntity<String> missing = exchange(hold, HttpMethod.POST,
                 "{\"amount\":10,\"currency\":\"USD\"}", MediaType.APPLICATION_JSON_VALUE, "k-field-1");
 
-        assertThat(missing.getStatusCode().value())
-                .isEqualTo(CashAccountErrorCode.INVALID_AMOUNT.status().value());
+        assertThat(CashAccountErrorCode.INVALID_REQUEST_FIELD.status().value()).isEqualTo(400);
+        assertApiErrorShape(missing, CashAccountErrorCode.INVALID_REQUEST_FIELD, "INVALID_REQUEST_FIELD");
         assertThat(messageOf(missing)).contains("orderReference");
 
         ResponseEntity<String> tooLong = exchange(hold, HttpMethod.POST,
                 "{\"orderReference\":\"" + "R".repeat(65) + "\",\"amount\":10,\"currency\":\"USD\"}",
                 MediaType.APPLICATION_JSON_VALUE, "k-field-2");
 
-        assertThat(tooLong.getStatusCode().value())
-                .isEqualTo(CashAccountErrorCode.INVALID_AMOUNT.status().value());
+        assertApiErrorShape(tooLong, CashAccountErrorCode.INVALID_REQUEST_FIELD, "INVALID_REQUEST_FIELD");
         assertThat(messageOf(tooLong)).contains("orderReference");
+
+        // Bound by Jackson rather than by Bean Validation, which is the other half of the same contract: the
+        // member Jackson was reading when it failed is reported exactly as a constraint failure on that member
+        // would be, instead of arriving as a claim about the amount.
+        ResponseEntity<String> unparsableExpiry = exchange(hold, HttpMethod.POST,
+                "{\"orderReference\":\"ORD-1\",\"amount\":10,\"currency\":\"USD\",\"expiresAt\":\"not-a-date\"}",
+                MediaType.APPLICATION_JSON_VALUE, "k-field-3");
+
+        assertApiErrorShape(unparsableExpiry, CashAccountErrorCode.INVALID_REQUEST_FIELD,
+                "INVALID_REQUEST_FIELD");
+        assertThat(messageOf(unparsableExpiry)).contains("expiresAt");
+
+        ResponseEntity<String> zeroAmount = exchange(hold, HttpMethod.POST,
+                "{\"orderReference\":\"ORD-2\",\"amount\":0,\"currency\":\"USD\"}",
+                MediaType.APPLICATION_JSON_VALUE, "k-field-4");
+
+        assertThat(zeroAmount.getStatusCode().value())
+                .isEqualTo(CashAccountErrorCode.INVALID_AMOUNT.status().value());
+        assertThat(codeOf(zeroAmount)).isEqualTo(CashAccountErrorCode.INVALID_AMOUNT.code());
+
+        // The same control on the retail seam, where the amount is called "balance"
+        // [backend/broker/.../json/CashAccount.java:L22-L24]: a member that reads as the amount must keep
+        // answering INVALID_AMOUNT, which is what AAP 0.6.2 fixes for the retail create and update.
+        ResponseEntity<String> balanceTypeConfusion = exchange("/cash-account/" + OWNER, HttpMethod.POST,
+                "{\"balance\":true,\"currency\":\"USD\"}", MediaType.APPLICATION_JSON_VALUE, null);
+
+        assertThat(balanceTypeConfusion.getStatusCode().value())
+                .isEqualTo(CashAccountErrorCode.INVALID_AMOUNT.status().value());
+        assertThat(codeOf(balanceTypeConfusion)).isEqualTo(CashAccountErrorCode.INVALID_AMOUNT.code());
+    }
+
+    // Spring Security's firewall refuses a request before a single filter of the chain runs, and its default
+    // handler answers with sendError(400) and no body. That was neither a 400 nor a body by the time it reached
+    // the caller: the container turned it into an ERROR dispatch to /error, the chain ran again on that dispatch
+    // with no principal (BearerTokenAuthenticationFilter is a OncePerRequestFilter and error dispatches are
+    // skipped), and anyRequest().denyAll() answered 401 UNAUTHORIZED - telling a caller to authenticate for a
+    // request already refused on its shape, and doing so on /actuator paths that require no authentication at
+    // all. All four cases here are firewall refusals: a path Spring Security reads as traversal-prone, a matrix
+    // parameter, and a method outside its allowed set.
+    @Test
+    void aRequestTheFirewallRefusesIsRenderedAsAnInvalidQueryApiError() throws Exception {
+        assertRejectedAsInvalidQuery(send("//cash-account/" + OWNER, "GET", AUTHORIZATION));
+        assertRejectedAsInvalidQuery(send("/cash-account/" + OWNER + ";x=y", "GET", AUTHORIZATION));
+
+        // Unauthenticated and on a permitAll path, which is where the 401 was most obviously wrong: a kubelet or
+        // a scraper reaching the probe through a proxy that emitted a double slash was told its credentials were
+        // missing on a path that has none.
+        assertRejectedAsInvalidQuery(send("//actuator/health", "GET", null));
+        assertRejectedAsInvalidQuery(send("/cash-account/" + OWNER, "PROPFIND", AUTHORIZATION));
+
+        // The control: the firewall is refusing these request lines, not the paths behind them.
+        assertThat(send("/actuator/health/readiness", "GET", null).statusCode()).isEqualTo(200);
+    }
+
+    // Tomcat refuses a header block over server.max-http-request-header-size and an encoded path separator
+    // before the request is mapped to a servlet context, so no error page can be dispatched and no filter, no
+    // controller and no advice of this service ever sees the request: these were answered with Tomcat's own
+    // 435-byte HTML page, carrying neither the ApiError body every other rejection carries nor any of the
+    // security headers the filter chain writes. The last case is the boundary that admitting the ERROR dispatch
+    // in config/SecurityConfig must not move: /error as an ordinary request is a REQUEST dispatch, matches no
+    // rule, and stays denied.
+    @Test
+    void aContainerRejectionThatNeverReachesAServletIsRenderedAsApiError() throws Exception {
+        HttpResponse<String> oversizedHeader = send("/cash-account/" + OWNER, "GET", AUTHORIZATION,
+                "X-Overlong-Header", "H".repeat(9 * 1024));
+        assertRejectedAsInvalidQuery(oversizedHeader);
+
+        HttpResponse<String> encodedSeparator =
+                send("/cash-account/..%2F..%2Fetc%2Fpasswd", "GET", AUTHORIZATION);
+        assertRejectedAsInvalidQuery(encodedSeparator);
+
+        HttpResponse<String> directError = send("/error", "GET", AUTHORIZATION);
+        assertThat(directError.statusCode()).isEqualTo(CashAccountErrorCode.FORBIDDEN.status().value());
+        assertApiErrorPayload(contentTypeOf(directError), directError.body(), CashAccountErrorCode.FORBIDDEN,
+                "FORBIDDEN");
     }
 
     // The two framings of one request, because a body-size control that covers one of them is not a control. A
@@ -319,6 +396,43 @@ class FailClosedIT extends PostgresTestSupport {
         return response.headers().firstValue(HttpHeaders.CONTENT_TYPE).orElse(null);
     }
 
+    // The JDK client for every rejection decided outside a handler, and for one reason per case: TestRestTemplate
+    // builds its URI through UriComponentsBuilder, which normalises the "//" and the matrix parameter the firewall
+    // is supposed to refuse; HttpURLConnection behind its default factory cannot issue an arbitrary method; and a
+    // 9KB header has to reach the connector exactly as written. The path is concatenated rather than resolved so
+    // it arrives raw.
+    private HttpResponse<String> send(String path, String method, String authorization, String... headers)
+            throws Exception {
+
+        HttpRequest.Builder request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + path))
+                .method(method, HttpRequest.BodyPublishers.noBody());
+        if (authorization != null) {
+            request.header(HttpHeaders.AUTHORIZATION, authorization);
+        }
+        for (int index = 0; index + 1 < headers.length; index += 2) {
+            request.header(headers[index], headers[index + 1]);
+        }
+        try (HttpClient client = HttpClient.newHttpClient()) {
+            return client.send(request.build(), HttpResponse.BodyHandlers.ofString());
+        }
+    }
+
+    private void assertRejectedAsInvalidQuery(HttpResponse<String> response) {
+        assertThat(CashAccountErrorCode.INVALID_QUERY.status().value()).isEqualTo(400);
+        assertThat(response.statusCode()).isEqualTo(CashAccountErrorCode.INVALID_QUERY.status().value());
+        assertApiErrorPayload(contentTypeOf(response), response.body(), CashAccountErrorCode.INVALID_QUERY,
+                "INVALID_QUERY");
+
+        // The headers matter as much as the body here: these rejections are written outside the filter chain, so
+        // Spring Security's HeaderWriterFilter - a OncePerRequestFilter, which skips error dispatches - cannot
+        // supply them, and without them a refused response was the one response class this service served with
+        // no nosniff, no frame denial and no no-store.
+        assertThat(response.headers().firstValue("X-Content-Type-Options")).contains("nosniff");
+        assertThat(response.headers().firstValue("X-Frame-Options")).contains("DENY");
+        assertThat(response.headers().firstValue(HttpHeaders.CACHE_CONTROL))
+                .hasValueSatisfying(value -> assertThat(value).contains("no-store"));
+    }
+
     // Well-formed JSON of the shape the create endpoint accepts, padded past the limit by one long member value:
     // a body that fails on its SIZE and on nothing else, so the 413 cannot be mistaken for a parse failure.
     private static String oversizedJson(int approximateBytes) {
@@ -369,6 +483,12 @@ class FailClosedIT extends PostgresTestSupport {
         JsonNode error = readTree(response.getBody());
         assertThat(error.has("message")).isTrue();
         return error.get("message").asText();
+    }
+
+    private String codeOf(ResponseEntity<String> response) {
+        JsonNode error = readTree(response.getBody());
+        assertThat(error.has("code")).isTrue();
+        return error.get("code").asText();
     }
 
     private static HttpHeaders authenticatedHeaders() {

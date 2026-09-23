@@ -86,8 +86,10 @@ public class FrankfurterExchangeRateClient implements ExchangeRateSource {
     /**
      * Container constructor.
      *
-     * @param restClient  the bounded, header-free client published by {@code config.FxClientConfig}, which owns
-     *                    its connect and read budget
+     * @param restClient  the bounded client published by {@code config.FxClientConfig}, which owns its connect and
+     *                    read budget and attaches one compiled-in header - the fixed
+     *                    {@code config.FxClientConfig#USER_AGENT} - and nothing caller-derived, so this class adds
+     *                    no header of its own
      * @param environment source of both configured values, each read through {@link Binder}: the endpoint
      *                    {@code cashaccount.fx.url} - a deployment value, never a literal here: the chart injects
      *                    {@code CURRENCY_API_URL} from configMap key {@code cashAccount.exchangeRateUrl}

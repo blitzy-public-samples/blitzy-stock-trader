@@ -654,14 +654,15 @@ class ReservationLifecycleIT extends PostgresTestSupport {
         String owner = "CEILING1";
         openAccount(owner);
 
-        // 50,000,000.00 is past the NUMERIC(9,2) ceiling of 9,999,999.99, but that is the service's constraint,
-        // not the caller's condition: what the caller asked for is more than the account can cover, and
-        // INSUFFICIENT_FUNDS is the only 422 the hold contract declares (AAP 0.6.2) - AMOUNT_OUT_OF_RANGE, which
-        // the money type raises on its own, is in neither endpoint's error set.
+        // 50,000,000.00 is past the NUMERIC(9,2) ceiling of 9,999,999.99, and the code says so: the retail credit
+        // and debit paths answer the identical input class with 422 AMOUNT_OUT_OF_RANGE through domain/Money, so
+        // a hold answering 422 INSUFFICIENT_FUNDS gave one service two codes for one condition depending on which
+        // surface received it. INSUFFICIENT_FUNDS keeps what it names - a hold larger than the available balance,
+        // asserted through the state machine - and the status class is unchanged either way.
         ResponseEntity<String> overCeilingHold =
                 postHold(owner, "IDEM-CEILING-1", holdBody("ORD-CEILING-1", "50000000.00", FIXED_EXPIRY));
         assertThat(overCeilingHold.getStatusCode()).isEqualTo(HttpStatus.UNPROCESSABLE_ENTITY);
-        assertThat(errorOf(overCeilingHold).code()).isEqualTo(CashAccountErrorCode.INSUFFICIENT_FUNDS);
+        assertThat(errorOf(overCeilingHold).code()).isEqualTo(CashAccountErrorCode.AMOUNT_OUT_OF_RANGE);
         assertThat(reservationRowCount(owner)).isZero();
         assertThat(rowsOf(ledger(owner), LedgerEventType.HOLD)).isEmpty();
         InstitutionalAccountResponse refused = account(owner);

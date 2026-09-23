@@ -15,6 +15,7 @@ import java.security.cert.CertificateFactory;
 import java.security.interfaces.RSAPublicKey;
 import java.security.spec.InvalidKeySpecException;
 import java.security.spec.X509EncodedKeySpec;
+import java.time.Instant;
 import java.util.Base64;
 import java.util.Collection;
 import java.util.Collections;
@@ -23,6 +24,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 
 import org.springframework.context.annotation.Bean;
@@ -45,6 +47,7 @@ import org.springframework.security.oauth2.core.OAuth2TokenValidatorResult;
 import org.springframework.security.oauth2.jose.jws.SignatureAlgorithm;
 import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.security.oauth2.jwt.JwtClaimNames;
+import org.springframework.security.oauth2.jwt.JwtClaimValidator;
 import org.springframework.security.oauth2.jwt.JwtDecoder;
 import org.springframework.security.oauth2.jwt.JwtIssuerValidator;
 import org.springframework.security.oauth2.jwt.JwtValidators;
@@ -64,7 +67,32 @@ public class JwtDecoderConfig {
 
     private static final String ROLE_PREFIX = "ROLE_";
 
-    private static final String STOCK_TRADER_AUTHORITY = ROLE_PREFIX + "StockTrader";
+    // The estate's two group names, spelled as its registry defines them and as broker's deployment descriptor
+    // constrains them [backend/broker/src/main/liberty/config/includes/none.xml:L39-L46;
+    // backend/broker/src/main/webapp/WEB-INF/web.xml:L11-L18]. Nothing else in the estate is a role.
+    private static final String GROUP_STOCK_TRADER = "StockTrader";
+
+    private static final String GROUP_STOCK_VIEWER = "StockViewer";
+
+    // One immutable instance each, shared across requests: SimpleGrantedAuthority holds a single final String and
+    // is compared by it, so the authority for a group is a value and there is no reason to build one per token.
+    private static final GrantedAuthority STOCK_TRADER_AUTHORITY =
+            new SimpleGrantedAuthority(ROLE_PREFIX + GROUP_STOCK_TRADER);
+
+    private static final GrantedAuthority STOCK_VIEWER_AUTHORITY =
+            new SimpleGrantedAuthority(ROLE_PREFIX + GROUP_STOCK_VIEWER);
+
+    // A closed lookup, never ROLE_ + <claim value>. The predecessor concatenated the trimmed claim value, and
+    // String.trim() strips every character up to and including U+0020 - NUL among them - so "StockTrader ",
+    // " StockTrader", "StockTrader\t", "StockTrader\n" and "StockTrader\u0000" all became ROLE_StockTrader and each
+    // one carried the write role in strict mode. A value that merely looks equivalent is a different value
+    // (CWE-178), and the caller is the party that chose it, so the mapping is by exact match against the only two
+    // names the estate binds - which are also the only ones config/SecurityConfig asks for, through
+    // hasRole("StockTrader") and hasAnyRole("StockViewer", "StockTrader"). Mapping through a table rather than a
+    // format string has the second effect that no caller-supplied text can ever become an authority name.
+    private static final Map<String, GrantedAuthority> AUTHORITIES_BY_GROUP = Map.of(
+            GROUP_STOCK_TRADER, STOCK_TRADER_AUTHORITY,
+            GROUP_STOCK_VIEWER, STOCK_VIEWER_AUTHORITY);
 
     private static final String AUTH_TYPE_PROPERTY = "cashaccount.security.auth-type";
 
@@ -194,18 +222,21 @@ public class JwtDecoderConfig {
         // through broker today and granting the same by default means cutover changes no caller's effective
         // permissions. False is the supported strict mode in which only the token's groups decide.
         if (allAuthenticatedHoldStockTrader) {
-            authorities.add(new SimpleGrantedAuthority(STOCK_TRADER_AUTHORITY));
+            authorities.add(STOCK_TRADER_AUTHORITY);
         }
         return authorities;
     }
 
+    // Exact match only: whatever AUTHORITIES_BY_GROUP holds for the value, or nothing at all. An unknown group, a
+    // near-miss spelling, an empty value and a nested array (whose toString is "[StockTrader]") therefore grant no
+    // role, which the rules answer with 403 rather than this method failing on the claim.
     private static void addRole(Set<GrantedAuthority> authorities, Object group) {
         if (group == null) {
             return;
         }
-        String name = group.toString().trim();
-        if (!name.isEmpty()) {
-            authorities.add(new SimpleGrantedAuthority(ROLE_PREFIX + name));
+        GrantedAuthority authority = AUTHORITIES_BY_GROUP.get(group.toString());
+        if (authority != null) {
+            authorities.add(authority);
         }
     }
 
@@ -214,10 +245,23 @@ public class JwtDecoderConfig {
         // and nbf only, and an issuer match alone would accept a token this estate minted for a different service -
         // every StockTrader token shares one signer and one issuer, so the audience is the only thing distinguishing
         // them. Omitting it would make any such token a valid credential here.
+        //
+        // The expiry check closes the other half of the same gap, and is stated rather than assumed: the framework's
+        // own JwtTimestampValidator, which createDefault() installs, compares exp against the clock only WHEN THE
+        // CLAIM IS PRESENT - so requiring its presence is a separate delegate, not a setting on that one. Nothing
+        // synthesises a missing one - MappedJwtClaimSetConverter derives iat from exp and never the reverse - so a
+        // token minted without exp verified, authenticated and authorised as a permanent credential. This service
+        // keeps no per-token state and so can revoke nothing; exp is the only bound on how long a leaked bearer
+        // token moves money, which makes its absence unacceptable rather than merely lax. Requiring the claim
+        // refuses nothing the estate issues, because the siblings mint expiry="12h"
+        // [backend/broker/src/main/liberty/config/includes/basic.xml:L39-L40]. No maximum-lifetime ceiling is
+        // added on top of it: exp already bounds the credential's life, and a shorter window would be a policy no
+        // estate configuration states.
         return new DelegatingOAuth2TokenValidator<>(
                 JwtValidators.createDefault(),
                 new JwtIssuerValidator(issuer),
-                new RequiredAudienceValidator(audience));
+                new RequiredAudienceValidator(audience),
+                new JwtClaimValidator<Instant>(JwtClaimNames.EXP, Objects::nonNull));
     }
 
     // MicroProfile JWT identifies the caller by upn and falls back to sub, but JwtAuthenticationConverter derives

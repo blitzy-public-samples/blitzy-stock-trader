@@ -1,5 +1,7 @@
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.error;
 
+import com.fasterxml.jackson.databind.JsonMappingException;
+
 import jakarta.validation.ConstraintViolationException;
 import jakarta.validation.Path;
 
@@ -48,6 +50,7 @@ public class ApiExceptionHandler {
     private static final Logger LOGGER = LoggerFactory.getLogger(ApiExceptionHandler.class);
 
     private static final String AMOUNT = "amount";
+    private static final String BALANCE = "balance";
     private static final String CURRENCY = "currency";
     private static final String OWNER = "owner";
     private static final String IDEMPOTENCY_KEY_HEADER = "Idempotency-Key";
@@ -190,8 +193,9 @@ public class ApiExceptionHandler {
         return respond(ApiError.of(code));
     }
 
-    // Spring would render Bean Validation failures as a ProblemDetail, a second error shape; the offending
-    // field name maps onto the codes that already exist for it rather than onto a new constant.
+    // Spring would render Bean Validation failures as a ProblemDetail, a second error shape. The offending field
+    // name selects the code: amount, currency and owner map onto the codes that exist for them, and every other
+    // member onto INVALID_REQUEST_FIELD, whose whole reason for existing is stated at codeForField below.
     @ExceptionHandler({ MethodArgumentNotValidException.class, HandlerMethodValidationException.class,
             ConstraintViolationException.class })
     public ResponseEntity<ApiError> handleValidationFailure(Exception exception) {
@@ -201,21 +205,31 @@ public class ApiExceptionHandler {
         return respond(ApiError.of(code, validationMessage(code, field)));
     }
 
-    // INVALID_AMOUNT is the closed code set's designated 400 for a body-binding failure; the set holds no
-    // generic "malformed body" condition. Only the exception's type is logged, because its message embeds
-    // the offending request content, which must not reach a log any more than it reaches the response.
-    // The cause chain is inspected first because that is the only route by which an oversized chunked body is
-    // reported correctly: config/RequestBodySizeLimitFilter's counting stream fails the read mid-parse with a
-    // RequestBodyTooLargeException, which Spring's Jackson converter re-throws wrapped in this type; without the
-    // unwrap an over-limit body would answer 400 INVALID_AMOUNT for a body that was never parsed at all.
+    // The exception's type, the member it names and the code that member resolved to are logged - never its
+    // message, which embeds the offending request content and must not reach a log any more than it reaches the
+    // response. The member's name is encoded all the same, because Jackson reports the name as it read it.
+    //
+    // The cause chain is inspected twice, for two different reasons. An oversized chunked body is reported
+    // correctly only through the first: config/RequestBodySizeLimitFilter's counting stream fails the read
+    // mid-parse with a RequestBodyTooLargeException, which Spring's Jackson converter re-throws wrapped in this
+    // type, and without the unwrap an over-limit body would answer 400 INVALID_AMOUNT for a body that was never
+    // parsed at all. The second finds the member Jackson was binding when it failed, so a body whose expiresAt is
+    // "not-a-date" is reported as the field fault it is - the same code and the same field-naming message a Bean
+    // Validation failure on that member produces - rather than as INVALID_AMOUNT about an amount the caller got
+    // right. A body that names no member at all (absent, truncated, or not an object) keeps INVALID_AMOUNT: the
+    // closed code set holds no generic "malformed body" condition, and the retail seam's own contract test pins
+    // that code for a body-less PUT [src/test/.../contract/RetailContractIT.java, writeWithNoBodyIsRejected...].
     @ExceptionHandler(HttpMessageNotReadableException.class)
     public ResponseEntity<ApiError> handleUnreadableBody(HttpMessageNotReadableException exception) {
-        RequestBodyTooLargeException oversized = oversizedBodyCause(exception);
+        RequestBodyTooLargeException oversized = causeOfType(exception, RequestBodyTooLargeException.class);
         if (oversized != null) {
             return handleOversizedBody(oversized);
         }
-        LOGGER.debug("Rejecting request: unreadable body - {}", exception.getClass().getSimpleName());
-        return respond(ApiError.of(CashAccountErrorCode.INVALID_AMOUNT));
+        String field = boundBodyField(exception);
+        CashAccountErrorCode code = isNamed(field) ? codeForField(field) : CashAccountErrorCode.INVALID_AMOUNT;
+        LOGGER.debug("Rejecting request: unreadable body - {} on '{}' - {}", exception.getClass().getSimpleName(),
+                LogSafeText.of(field), code.code());
+        return respond(ApiError.of(code, isNamed(field) ? validationMessage(code, field) : null));
     }
 
     // Declared for the direct throw as well as the wrapped one, so the status does not depend on whether the
@@ -296,13 +310,13 @@ public class ApiExceptionHandler {
 
     // Depth-bounded rather than a plain walk to the end of the chain: a cause graph that references itself, which
     // a wrapping converter can produce, would otherwise spin here while rendering an error. Eight levels is more
-    // than the two this path actually produces (converter wrapping the stream failure) and is reached by nothing
-    // legitimate.
-    private static RequestBodyTooLargeException oversizedBodyCause(Throwable exception) {
+    // than the two these paths actually produce (a converter wrapping the stream failure, or wrapping Jackson's
+    // own mapping failure) and is reached by nothing legitimate.
+    private static <T extends Throwable> T causeOfType(Throwable exception, Class<T> type) {
         Throwable cause = exception;
         for (int depth = 0; cause != null && depth < MAX_CAUSE_DEPTH; depth++) {
-            if (cause instanceof RequestBodyTooLargeException oversized) {
-                return oversized;
+            if (type.isInstance(cause)) {
+                return type.cast(cause);
             }
             Throwable next = cause.getCause();
             if (next == cause) {
@@ -311,6 +325,24 @@ public class ApiExceptionHandler {
             cause = next;
         }
         return null;
+    }
+
+    // Jackson records the member it was binding as a path of references, so the deepest NAMED reference is the
+    // member the caller has to correct - the same reading leafName applies to a Bean Validation property path,
+    // which is what makes a body-binding failure and a validation failure on one member answer alike. A
+    // reference with no field name is an array or collection index and names nothing a caller can fix.
+    private static String boundBodyField(Throwable exception) {
+        JsonMappingException mapping = causeOfType(exception, JsonMappingException.class);
+        if (mapping == null) {
+            return null;
+        }
+        String field = null;
+        for (JsonMappingException.Reference reference : mapping.getPath()) {
+            if (isNamed(reference.getFieldName())) {
+                field = reference.getFieldName();
+            }
+        }
+        return field;
     }
 
     private static String boundValueName(Exception exception) {
@@ -333,12 +365,9 @@ public class ApiExceptionHandler {
         return CashAccountErrorCode.INVALID_QUERY;
     }
 
-    // The payload names the offending field because the code alone cannot: every member with no code of its own
-    // falls to INVALID_AMOUNT below, so a missing or over-length orderReference was answered "Amount is missing,
-    // not a number, or not permitted for this operation" while the amount the caller sent was perfectly valid.
-    // An error naming the wrong field is worse than a generic one - it sends the caller to correct what is
-    // already correct. The closed code set is unchanged (AAP 0.6.2 defines no code for an invalid
-    // orderReference) and the status stays 400; only the sentence gains the field.
+    // The payload names the offending field because the code cannot name it on its own: INVALID_REQUEST_FIELD
+    // covers every member the AAP's vocabulary has no code for, so the sentence is what tells a caller whether
+    // it was the orderReference or the expiresAt that was refused.
     //
     // Encoded for the payload and not only the log: a field name is this module's own record or parameter name
     // today, but a validated map or nested-collection key would be the caller's, and an encoder applied only
@@ -382,14 +411,26 @@ public class ApiExceptionHandler {
         return cause.getClass().getSimpleName();
     }
 
+    // The field names the code, and a member with no code of its own is INVALID_REQUEST_FIELD rather than
+    // INVALID_AMOUNT: a hold's orderReference or expiresAt has nothing to do with an amount, and answering
+    // INVALID_AMOUNT for it made the code untrue while the message was accurate - a caller reading the code
+    // alone, which is what an automated client does, was told to correct a value it had got right. The status
+    // is 400 for every branch, so no endpoint's status class depends on which one is taken.
     private static CashAccountErrorCode codeForField(String field) {
+        // "balance" beside "amount" because it is the retail seam's own wire name for the amount
+        // [backend/broker/.../json/CashAccount.java:L22-L24]: a POST or PUT body whose balance is a boolean, an
+        // object or an unparsable string is an amount fault, and the AAP fixes INVALID_AMOUNT for it, so the
+        // field-level reading below must not take it for a member the vocabulary has no code for.
+        if (AMOUNT.equalsIgnoreCase(field) || BALANCE.equalsIgnoreCase(field)) {
+            return CashAccountErrorCode.INVALID_AMOUNT;
+        }
         if (CURRENCY.equalsIgnoreCase(field)) {
             return CashAccountErrorCode.INVALID_CURRENCY;
         }
         if (OWNER.equalsIgnoreCase(field)) {
             return CashAccountErrorCode.INVALID_OWNER;
         }
-        return CashAccountErrorCode.INVALID_AMOUNT;
+        return CashAccountErrorCode.INVALID_REQUEST_FIELD;
     }
 
     // The three validation exceptions report the offending member differently - a BindingResult,

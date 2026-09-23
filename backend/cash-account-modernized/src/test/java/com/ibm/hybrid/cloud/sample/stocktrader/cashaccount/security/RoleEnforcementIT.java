@@ -3,8 +3,13 @@ package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.security;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.StringWriter;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.util.List;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -22,6 +27,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.client.TestRestTemplate;
+import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.core.io.DefaultResourceLoader;
 import org.springframework.core.io.ResourceLoader;
 import org.springframework.expression.spel.standard.SpelExpressionParser;
@@ -29,6 +35,7 @@ import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.HttpStatusCode;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.mock.env.MockEnvironment;
@@ -55,6 +62,8 @@ public class RoleEnforcementIT extends PostgresTestSupport {
     private static final String WRITE_OWNER = "RBACWRITE";
     private static final String STRICT_WRITE_OWNER = "RBACSTRICTWRITE";
     private static final String INSTITUTIONAL_OWNER = "RBACINSTITUTIONAL";
+    private static final String NO_EXPIRY_OWNER = "RBACNOEXPIRY";
+    private static final String EXACT_GROUP_OWNER = "RBACEXACTGROUP";
 
     // USD is both broker's default account currency and cashaccount.fx.base-currency, so a same-currency
     // operation short-circuits to a rate of exactly 1 and no request here reaches the exchange-rate client
@@ -90,6 +99,11 @@ public class RoleEnforcementIT extends PostgresTestSupport {
     // looking correct and the flag false.
     @Autowired
     private FilterChainProxy securityFilterChain;
+
+    // Needed only by the rejection of a write that carries a body, which has to be issued by a client
+    // TestRestTemplate cannot stand in for; see postAccount.
+    @LocalServerPort
+    private int port;
 
     @DynamicPropertySource
     static void jwtSignerKey(DynamicPropertyRegistry registry) {
@@ -144,6 +158,45 @@ public class RoleEnforcementIT extends PostgresTestSupport {
         // so the full payload is what proves error/ApiErrorAuthenticationEntryPoint is wired: an unwired chain
         // answers 401 with an empty body, leaving a caller two payload shapes to parse instead of one (AAP 0.6.2).
         assertApiError(response, HttpStatus.UNAUTHORIZED, "UNAUTHORIZED");
+    }
+
+    @Test
+    void tokenCarryingNoExpiryClaimIsRefusedOnEverySecuredSurface() throws Exception {
+        // Correctly signed, issued and audienced, holding StockTrader, and missing only exp. Spring Security's
+        // default JwtTimestampValidator compares exp against the clock only when the claim is PRESENT, so before
+        // config/JwtDecoderConfig required its presence this was a credential that never expired and could not be
+        // revoked. All three surfaces are asserted in one scenario because each is admitted by a different
+        // authorization rule - a read, a write and the institutional space (AAP 0.7.5 rule order) - and token
+        // validation has to refuse the request ahead of every one of them.
+        seedAccount(READ_OWNER);
+
+        String withoutExpiry = JwtTestTokens.tokenWithoutExpiryFor(
+                JwtTestTokens.USER_STOCK_TRADER, JwtTestTokens.GROUP_STOCK_TRADER);
+
+        ResponseEntity<String> read = rest.exchange("/cash-account/{owner}", HttpMethod.GET,
+                new HttpEntity<>(jsonHeaders(withoutExpiry)), String.class, READ_OWNER);
+        assertApiError(read, HttpStatus.UNAUTHORIZED, "UNAUTHORIZED");
+
+        // A create, never PUT .../debit or .../credit, for the same reason as the parity-grant scenario above:
+        // those two consult the exchange-rate source the test profile points at a refused port. Its own owner, so
+        // that a regression admitting this write cannot leave an account another scenario reads.
+        ResponseEntity<String> write = postAccount(NO_EXPIRY_OWNER, withoutExpiry);
+        assertApiError(write, HttpStatus.UNAUTHORIZED, "UNAUTHORIZED");
+
+        ResponseEntity<String> institutional = rest.exchange("/cash-account/institutional/accounts/{owner}",
+                HttpMethod.GET, new HttpEntity<>(jsonHeaders(withoutExpiry)), String.class, INSTITUTIONAL_OWNER);
+        assertApiError(institutional, HttpStatus.UNAUTHORIZED, "UNAUTHORIZED");
+
+        // The control belongs in this method: the same identity and groups WITH an exp claim is admitted and
+        // serves the seeded account, which is what makes the three rejections a property of the absent claim
+        // rather than of a decoder that has stopped accepting tokens at all.
+        ResponseEntity<String> admitted = rest.exchange("/cash-account/{owner}", HttpMethod.GET,
+                new HttpEntity<>(jsonHeaders(JwtTestTokens.tokenFor(
+                        JwtTestTokens.USER_STOCK_TRADER, JwtTestTokens.GROUP_STOCK_TRADER))),
+                String.class, READ_OWNER);
+
+        assertThat(admitted.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(json(admitted.getBody()).path("owner").asText()).isEqualTo(READ_OWNER);
     }
 
     @Test
@@ -323,6 +376,44 @@ public class RoleEnforcementIT extends PostgresTestSupport {
         }
 
         @Test
+        void onlyTheExactGroupNameGrantsTheTraderRole() throws JsonProcessingException {
+            // Strict mode is the only configuration in which this is observable: with the parity grant on, every
+            // authenticated caller holds StockTrader whatever the claim says, so each value below would be admitted
+            // for a reason that has nothing to do with how it is spelled.
+            //
+            // One method iterating over the values rather than a parameterized matrix (AAP 0.7.6). Each differs
+            // from the estate's group name only by surrounding whitespace or a control character, and every one of
+            // them carried the write role while the mapping trimmed the claim before prefixing it with ROLE_ -
+            // String.trim() strips every character up to and including U+0020, NUL included (CWE-178). The empty
+            // value is included because it granted nothing even then, and that has to stay true.
+            List<String> nearMisses = List.of(
+                    "StockTrader ", " StockTrader", "StockTrader\t", "StockTrader\n", "StockTrader\u0000", "");
+
+            for (String group : nearMisses) {
+                ResponseEntity<String> refused = strictRest.exchange("/cash-account/{owner}", HttpMethod.POST,
+                        new HttpEntity<>(accountBody(EXACT_GROUP_OWNER, SEED_BALANCE),
+                                jsonHeaders(JwtTestTokens.tokenFor(JwtTestTokens.USER_UNPRIVILEGED, group))),
+                        String.class, EXACT_GROUP_OWNER);
+
+                // Described before the payload shape is asserted: assertApiError cannot name the value it was
+                // handed, and a tab or a NUL printed raw would not identify it either.
+                assertThat(refused.getStatusCode()).as("groups value %s", visible(group))
+                        .isEqualTo(HttpStatus.FORBIDDEN);
+                assertApiError(refused, HttpStatus.FORBIDDEN, "FORBIDDEN");
+            }
+
+            // The control, so the six refusals read as a property of the spelling rather than of a role model that
+            // now grants nothing: the exact group name still writes. Either status proves admission - both come
+            // from the controller - and a conflict is possible for the reason seedAccount records.
+            ResponseEntity<String> admitted = strictRest.exchange("/cash-account/{owner}", HttpMethod.POST,
+                    new HttpEntity<>(accountBody(EXACT_GROUP_OWNER, SEED_BALANCE),
+                            jsonHeaders(JwtTestTokens.stockTraderToken())),
+                    String.class, EXACT_GROUP_OWNER);
+
+            assertThat(admitted.getStatusCode()).isIn(HttpStatus.OK, HttpStatus.CONFLICT);
+        }
+
+        @Test
         void tokenWithoutStockTraderCannotReachInstitutionalSurface() throws JsonProcessingException {
             // The institutional path space admits StockTrader only, and this module's own tests are the sole
             // thing that exercises it: wiring an institutional order service to these endpoints is deliberately
@@ -397,6 +488,30 @@ public class RoleEnforcementIT extends PostgresTestSupport {
 
             assertApiError(refused, HttpStatus.FORBIDDEN, "FORBIDDEN");
             assertSecurityHeaders(refused.getHeaders());
+        }
+    }
+
+    // A retail create issued through the JDK client rather than through TestRestTemplate, because a 401 answered to
+    // a request that carries a body is unobservable through the latter: HttpURLConnection, which sits behind its
+    // default request factory, streams the body and then throws HttpRetryException("cannot retry due to server
+    // authentication, in streaming mode") rather than surfacing the challenge response - the same limitation
+    // error/FailClosedIT records for its unauthenticated oversized-body case. The response is adapted to a
+    // ResponseEntity so that one assertApiError judges every rejection in this class, whichever client issued it.
+    private ResponseEntity<String> postAccount(String owner, String token) throws IOException, InterruptedException {
+        HttpRequest request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/cash-account/" + owner))
+                .header(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
+                .header(HttpHeaders.ACCEPT, MediaType.APPLICATION_JSON_VALUE)
+                .header(HttpHeaders.AUTHORIZATION, JwtTestTokens.bearer(token))
+                .POST(HttpRequest.BodyPublishers.ofString(accountBody(owner, SEED_BALANCE)))
+                .build();
+
+        try (HttpClient client = HttpClient.newHttpClient()) {
+            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+
+            HttpHeaders headers = new HttpHeaders();
+            response.headers().firstValue(HttpHeaders.CONTENT_TYPE)
+                    .ifPresent(value -> headers.set(HttpHeaders.CONTENT_TYPE, value));
+            return new ResponseEntity<>(response.body(), headers, HttpStatusCode.valueOf(response.statusCode()));
         }
     }
 
@@ -489,6 +604,21 @@ public class RoleEnforcementIT extends PostgresTestSupport {
         assertThat(headers.getFirst(HttpHeaders.EXPIRES)).isEqualTo("0");
         assertThat(headers.getFirst("X-Content-Type-Options")).isEqualTo("nosniff");
         assertThat(headers.getFirst("X-Frame-Options")).isEqualTo("DENY");
+    }
+
+    // A rendering for failure text only: the near-miss group values differ from the estate's name by characters a
+    // terminal does not show, so a raw %s would report "groups value 'StockTrader'" for five different inputs.
+    private static String visible(String value) {
+        StringBuilder rendered = new StringBuilder(value.length());
+        for (int index = 0; index < value.length(); index++) {
+            char character = value.charAt(index);
+            if (character < ' ' || character == 0x7F) {
+                rendered.append(String.format("\\u%04x", (int) character));
+            } else {
+                rendered.append(character);
+            }
+        }
+        return "'" + rendered + "'";
     }
 
     private static JsonNode json(String body) throws JsonProcessingException {

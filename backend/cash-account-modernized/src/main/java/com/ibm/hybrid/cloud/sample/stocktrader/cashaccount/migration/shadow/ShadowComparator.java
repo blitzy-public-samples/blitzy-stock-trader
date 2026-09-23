@@ -670,10 +670,11 @@ public class ShadowComparator {
     }
 
     // The grouping key for one captured owner, which never throws: OwnerNormalizer is the authority wherever
-    // it succeeds, but it rejects a blank or over-long owner, and the row's owner column is NOT NULL - so a
-    // capture the target refuses still needs a deterministic key. The fallback folds as the normalizer would
-    // and then cuts to the stored width, which is how the legacy interface itself lost long owners
-    // (CASH00.cbl:L55).
+    // it succeeds, but it rejects a blank owner, an over-long one and - since QA finding F03 - one spelled with
+    // a character outside its identifier rule, while the row's owner column is NOT NULL. A capture the target
+    // refuses therefore still needs a deterministic key, and it is the refused lines that most need one. The
+    // fallback folds as the normalizer would and then cuts to the stored width, which is how the legacy
+    // interface itself lost long owners (CASH00.cbl:L55).
     private static String joinKey(String rawOwner) {
         try {
             return OwnerNormalizer.normalize(rawOwner);

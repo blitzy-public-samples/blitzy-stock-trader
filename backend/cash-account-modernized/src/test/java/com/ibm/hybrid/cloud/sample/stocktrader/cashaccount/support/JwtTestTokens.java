@@ -161,6 +161,20 @@ public final class JwtTestTokens {
         return mint(upn, groups, expiresAt.minus(TOKEN_LIFETIME), expiresAt);
     }
 
+    /**
+     * Signed, correctly issued and audienced, carrying {@code upn} and {@code groups} but no {@code exp} claim at
+     * all - a credential with no lifetime bound, which is a different case from an expired one: Spring Security's
+     * timestamp validator compares {@code exp} only when the claim is present, so nothing but an explicit
+     * presence check refuses this token.
+     *
+     * @param upn the caller identity to mint for
+     * @param groups the {@code groups} claim values, as the estate's JSON array
+     * @return a serialized RS256 token whose payload holds no {@code exp}
+     */
+    public static String tokenWithoutExpiryFor(String upn, String... groups) {
+        return mint(upn, groups, Instant.now(), null);
+    }
+
     public static String bearer(String token) {
         // The shape frontend/trader/.../Utilities.java:L122 sends and broker forwards unchanged.
         return "Bearer " + token;
@@ -170,8 +184,8 @@ public final class JwtTestTokens {
         return (RSAPublicKey) KEY_PAIR.getPublic();
     }
 
-    private static String mint(String upn, String[] groups, Instant issuedAt, Instant expiresAt) {
-        JWTClaimsSet claims = new JWTClaimsSet.Builder()
+    private static String mint(String upn, String[] groups, Instant issuedAt, Instant expiresAtOrNull) {
+        JWTClaimsSet.Builder claims = new JWTClaimsSet.Builder()
                 .issuer(ISSUER)
                 .audience(AUDIENCE)
                 // sub carries the same value as upn so the decoder's "upn when present, else sub" fallback resolves
@@ -181,12 +195,18 @@ public final class JwtTestTokens {
                 // A JSON array, never a joined string: the granted-authorities converter reads a list claim and
                 // would turn "StockTrader,StockViewer" into the single bogus authority ROLE_StockTrader,StockViewer.
                 .claim(GROUPS_CLAIM, groupClaim(groups))
-                .issueTime(Date.from(issuedAt))
-                .expirationTime(Date.from(expiresAt))
-                .build();
+                .issueTime(Date.from(issuedAt));
+
+        // Guarded rather than passed through as a null claim: Nimbus happens to omit a null expirationTime on
+        // serialization, but the absent-exp fixture above is a deliberate negative case and must not rest on a
+        // library's incidental behaviour - an upgrade that serialized "exp": null instead would turn the test that
+        // depends on it into one that passes for the wrong reason.
+        if (expiresAtOrNull != null) {
+            claims.expirationTime(Date.from(expiresAtOrNull));
+        }
 
         SignedJWT jwt = new SignedJWT(
-                new JWSHeader.Builder(JWSAlgorithm.RS256).type(JOSEObjectType.JWT).build(), claims);
+                new JWSHeader.Builder(JWSAlgorithm.RS256).type(JOSEObjectType.JWT).build(), claims.build());
         try {
             jwt.sign(new RSASSASigner((RSAPrivateKey) KEY_PAIR.getPrivate()));
         } catch (JOSEException exception) {

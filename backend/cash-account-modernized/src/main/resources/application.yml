@@ -17,6 +17,24 @@ server:
   # In-flight retail writes each hold a cash_account row lock; draining them beats severing them at SIGTERM.
   shutdown: graceful
 
+  error:
+    # HOW A REJECTION THE CONTAINER DECIDED IS RENDERED. Both keys hold Spring Boot's own defaults and are written
+    # here because this service depends on them rather than merely tolerating them, and because a later change to
+    # either would alter what a refused caller receives with nothing else in the module to notice.
+    #
+    # whitelabel disabled: error/ApiErrorController replaces Boot's BasicErrorController (declaring an
+    # ErrorController bean is what removes it) so every error dispatch answers in the one ApiError shape of AAP
+    # 0.6.2. With no HTML view reachable, this key states that there is no second rendering to fall back to.
+    whitelabel:
+      enabled: false
+    # include-stacktrace never: nothing about an internal failure reaches a caller (AAP 0.7.5), and this key
+    # governs two renderers rather than one. It is also what makes Boot install Tomcat's ErrorReportValve with its
+    # report and server-info suppressed, which is the page error/ApiErrorReportValveCustomizer replaces with the
+    # ApiError payload for the rejections Tomcat decides before a servlet context exists - a malformed request
+    # line, an oversized header block, an encoded path separator. Set to anything else, Tomcat's own page returns
+    # and carries a stack trace with it.
+    include-stacktrace: never
+
   # INTAKE BOUNDS. Nothing in this stack limited a request body: Tomcat's post-size cap covers form encodings only,
   # so a JSON body was bounded by nothing and Jackson materialized whatever arrived BEFORE any field validation ran —
   # heap and CPU in a 2Gi pod (.../templates/cash-account.yaml:L224-L232) for the cost of sending bytes. The largest
@@ -111,7 +129,24 @@ spring:
 
   sql:
     init:
-      mode: always
+      # TWO DEPLOYMENT POSTURES, ONE SWITCH, AND THE DEFAULT IS NOT THE SAFE ONE. The chart supplies a SINGLE
+      # database identity for DDL and DML alike (.../templates/cash-account.yaml:L110-L119), so `always` is the
+      # only default that starts a chart deployment - and it means the identity this service handles requests with
+      # also OWNS ledger_entry. An owner can drop the immutability trigger the append-only promise of AAP 0.7.4
+      # rests on: measured against PostgreSQL 12.22 as that identity, `DROP TRIGGER ledger_entry_immutable ON
+      # ledger_entry` succeeds and a following `UPDATE ledger_entry SET amount = 0` rewrites an audit row. The next
+      # start re-creates both guards (schema/cash-account-schema.sql is idempotent), so the exposure is a window
+      # rather than a permanent loss, but a leaked JDBC_PASSWORD or an application-level RCE reaches it.
+      #
+      # `never` selects the hardened posture instead, with no chart change and no code change: the DDL-owning role
+      # applies this same file once with psql, the pod runs as a DML-only role holding SELECT/INSERT/UPDATE/DELETE
+      # and owning nothing, and PostgreSQL then refuses that role DROP TRIGGER, ALTER ... DISABLE TRIGGER, TRUNCATE
+      # and DROP FUNCTION (42501) while the trigger still refuses UPDATE and DELETE (P0001) - the arrangement
+      # audit/LedgerImmutabilityIT proves and README "Hardened production posture" spells out. Carrying a second
+      # identity into the pod needs a second secret key in the chart, which is a template change this module may
+      # not make (AAP 0.3.4, open item 0.11.2), so which posture a release runs is a recorded deployment decision
+      # taken at runbook Step 0 - not something this file may quietly settle by defaulting.
+      mode: ${SPRING_SQL_INIT_MODE:always}
       schema-locations: classpath:schema/cash-account-schema.sql
       # Flyway and Liquibase occur in no pom.xml of this checkout and backend/portfolio hand-applies its
       # createTables.ddl, so the schema is applied by the mandated framework's own SQL initialization rather than by
@@ -184,6 +219,16 @@ management:
         # by default (.../values.yaml:L54), so a pod missing this endpoint fails its very first deployment. The
         # endpoint exists only because CashAccountApplication installs a BufferingApplicationStartup(2048).
         # prometheus backs the scrape annotation below. Nothing broader is exposed — no '*'.
+        #
+        # WHAT startup MAY DISCLOSE IS BOUNDED IN CODE, NOT HERE. A kubelet presents no credential, so this path is
+        # permitAll and whatever the recorder buffers is readable by any peer that reaches port 8080 - re-served on
+        # every probe, because a GET is the endpoint's snapshot rather than its drain. Unfiltered it answered
+        # 170,993 bytes naming 447 beans and 221 classes; CashAccountApplication's step filter reduces that to the
+        # six tag-free application-lifecycle steps, which is what a startup probe and a slow-start diagnosis need.
+        # Removing `startup` from this line instead would fail every pod's startupProbe, and the probe path itself
+        # is the chart's to change (AAP 0.3.4). What remains published is the step timings and the Spring Boot
+        # version the endpoint's own descriptor carries; constraining who may reach /actuator at all is a
+        # NetworkPolicy the platform owner applies (runbook Step 0).
         include: health,startup,prometheus
   endpoint:
     health:
