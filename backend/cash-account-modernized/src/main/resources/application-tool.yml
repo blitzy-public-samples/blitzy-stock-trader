@@ -1,0 +1,84 @@
+# Profile "tool": the same jar run as an offline migration/reconciliation CLI, overlaying application.yml.
+
+spring:
+  main:
+    # A load or a reconcile is an operator-run batch invocation, so the process must not acquire a routable
+    # endpoint while it runs: the Operational Runbook admits no traffic to this service before cutover signs
+    # off, and with no web application type there is no connector, controller or filter chain to enter at all.
+    # It also keeps the tool's lifetime equal to its work - the runner returns its exit code and the JVM ends.
+    web-application-type: none
+
+    # Quoted deliberately: YAML 1.1 reads bare `off` as the boolean false, which does not convert to
+    # Banner.Mode and would fail start-up. What an operator reads out of a tool run is the exit code and the
+    # migration_run / migration_reconciliation rows, which the runbook captures as step evidence; anything
+    # printed before the first record competes with that evidence. Log levels stay in application.yml.
+    banner-mode: "off"
+    log-startup-info: false
+
+  # Four base-profile settings are deliberately NOT restated here, because the tool must inherit them:
+  # spring.sql.init.* stays enabled so the runbook's Step 1 reset (DROP SCHEMA ... CASCADE, CREATE SCHEMA,
+  # re-run) re-applies schema/cash-account-schema.sql; hikari.schema stays unpinned so the runbook can pass
+  # --spring.datasource.hikari.schema=cash_account_rehearsal per invocation; jpa.hibernate.ddl-auto stays
+  # validate so a tool run cannot create structure the service would then reject at start-up; and
+  # datasource.* comes from the same guarded assembly in both profiles.
+
+tool:
+  # Intentionally empty. A bare `--spring.profiles.active=tool` would otherwise perform whichever
+  # command was defaulted here against whichever directory happened to be configured — a load is a
+  # write, and the one place it must never land by accident is a schema an operator did not name.
+  # The runner rejects a missing or unrecognized value; legal values are `load`, `reconcile` and
+  # `shadow-compare`.
+  command:
+
+  # Intentionally empty, and never a path inside this repository. The tooling is verified against the
+  # synthetic fixtures under src/test/resources/fixtures/ alone; a default pointing anywhere real would
+  # turn "the operator forgot an argument" into "the tool chose a source", and the source it must never
+  # choose is the live DB2 for z/OS or VSAM export.
+  input:
+
+  # Intentionally empty. Every invocation records its own migration_run.run_id, so the batch id is the
+  # only thing that ties a `reconcile` to the `load` it judges, and a retry after a FAILED load is a new
+  # run_id under the same batch id. A value generated when the operator omits it would produce a run
+  # that reconciles nothing and looks clean doing it.
+  batch-id:
+
+  # legacy-table, because parity can only be judged on identical inputs: the legacy balance came from the
+  # two-decimal RATES column of the staged rate table (backend/cash-account-cobol/COBOL/CASH00.cbl:L213-L222;
+  # COBOL/DCLFRANK.cpy:L12), so judging against a live rate would report every intervening ECB fixing as a
+  # balance variance. With `live`, a difference the rate difference fully explains is reclassified
+  # RATE_SOURCE / ACCEPTED_EXCEPTION and anything left over stays BALANCE / VARIANCE.
+  rate-source: legacy-table
+
+  # A property rather than a constant because the repository cannot settle it. The database, the
+  # tablespace and both tables are created CCSID EBCDIC
+  # (backend/cash-account-cobol/DB2-DDL/DB2DDL.jcl:L22, L29, L51, L61), which names an encoding family
+  # and not a code page, and the CICS region's exact CCSID appears nowhere in this module — an open item
+  # the mainframe team answers (docs/legacy-characterization.md section 9.6). IBM037 is therefore a
+  # documented assumption, and a wrong assumption corrupts every decoded owner name, so it has to be
+  # correctable by configuration in the middle of a migration window rather than by a rebuild.
+  legacy-charset: IBM037
+
+  # Same reasoning, same open item. The history stamps are region local time — EXEC CICS FORMATTIME fills
+  # YYYYMMDD and HHMMSS from ASKTIME (backend/cash-account-cobol/COBOL/CASH00.cbl:L80-L85), moved into the
+  # record at L112-L113 — and no artifact here names the region's zone. A wrong zone shifts every
+  # legacy_history.event_at by a fixed offset, making the shadow step's window boundaries meaningless while
+  # every individual row still looks plausible.
+  legacy-timezone: UTC
+
+  # Deliberately not a tool.* key: the chunk size a bulk load and a bulk reconcile flush by lives at
+  # cashaccount.migration.batch-chunk-size in application.yml, beside the JDBC batch size it must match.
+  # MigrationToolRunner rejects any tool.* command-line option outside the seven it declares, so a knob added
+  # to this namespace could never be passed at the moment an operator sizing a migration window needs it;
+  # --cashaccount.migration.batch-chunk-size=<rows> overrides it and the runner's typo guard leaves it alone.
+
+  # Intentionally empty: the one value in this file whose absence of a default IS the requirement.
+  # CASH00 writes 57 bytes — the accumulated width of WS-VSAM-RECORD
+  # (backend/cash-account-cobol/COBOL/CASH00.cbl:L38-L45), passed as LENGTH OF WS-VSAM-RECORD at L128 —
+  # into a cluster defined RECSZ(100 100) (backend/cash-account-cobol/VSAM/DEFKSDS.jcl:L11). Which of
+  # the two a real REPRO yields depends on the CICS FILE definition, which is not in this repository and
+  # is obtained during the runbook's migration-rehearsal step (docs/legacy-characterization.md section
+  # 9.5). The length is consequently declared and never inferred: mandatory whenever binary history is
+  # the input, 57 or 100, with the file length required to be an exact multiple of it and anything else
+  # rejected explicitly. A guessed length divides a file cleanly often enough to look correct and then
+  # shifts every field of every record by a few bytes — the one failure this key exists to prevent.
+  history-record-length:

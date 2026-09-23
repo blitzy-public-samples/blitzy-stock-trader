@@ -1,0 +1,465 @@
+# Default-profile configuration of the modernized cash ledger and the declared source of truth for every key the module binds.
+
+server:
+  port: 8080
+
+  # No server.servlet.context-path, and that omission is load-bearing rather than an oversight. The chart probes
+  # /actuator/startup, /actuator/health/readiness and /actuator/health/liveness at the ROOT of port 8080
+  # (infra/stocktrader-operator/helm-charts/stocktrader/templates/cash-account.yaml:L204-L222) while publishing the
+  # retail base URL to broker as http://<release>-cash-account-service:8080/cash-account
+  # (infra/stocktrader-operator/helm-charts/stocktrader/values.yaml:L146). Both can only hold at once when the
+  # /cash-account prefix lives on the controllers, so a context path here would break every probe at once.
+  #
+  # No server.ssl.* either: the template declares container port 8443
+  # (.../templates/cash-account.yaml:L199-L201) but the chart provisions no key material for this service, so there
+  # is no HTTPS listener to configure and Kubernetes never requires the declared port to be bound.
+
+  # In-flight retail writes each hold a cash_account row lock; draining them beats severing them at SIGTERM.
+  shutdown: graceful
+
+  error:
+    # HOW A REJECTION THE CONTAINER DECIDED IS RENDERED. Both keys hold Spring Boot's own defaults and are written
+    # here because this service depends on them rather than merely tolerating them, and because a later change to
+    # either would alter what a refused caller receives with nothing else in the module to notice.
+    #
+    # whitelabel disabled: error/ApiErrorController replaces Boot's BasicErrorController (declaring an
+    # ErrorController bean is what removes it) so every error dispatch answers in the one ApiError shape of AAP
+    # 0.6.2. With no HTML view reachable, this key states that there is no second rendering to fall back to.
+    whitelabel:
+      enabled: false
+    # include-stacktrace never: nothing about an internal failure reaches a caller (AAP 0.7.5), and this key
+    # governs two renderers rather than one. It is also what makes Boot install Tomcat's ErrorReportValve with its
+    # report and server-info suppressed, which is the page error/ApiErrorReportValveCustomizer replaces with the
+    # ApiError payload for the rejections Tomcat decides before a servlet context exists - a malformed request
+    # line, an oversized header block, an encoded path separator. Set to anything else, Tomcat's own page returns
+    # and carries a stack trace with it.
+    include-stacktrace: never
+
+  # INTAKE BOUNDS. Nothing in this stack limited a request body: Tomcat's post-size cap covers form encodings only,
+  # so a JSON body was bounded by nothing and Jackson materialized whatever arrived BEFORE any field validation ran —
+  # heap and CPU in a 2Gi pod (.../templates/cash-account.yaml:L224-L232) for the cost of sending bytes. The largest
+  # payload this service defines is a few hundred bytes with every field at its maximum (owner 32, order reference
+  # 64), so 8KB is ample headroom and still trivial to refuse. config/RequestBodySizeLimitFilter binds this key,
+  # rejects a declared length above it before reading a byte and counts a chunked body as it is read, answering
+  # 413 REQUEST_TOO_LARGE in the standard ApiError shape either way.
+  max-request-body-size: 8KB
+  # The request line and headers, whose 8KB is Tomcat's own default, stated here because it is the bound on the one
+  # caller-controlled input the filter above cannot see: the ?amount= query parameter's text.
+  max-http-request-header-size: 8KB
+
+  tomcat:
+    # Form bodies never reach the filter's counter — the container parses them off the native stream to build the
+    # parameter map — so they are bounded here instead. This service consumes application/json only; the value is a
+    # cap rather than a facility.
+    max-http-form-post-size: 8KB
+    # How much of a body the application refused to read Tomcat will still drain to keep the connection usable.
+    # Down from the 2MB default: large enough that a rejected request receives its 413 rather than a reset
+    # connection, small enough that draining is never the attack. It is also the bound on a body nothing reads at
+    # all — one sent to a GET mapping or to an actuator path — which the filter's counter never sees.
+    max-swallow-size: 64KB
+
+  # WHAT THESE KEYS DO NOT AND CANNOT BOUND, stated so it is never mistaken for covered. Every value above governs
+  # what this process READS; none of them governs what the network DELIVERS, because the connector has already
+  # accepted the bytes by the time any of them applies. A body the application parses is capped at 8KB and a body it
+  # refuses is drained at no more than 64KB, so no request can cost this pod more than that — but a caller can still
+  # spend its own bandwidth pushing bytes at the connector.
+  #
+  # Closing that outer layer is a DEPLOYMENT change and deliberately not attempted here: it belongs to the ingress,
+  # service mesh or API gateway in front of the Service, and this module may not edit
+  # infra/stocktrader-operator/helm-charts/** — AAP 0.3.4 makes a chart template change a stop-and-flag condition and
+  # AAP 0.2.4 puts values, CRDs and GitOps resources out of scope. The platform owner is the one who can set it, the
+  # value to set is a request-body limit at or below this file's 8KB for the /cash-account path space (for example
+  # nginx-ingress client_max_body_size, or an Envoy buffer limit), and the evidence to capture is an over-limit POST
+  # refused at the edge before it reaches a pod. Until that is done the controls here are the whole of it, and they
+  # bound this process rather than the link to it.
+
+spring:
+  application:
+    name: cash-account-modernized
+
+  datasource:
+    # Credentials only. The JDBC URL is assembled by config/DataSourceGuardConfig out of the cashaccount.jdbc.*
+    # values below, because JDBC_SSL=true has to append ssl=true&sslmode=verify-ca plus EITHER sslrootcert=<temp
+    # PEM> or sslfactory=org.postgresql.ssl.DefaultJavaSSLFactory — a branch no static placeholder can express.
+    # Keys database.id / database.password of the chart secret (.../templates/cash-account.yaml:L110-L119).
+    #
+    # There is deliberately no url key, and one arriving from any other property source - SPRING_DATASOURCE_URL in
+    # the container environment, a system property, a command-line argument - is not honoured as a connection: that
+    # single value would otherwise decide the dialect, the host, the credentials and the TLS mode together.
+    # DataSourceGuardConfig refuses it while JDBC_HOST or JDBC_DB carries a value, which is every chart deployment,
+    # and refuses it outright while JDBC_SSL asks for TLS, because sslmode=verify-ca verifies the certificate chain
+    # and not the hostname; otherwise it keeps only the URL's host, port and database. So no property source can drop
+    # sslmode=verify-ca, swap in a non-validating SSL factory, fold credentials into the URL or repoint the ledger.
+    username: ${JDBC_ID:}
+    password: ${JDBC_PASSWORD:}
+
+    hikari:
+      # THE BOUND ON HOW LONG ANYTHING WAITS FOR THE LEDGER'S DATABASE. Hikari's own default is 30 s to borrow a
+      # connection, which is not a budget anyone chose: with the database unreachable every DB-dependent request
+      # sat for 30.0 s before returning the 503 that was already decided at the first refused connection, and the
+      # readiness group's `db` indicator - which borrows from this very pool - answered DOWN just as late, so the
+      # kubelet's probe (period 15s, no timeoutSeconds, hence its 1 s default:
+      # .../templates/cash-account.yaml:L211-L216) never saw a body at all while a Tomcat worker stayed parked per
+      # probe and per caller. The exchange-rate hop is already capped at cashaccount.fx.timeout=PT2S "never as a
+      # request that outlives its caller"; the datastore is the other outbound hop and takes the same ceiling.
+      #
+      # What a caller receives once it expires is unchanged and was always correct: Hikari's
+      # SQLTransientConnectionException reaches error/ApiExceptionHandler as 503 DATASTORE_UNAVAILABLE with
+      # Retry-After: 5 - the modern reading of DB2's -911/-913, which CICS backed out at once rather than queued
+      # (AAP 0.12.3). A saturated pool now answers that way too instead of queueing half a minute: with every
+      # operation here a single-row read or write, 2 s of unbroken contention is real overload, and a retryable
+      # 503 is the honest answer to it. Retunable with no chart change through
+      # SPRING_DATASOURCE_HIKARI_CONNECTION_TIMEOUT.
+      connection-timeout: 2000
+      # Must stay at or below the borrow budget, which is why the 5 s default is replaced rather than left alone:
+      # the aliveness check of a pooled connection runs INSIDE the borrow, so a dead-but-open connection would
+      # otherwise be declared invalid only after the ceiling above had already passed, and the bound would be a
+      # claim rather than a fact.
+      validation-timeout: 1000
+      # Start-up keeps, deliberately and by name, the tolerance the 30 s borrow default used to give it by
+      # accident: Hikari retries once a second across this window before failing the context, so a pod whose
+      # database is still coming up starts anyway and the tighter budget above cannot turn a slow database into a
+      # crash loop. Not negative on purpose - a negative value starts the pod with no database at all, while
+      # spring.sql.init and ddl-auto=validate below both have to run against a real one before this service is
+      # allowed to answer.
+      initialization-fail-timeout: 30000
+      # THE BOUND ON WAITING FOR A LOCK ANOTHER TRANSACTION HOLDS, which is the one wait none of the three values
+      # above reaches. connection-timeout bounds OBTAINING a connection and cashaccount.jdbc.socket-timeout bounds
+      # a read once it has begun; neither bounds a statement the server is deliberately holding back, and
+      # PostgreSQL's row locks express only NOWAIT and SKIP LOCKED while its own lock_timeout defaults to 0 - wait
+      # for ever. Measured against PostgreSQL 12.22 with one stuck transaction on a cash_account row: a retail
+      # credit occupied a Tomcat worker for 30.07 s, the socket-timeout expiry then killed the connection so even
+      # the ROLLBACK failed, and the caller received 500 INTERNAL with no Retry-After - precisely the generic 500
+      # AAP 0.6.3 forbids for a lock conflict.
+      #
+      # A POOL setting rather than pgJDBC's `options` parameter on the assembled URL, which reaches the same GUC:
+      # this way the bound holds however the URL arrives - from the chart's JDBC_* variables in a deployment, and
+      # from Testcontainers' @ServiceConnection under @SpringBootTest, where config/DataSourceGuardConfig stands
+      # its own JdbcConnectionDetails down and a URL-borne bound would be silently absent from every *IT. A JPA
+      # jakarta.persistence.lock.timeout hint on the locking query would not work at all: Hibernate's
+      # PostgreSQLDialect reports supportsWait() = false and drops a positive timeout.
+      #
+      # What a caller receives once it expires was already correct and merely unreachable: SQLSTATE 55P03 becomes
+      # org.hibernate.PessimisticLockException, Spring translates that to PessimisticLockingFailureException, and
+      # error/ApiExceptionHandler renders it as 409 CONCURRENT_MODIFICATION with Retry-After: 1 - the modern
+      # reading of the -911/-913 CICS backed out at once rather than queued (AAP 0.12.3). Because the statement is
+      # a session setting it costs one round trip per PHYSICAL connection rather than per borrow, and it survives
+      # the ROLLBACK Hikari issues when a connection returns to the pool.
+      connection-init-sql: SET lock_timeout = ${cashaccount.jdbc.lock-wait-timeout-ms}
+      # Deliberately no spring.datasource.hikari.schema: the Operational Runbook's Step 1 rehearsal supplies
+      # spring.datasource.hikari.schema=cash_account_rehearsal at run time so production tables stay untouched, which
+      # a value pinned here would defeat.
+
+  sql:
+    init:
+      # TWO DEPLOYMENT POSTURES, ONE SWITCH, AND THE DEFAULT IS NOT THE SAFE ONE. The chart supplies a SINGLE
+      # database identity for DDL and DML alike (.../templates/cash-account.yaml:L110-L119), so `always` is the
+      # only default that starts a chart deployment - and it means the identity this service handles requests with
+      # also OWNS ledger_entry. An owner can drop the immutability trigger the append-only promise of AAP 0.7.4
+      # rests on: measured against PostgreSQL 12.22 as that identity, `DROP TRIGGER ledger_entry_immutable ON
+      # ledger_entry` succeeds and a following `UPDATE ledger_entry SET amount = 0` rewrites an audit row. The next
+      # start re-creates both guards (schema/cash-account-schema.sql is idempotent), so the exposure is a window
+      # rather than a permanent loss, but a leaked JDBC_PASSWORD or an application-level RCE reaches it.
+      #
+      # `never` selects the hardened posture instead, with no chart change and no code change: the DDL-owning role
+      # applies this same file once with psql, the pod runs as a DML-only role holding SELECT/INSERT/UPDATE/DELETE
+      # and owning nothing, and PostgreSQL then refuses that role DROP TRIGGER, ALTER ... DISABLE TRIGGER, TRUNCATE
+      # and DROP FUNCTION (42501) while the trigger still refuses UPDATE and DELETE (P0001) - the arrangement
+      # audit/LedgerImmutabilityIT proves and README "Hardened production posture" spells out. Carrying a second
+      # identity into the pod needs a second secret key in the chart, which is a template change this module may
+      # not make (AAP 0.3.4, open item 0.11.2), so which posture a release runs is a recorded deployment decision
+      # taken at runbook Step 0 - not something this file may quietly settle by defaulting.
+      mode: ${SPRING_SQL_INIT_MODE:always}
+      schema-locations: classpath:schema/cash-account-schema.sql
+      # Flyway and Liquibase occur in no pom.xml of this checkout and backend/portfolio hand-applies its
+      # createTables.ddl, so the schema is applied by the mandated framework's own SQL initialization rather than by
+      # introducing a migration tool the estate does not use. Two semicolons because Spring's script runner splits
+      # on a single one, which would sever the ledger_entry_reject() function body and the trigger DO block of
+      # schema/cash-account-schema.sql; every statement in that file therefore ends with ';;'. The separator here
+      # and the terminators there are one contract — changing either alone breaks start-up.
+      separator: ';;'
+
+  jpa:
+    hibernate:
+      # Drift between the entities and schema/cash-account-schema.sql must stop start-up rather than be silently
+      # auto-corrected against a ledger. spring.jpa.defer-datasource-initialization is left at its false default on
+      # purpose: deferring would run this validation before the schema script and fail every cold start.
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      # Ledger and reservation timestamps are TIMESTAMPTZ, so pinning the JDBC zone keeps a written instant equal to
+      # the instant read back whatever local zone the pod happens to carry.
+      hibernate.jdbc.time_zone: UTC
+      # Hibernate's default is one round trip per row, so a migration load that stages a whole DB2 unload and a
+      # whole VSAM history into legacy_rate_table and legacy_history pays N round trips for N rows. The value bounds
+      # how many statements share a round trip and decides nothing about correctness — a smaller number is slower and
+      # a larger one holds more unsent statements, and neither changes what lands. 50 is the estate-neutral default,
+      # and migration/load/LegacyLoader plus migration/reconcile/ReconciliationService use the same number for
+      # cashaccount.migration.batch-chunk-size below, so a flush maps onto whole JDBC batches instead of
+      # straddling them. The request path is unaffected in substance: a retail write flushes a single row, which is a batch of
+      # one, and ledger_entry's BIGINT GENERATED ALWAYS AS IDENTITY key makes Hibernate issue its inserts singly in
+      # any case because it needs the generated entry_id immediately.
+      hibernate.jdbc.batch_size: 50
+      # Ordering is what makes a batch a batch: within one flush Hibernate groups the statements of an entity type
+      # together, so a staging pass produces batched INSERTs rather than an alternating sequence that breaks the
+      # batch on every type change. It reorders statements inside a flush only, never across one, and the one
+      # foreign key in the schema (migration_reconciliation.run_id → migration_run) is satisfied by an explicit
+      # flush of the run row before the first finding is written, not by this ordering.
+      hibernate.order_inserts: true
+      hibernate.order_updates: true
+
+  jackson:
+    # No float or double may touch a money path, and a balance must reach the wire as plain decimal text: broker's
+    # client consumes it and RetailContractIT captures the raw response to assert the literal "balance":1234.56,
+    # which exponent notation would fail. config/JacksonConfig applies the same two settings programmatically; they
+    # are declared here so this file remains the whole, self-describing configuration.
+    deserialization:
+      use-big-decimal-for-floats: true
+    generator:
+      write-bigdecimal-as-plain: true
+    # The error payload carries owner and reservationId only where the condition has them, so absent fields are
+    # omitted rather than rendered null.
+    default-property-inclusion: non_null
+
+  servlet:
+    multipart:
+      # No endpoint of this service consumes multipart/form-data - every write takes a JSON body - so the
+      # capability is removed rather than left enabled and unused. Boot's MultipartAutoConfiguration is
+      # @ConditionalOnProperty(prefix = "spring.servlet.multipart", name = "enabled", matchIfMissing = true),
+      # so false removes the whole auto-configuration: no MultipartConfigElement on the dispatcher-servlet
+      # registration and no StandardServletMultipartResolver. With Tomcat's allowCasualMultipartParsing at its
+      # false default, neither the container nor Spring MVC then parses a multipart body, which puts the
+      # temp-file path of CVE-2025-61795 out of reach whatever the container patch level. Defence in depth
+      # beside the tomcat.version 10.1.60 bump in pom.xml, never a substitute for it.
+      enabled: false
+
+management:
+  endpoints:
+    web:
+      exposure:
+        # startup is not optional: the chart's startupProbe hits /actuator/startup with a 60s initial delay, a 30s
+        # period and 3 allowed failures (.../templates/cash-account.yaml:L204-L210) and global.healthCheck is true
+        # by default (.../values.yaml:L54), so a pod missing this endpoint fails its very first deployment. The
+        # endpoint exists only because CashAccountApplication installs a BufferingApplicationStartup(2048).
+        # prometheus backs the scrape annotation below. Nothing broader is exposed — no '*'.
+        #
+        # WHAT startup MAY DISCLOSE IS BOUNDED IN CODE, NOT HERE. A kubelet presents no credential, so this path is
+        # permitAll and whatever the recorder buffers is readable by any peer that reaches port 8080 - re-served on
+        # every probe, because a GET is the endpoint's snapshot rather than its drain. Unfiltered it answered
+        # 170,993 bytes naming 447 beans and 221 classes; CashAccountApplication's step filter reduces that to the
+        # six tag-free application-lifecycle steps, which is what a startup probe and a slow-start diagnosis need.
+        # Removing `startup` from this line instead would fail every pod's startupProbe, and the probe path itself
+        # is the chart's to change (AAP 0.3.4). What remains published is the step timings and the Spring Boot
+        # version the endpoint's own descriptor carries; constraining who may reach /actuator at all is a
+        # NetworkPolicy the platform owner applies (runbook Step 0).
+        include: health,startup,prometheus
+  endpoint:
+    health:
+      # The readiness and liveness groups are only auto-enabled inside a detected Kubernetes environment; the probes
+      # must also answer under `java -jar` and under @SpringBootTest, so enablement is explicit.
+      probes:
+        enabled: true
+      # config/SecurityConfig leaves the probe paths permitAll, so the response must not describe internals.
+      show-details: never
+      group:
+        readiness:
+          # db belongs in readiness: a pod that cannot reach its ledger must leave the Service endpoints. The
+          # exchange-rate API deliberately gets no health indicator, so an FX outage never flaps pods.
+          include: readinessState,db
+        liveness:
+          # livenessState alone. A failing livenessProbe restarts the container
+          # (.../templates/cash-account.yaml:L217-L222), so including db here would turn one database outage into a
+          # rolling crash loop across every pod.
+          include: livenessState
+  prometheus:
+    metrics:
+      export:
+        # Spring Boot 3.x property name (management.metrics.export.prometheus.* is the pre-3.0 form and is inert
+        # here). The chart's scrape annotation carries prometheus.io/port "8080" with no path
+        # (.../templates/cash-account.yaml:L51-L54), which is why config/MetricsScrapeController serves GET /metrics
+        # from this registry in addition to the canonical /actuator/prometheus.
+        enabled: true
+  # No management.server.port: the chart probes and scrapes port 8080 only, so the management endpoints must stay on
+  # the main connector.
+
+cashaccount:
+  migration:
+    # Rows per flush-and-clear during a bulk load or reconcile. Unbounded, one load would hold every entity it has
+    # written until the transaction ends - an out-of-memory failure halfway through a migration window. It is a
+    # trade-off, not a correctness parameter: the same rows land whatever it is, because the whole load stays one
+    # transaction (AAP 0.6.3). 50 matches spring.jpa.properties.hibernate.jdbc.batch_size above so a flush is whole
+    # JDBC batches, and the key lives here rather than under tool.* because MigrationToolRunner rejects any tool.*
+    # option outside the seven it declares; --cashaccount.migration.batch-chunk-size=<rows> overrides it.
+    batch-chunk-size: 50
+
+  jdbc:
+    # Guarded rather than defaulted for convenience. database.kind is chart-global and is still db2 in the
+    # repository (.../values.yaml:L74-L81), so config/DataSourceGuardConfig fails start-up with an explicit message
+    # for any value other than postgres instead of half-starting against a store this schema was never written for.
+    # Moving the release to PostgreSQL is a signed-off runbook Step 0 prerequisite, not a change this file makes.
+    kind: ${JDBC_KIND:postgres}
+    # Host and database carry no fallback. The chart injects both from non-optional configMap keys
+    # (.../templates/cash-account.yaml:L89-L103), so a convenience default cannot help a real deployment and would
+    # instead let a process started without that configMap reach a local database while its probes stayed green -
+    # the ledger writing somewhere nobody is reconciling. The empty default resolves to a blank value on purpose:
+    # it routes straight into config/DataSourceGuardConfig, which refuses to start and names the missing variable,
+    # whereas a bare ${JDBC_HOST} would fail placeholder resolution with a message that names no remedy. Only the
+    # port keeps its 5432, which is PostgreSQL's own listening port rather than a guess about this estate.
+    host: ${JDBC_HOST:}
+    port: ${JDBC_PORT:5432}
+    database: ${JDBC_DB:}
+    # Mirrors portfolio's <variable name="JDBC_SSL" defaultValue="false"/>
+    # (backend/portfolio/src/main/liberty/config/includes/postgres.xml:L2).
+    ssl: ${JDBC_SSL:false}
+    # The two bounds the pool cannot set because they belong to the driver, appended to the assembled URL by
+    # config/DataSourceGuardConfig (both are already in the parameters it accepts on a supplied URL). They close
+    # what spring.datasource.hikari.connection-timeout above cannot reach:
+    #   connect-timeout bounds ONE TCP-and-TLS handshake, so a host that drops packets rather than refusing them
+    #   fails inside the pool's borrow budget instead of sitting in the kernel's connect retry, leaving the socket
+    #   and its thread behind after Hikari has already given up on it;
+    #   socket-timeout bounds a READ on an established connection, which nothing else here bounds at all -
+    #   pgJDBC's default is 0, meaning a statement already in flight when the peer disappears waits for ever, and
+    #   the pool's borrow budget governs getting a connection rather than using one.
+    # socket-timeout is a ceiling on the slowest legitimate single round trip, not a request budget: the longest
+    # this service can legitimately wait on one statement is schema/cash-account-schema.sql's pg_advisory_lock
+    # while another pod applies the same script, so it is generous where the borrow budget is tight. Whole
+    # seconds only, because the driver takes an int of seconds and reads 0 as "no timeout at all" - a sub-second
+    # value would be truncated into exactly the unbounded default these two settings exist to remove, so
+    # DataSourceGuardConfig refuses it instead.
+    connect-timeout: PT2S
+    socket-timeout: PT30S
+    # The third driver-level bound, applied to every pooled connection as PostgreSQL's lock_timeout by
+    # spring.datasource.hikari.connection-init-sql above, and validated by config/DataSourceGuardConfig rather
+    # than left for the pool to fail on. Milliseconds rather than an ISO-8601 duration like its two neighbours
+    # because this value is substituted verbatim into SQL: PT2S binds as a Duration but is not a lock_timeout
+    # PostgreSQL accepts, and Spring reads 5m as minutes where the server requires 5min - a unit mismatch that
+    # would fail every connection at creation rather than at configuration.
+    #
+    # 2 s is the same ceiling cashaccount.fx.timeout gives the other outbound hop, for the same reason: every
+    # statement here locks ONE account row inside a single-row transaction, so ordinary contention clears in
+    # milliseconds and two seconds of unbroken waiting is a stuck transaction rather than load - a retryable 409
+    # is the honest answer to that, and a bounded wait is what stops one parked transaction from occupying a
+    # request thread. It must stay well below socket-timeout or the read bound fires first and the conflict
+    # degrades to 500 again, which is the ordering DataSourceGuardConfig refuses.
+    #
+    # THE ONE OTHER WAIT IT BOUNDS, stated so it is not discovered later: lock_timeout also governs
+    # schema/cash-account-schema.sql's pg_advisory_lock, so a pod whose start-up waits longer than this for
+    # another pod's copy of the script fails and is restarted, applying it cleanly on the next attempt. That
+    # script measures 50 ms cold against PostgreSQL 12.22, so the margin is roughly forty-fold, and a release
+    # that applies the schema by hand under a DDL-owning role (spring.sql.init.mode=never above) removes the
+    # interaction entirely.
+    lock-wait-timeout-ms: 2000
+    # PEM text of the database server's CA, injected as cert_defaultTrustStore from configMap key ssl.certs and only
+    # when global.specifyCerts is on (.../templates/cash-account.yaml:L179-L186), which defaults to false
+    # (.../values.yaml:L72) — hence the empty default. When present, DataSourceGuardConfig writes it to a private
+    # temp file and appends sslrootcert=<file> so pgJDBC's LibPQFactory verifies the server chain against it; when
+    # absent it appends sslfactory=org.postgresql.ssl.DefaultJavaSSLFactory so trust rides on the JVM cacerts. Both
+    # are the properties portfolio already uses, with sslMode=verify-ca
+    # (backend/portfolio/src/main/liberty/config/includes/postgres.xml:L9-L11).
+    trust-store-pem: ${cert_defaultTrustStore:}
+
+  fx:
+    # Never a hardcoded endpoint: the chart supplies it as CURRENCY_API_URL from cashAccount.exchangeRateUrl
+    # (.../templates/cash-account.yaml:L156-L160), whose value is the default written here (.../values.yaml:L147).
+    # That endpoint answers 301 to another host, so config/FxClientConfig builds its client on an HttpClient that
+    # follows redirects. This live lookup replaces the legacy STOCKTRD.FRANKFURT1 rate-table join, a
+    # migration-source artifact and not a target-state dependency (backend/cash-account-cobol/COBOL/CASH00.cbl:L213-L219).
+    url: ${CURRENCY_API_URL:https://api.frankfurter.app/latest}
+    # Broker's default account currency, so a same-currency account short-circuits to a rate of exactly 1 with no
+    # network call (backend/broker/src/main/java/com/ibm/hybrid/cloud/sample/stocktrader/broker/BrokerService.java:L357-L365).
+    base-currency: USD
+    # Budget for the whole exchange per attempt in FrankfurterExchangeRateClient - DNS resolution, TCP connect, TLS
+    # handshake, request write, response headers AND body reception together, the last of which no timeout on the
+    # JDK HTTP client can bound (its response timer is disarmed once the headers arrive), so config/FxClientConfig
+    # enforces them as one deadline. A slow rate provider must surface as 503 EXCHANGE_RATE_UNAVAILABLE with the
+    # balance untouched, never as a request that outlives its caller; at most two attempts are made, so this value
+    # is half the worst case a degraded or hostile provider can impose on a caller.
+    #
+    # Connection set-up is inside the budget and is the part that does not fit: measured from a pod, a COLD TLS
+    # handshake to the endpoint the chart ships took 3.6 s, more than this whole value, which refused the first
+    # cross-currency credit or debit after every pod start. config/FxClientConfig therefore opens that connection
+    # once at start-up, outside every caller's budget and outside readiness, so the cost is paid before the first
+    # caller rather than by it. Where a provider is slow for the whole exchange and not only its set-up, this value
+    # is retuned as plain container environment - CASHACCOUNT_FX_TIMEOUT, no chart change - and README.md's
+    # "The FX budget covers connection set-up" section gives the measurement and the floor to set it from.
+    timeout: PT2S
+    # THE single authority for the accepted-currency policy: retail/RetailCashAccountService,
+    # migration/reconcile/ReconciliationService and fx/FrankfurterExchangeRateClient all bind this key, so
+    # narrowing it here - or through CASHACCOUNT_FX_ACCEPTED_CURRENCIES with no chart change - narrows all three.
+    # It is the ESTATE allowlist, adopted verbatim from the allowed_currencies CHECK the estate already enforces
+    # (infra/stocktrader-setup/azure/modules/postgres_init/init_schema.sql.tmpl:L7), NOT the set the exchange-rate
+    # provider serves: that provider omits BGN, so acceptance is no promise of convertibility. BGN stays because
+    # this list also decides what a legacy export may be LOADED with, and dropping it would strand a
+    # BGN-denominated legacy account; keeping it costs at most a 503 EXCHANGE_RATE_UNAVAILABLE on a cross-currency
+    # credit or debit, balance unchanged and no ledger row.
+    accepted-currencies: [
+      AUD, BGN, BRL, CAD, CHF, CNY, CZK, DKK, EUR, GBP, HKD, HUF, IDR, ILS, INR, ISK,
+      JPY, KRW, MXN, MYR, NOK, NZD, PHP, PLN, RON, SEK, SGD, THB, TRY, USD, ZAR
+    ]
+
+  security:
+    # From global.auth (.../templates/cash-account.yaml:L73-L77); the default matches both the chart
+    # (.../values.yaml:L20) and broker's own variable default
+    # (backend/broker/src/main/liberty/config/server.xml:L40), so this service selects the same mode the estate
+    # already runs in rather than introducing a mechanism of its own.
+    auth-type: ${AUTH_TYPE:basic}
+    # Grants StockTrader to every authenticated principal, mirroring the siblings' ALL_AUTHENTICATED_USERS ->
+    # StockTrader binding (backend/broker/src/main/liberty/config/server.xml:L56-L60). Deployed default is true so
+    # any authenticated caller can write exactly as it can through broker today and the GET/write role split stays
+    # latent; false is the supported, documented strict mode in which only the token's groups claim decides.
+    all-authenticated-hold-stocktrader: true
+    jwt:
+      # Same issuer and audience the estate's tokens already carry (.../templates/cash-account.yaml:L161-L170,
+      # .../values.yaml:L207-L209, backend/broker/src/main/liberty/config/server.xml:L41-L42), so broker's
+      # propagated Authorization header validates here without a new identity mechanism.
+      issuer: ${JWT_ISSUER:http://stock-trader.ibm.com}
+      audience: ${JWT_AUDIENCE:stock-trader}
+      # Public certificate of the shared jwtSigner alias only — the private key that siblings ship inside trust.p12
+      # is copied nowhere in this module (backend/broker/src/main/liberty/config/includes/basic.xml:L39-L40). It
+      # stays a property rather than a path baked into code so tests can repoint it at an ephemeral per-JVM key.
+      public-key-location: classpath:security/jwtsigner.pem
+      # Consumed only when auth-type=oidc, mirroring the mpJwt jwksUri attribute broker resolves from the same
+      # variable (backend/broker/src/main/liberty/config/includes/oidc.xml:L16-L21). The chart marks the key optional
+      # (.../templates/cash-account.yaml:L171-L176), so the default is empty.
+      jwks-url: ${OIDC_JWKS_URL:}
+
+  reservation:
+    # A hold that is never settled or released must not strand funds indefinitely; the sweep interval bounds how
+    # long an overdue hold keeps money out of the available balance.
+    default-ttl: PT24H
+    expiry-sweep-interval: PT60S
+
+logging:
+  level:
+    com.ibm.hybrid.cloud.sample.stocktrader.cashaccount: INFO
+    # THE TWO FRAMEWORK LOGGERS A DATASTORE OUTAGE WOULD OTHERWISE AMPLIFY. The module's own posture is one bounded
+    # record per failure - error/ApiExceptionHandler names the condition and the root cause's type and leaves the
+    # frames at DEBUG - but a level set for the application package alone leaves every framework logger at the root
+    # INFO, so the same outage was recorded a second and a third time, at greater volume, by code this module does
+    # not own. Measured over a ~12 s outage with five readiness probes and two requests: 1,137 log lines carrying
+    # 1,054 stack frames, against the two bounded WARN records the module itself wrote.
+    #
+    # Spring Boot's auto-configured DataSourceHealthIndicator was 945 of those frames, 189 per probe, because
+    # AbstractHealthIndicator logs whatever reaches Health.Builder#down(Throwable) as warn(message, throwable) on
+    # nothing but isWarnEnabled(). config/DatastoreHealthIndicator replaces it as the readiness group's `db`
+    # contributor and records one bounded line instead, so nothing in this package logs at all while that bean is
+    # registered. The level is the guard for when it is not: ERROR is the least-suppressive value that closes
+    # isWarnEnabled(), so a reinstated framework indicator cannot bring the per-probe stack back, and a genuine
+    # ERROR from the package is still published.
+    org.springframework.boot.actuate.jdbc: ERROR
+    # Hibernate's SqlExceptionHelper adds, per failed statement, one WARN naming the SQLState and one ERROR
+    # carrying the driver's message (verified in hibernate-core 6.5.3: the stack goes only to its own DEBUG). Both
+    # describe the exception error/ApiExceptionHandler is about to record once, with its root cause and its HTTP
+    # answer - and both are driven by conditions this service handles correctly: an unreachable datastore on every
+    # request of an outage, and the unique-violation race that institutional/ReservationService resolves into an
+    # idempotent replay, which made a working service log ERROR per concurrent hold. OFF rather than a lower
+    # threshold because a logger level cannot drop an ERROR line while keeping the logger: the frames and the
+    # message remain available through ApiExceptionHandler's DEBUG record, and through its ERROR-with-throwable for
+    # an INTERNAL failure. A debugging session restores them with
+    # logging.level.org.hibernate.engine.jdbc.spi.SqlExceptionHelper=DEBUG passed as a system property or a
+    # command-line argument, which carry the class logger's name verbatim - not as an environment variable, whose
+    # relaxed form cannot reproduce its camel case and would configure a different logger.
+    #
+    # Quoted deliberately: YAML 1.1, which SnakeYAML and therefore Spring Boot's loader implement, resolves a bare
+    # OFF to the boolean false, and the level would reach LogLevel as "false".
+    org.hibernate.engine.jdbc.spi.SqlExceptionHelper: 'OFF'

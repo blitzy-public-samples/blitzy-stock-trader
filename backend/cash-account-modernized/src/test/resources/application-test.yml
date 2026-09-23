@@ -1,0 +1,45 @@
+# Profile "test": a thin overlay of application.yml, which stays the source of truth for every key not below.
+
+cashaccount:
+  jdbc:
+    # An ambient JDBC_KIND would otherwise reach DataSourceGuardConfig's guard through ${JDBC_KIND:postgres}
+    # and fail every context; this literal outranks it. Testcontainers' @ServiceConnection supplies the rest.
+    kind: postgres
+  fx:
+    # Offline by construction: the *IT accounts are USD, where a same-currency rate of exactly 1 short-circuits
+    # before any call, and port 1 refuses at TCP so an unintended cross-currency path fails fast. https is not
+    # decoration: the client rejects a plaintext endpoint at construction, so an http value here would fail
+    # every *IT context at start-up.
+    url: https://127.0.0.1:1/latest
+  security:
+    # The mode the estate already runs in (infra/stocktrader-operator/helm-charts/stocktrader/values.yaml:L20,
+    # backend/broker/src/main/liberty/config/server.xml:L40), so tests exercise the deployed RS256
+    # resource-server chain rather than a mechanism invented for them.
+    auth-type: basic
+    jwt:
+      # The chart's deployed literals (.../values.yaml:L207-L209, broker's server.xml:L41-L42), so no second
+      # set of magic strings enters the module. support/JwtTestTokens reads them: its tokens must carry exactly
+      # these as iss and aud, or every *IT is answered 401.
+      issuer: http://stock-trader.ibm.com
+      audience: stock-trader
+  reservation:
+    # The deployed PT60S sweep would fire mid-assertion and race ReservationLifecycleIT's expiry and
+    # sweep-versus-settle cases; tests drive the sweep directly, so it is moved aside, not disabled.
+    expiry-sweep-interval: PT1H
+
+management:
+  endpoint:
+    health:
+      # Inherited, restated once so ActuatorProbesIT's precondition is local: these groups self-enable only
+      # inside a detected Kubernetes environment, never under @SpringBootTest.
+      probes:
+        enabled: true
+
+# Absent on purpose: security.jwt.public-key-location, because support/JwtTestTokens injects an ephemeral
+# per-JVM key's PEM with @DynamicPropertySource and no key material belongs in this tree;
+# security.all-authenticated-hold-stocktrader, which stays the deployed true parity grant
+# (broker's server.xml:L56-L60) while RoleEnforcementIT selects both modes per context; the datasource keys,
+# which come from the @ServiceConnection container, with the pool left at its default because
+# support/PostgresTestSupport raises the container's max_connections above what every cached context can reach
+# together; and spring.sql.init.*, which LedgerImmutabilityIT needs inherited so the schema re-applies across a
+# context restart.

@@ -1,0 +1,12 @@
+# Maven build output, and nothing else.
+#
+# This module is a plain tracked directory in the umbrella checkout while every sibling is a git submodule
+# carrying its own ignores, so without this line `git status --porcelain` at the repository root reports
+# `?? backend/cash-account-modernized/target/` after the build the README mandates (`./mvnw -B clean verify`) -
+# some 60 MB of build output that a blanket `git add -A` would commit, and a boundary-hygiene gate that can no
+# longer tell this deliverable's files from its artifacts.
+#
+# Kept to this one pattern deliberately: a wider rule could hide a deliverable file from the same gate, which is
+# the failure this file exists to prevent. The file itself is beyond AAP 0.2.1's frozen inventory and is recorded
+# as row D5 of the README's authorization record.
+target/

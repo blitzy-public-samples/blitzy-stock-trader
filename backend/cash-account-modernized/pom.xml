@@ -1,0 +1,507 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!-- 3.3.13 is the final 3.3.x release published to Maven Central and therefore carries every fix of
+         the mandated 3.3 line. The OSS end-of-life of 3.3.x is a raised open item, not a licence to bump
+         to 3.4/3.5. The empty <relativePath/> is required: every sibling in this checkout is a git
+         submodule and nothing aggregates this module, so the parent must be resolved from the
+         repository rather than by walking up the umbrella working tree. -->
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.3.13</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>com.ibm.hybrid.cloud.sample.stocktrader</groupId>
+    <artifactId>cash-account-modernized</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+    <packaging>jar</packaging>
+
+    <name>StockTrader - cash-account-modernized</name>
+    <description>
+        Cloud-native cash ledger service replacing the CICS/COBOL cash-account program: the retail
+        contract the broker already calls, an additive institutional reservation surface, an append-only
+        ledger over PostgreSQL, and the fixture-verified migration/reconciliation tooling.
+    </description>
+
+    <properties>
+        <!-- 21 is the highest source level the estate documents (backend/account/pom.xml:L33,
+             backend/trade-history/pom.xml:L47). java.version drives the parent's compiler settings;
+             maven.compiler.release is set as well so the build is explicit about release semantics. -->
+        <java.version>21</java.version>
+        <maven.compiler.release>21</maven.compiler.release>
+
+        <!-- The nine properties below carry this module's advisory-driven version decisions, and each exists
+             for a single reason: the version Spring Boot 3.3.13 resolves is affected by the advisory named
+             against it and the mandated 3.3 line ships no newer parent to inherit the fix from. Eight of them
+             OVERRIDE versions the BOM does manage; the ninth, nimbus-jose-jwt.version, pins a coordinate the
+             BOM does not manage at all and is applied through <dependencyManagement> below. One property per
+             coordinate set, each with its own advisory: everywhere else the BOM remains this module's single
+             version authority, and these nine are that rule's stated exceptions rather than a second
+             authority beside it.
+             WHAT NO PROPERTY HERE CAN REACH, so that its absence from this list is not read as safety: the
+             spring-boot and spring-boot-autoconfigure artifacts carry the PARENT's version. CVE-2026-22733
+             (authentication bypass under the actuator CloudFoundry endpoints, CVSS 8.1, fixed 3.5.12/4.0.4),
+             CVE-2026-40973 (fixed 3.5.14/4.0.6) and CVE-2026-41001 (fixed 3.5.15/4.0.7) therefore still ship,
+             and are remediable only by leaving the 3.3 line - which AAP 0.14.1 freezes and AAP 0.11.2 records
+             as an organizational decision, not a build change. The compensating control for the CloudFoundry
+             advisory is structural rather than hopeful: SecurityConfig's anyRequest().denyAll() covers
+             /cloudfoundryapplication and everything under it, the CloudFoundry actuator auto-configuration
+             activates only in the presence of VCAP_APPLICATION, and this module declares no endpoint in that
+             path space. README.md's open items carry that residual exposure as the production gate it is.
+             All nine also depart from the frozen dependency inventory (AAP 0.9.1, which pins pgJDBC 42.7.7 and
+             leaves the rest to the BOM), so each is carried as a row of README.md's "Deviations from the frozen
+             AAP inventory" register, where the advisory, the reason no BOM version remediates it and the
+             decision row that authorizes it (D1, PENDING until the requesting organization signs it) are stated
+             together - including that this set moves the Spring, Spring Data, Jackson, Logback and Micrometer
+             lines above
+             Boot 3.3.13's tested matrix, a combination no Spring compatibility statement covers and whose
+             evidence here is this module's own gate. A version moved here moves in that register in the same
+             edit, and reverting one to its inventory value reinstates the vulnerability. -->
+        <!-- CVE-2026-42198: in pgJDBC 42.2.0 up to but excluding 42.7.11 the SERVER dictates the
+             SCRAM-SHA-256 PBKDF2 iteration count, so an impersonated or compromised database can force
+             unbounded client-side CPU work at login, which loginTimeout does not bound. 42.7.11 adds the
+             scramMaxIterations cap (default 100000) and is the fixed floor; 42.7.13 is the current 42.7.x and
+             additionally fails closed on a SCRAM channel-binding downgrade. No scramMaxIterations is added to
+             the assembled JDBC URL: the driver's own default already caps it. -->
+        <postgresql.version>42.7.13</postgresql.version>
+        <!-- CVE-2025-61795: Tomcat 10.1.0-M1 through 10.1.46 delays cleanup of multipart upload temp files on
+             an error path, so repeated failed uploads exhaust disk; fixed in 10.1.47, and 10.1.60 is the
+             latest 10.1.x so it carries every later 10.1 fix as well. This is the parent's own version
+             property, so the whole org.apache.tomcat.embed:* set moves together rather than one artifact
+             being lifted out of its release. spring.servlet.multipart.enabled=false in application.yml
+             removes the affected code path as defence in depth beside this bump, not instead of it. -->
+        <tomcat.version>10.1.60</tomcat.version>
+        <!-- CVE-2026-40984: crafted HTTP requests against Micrometer's HTTP-server instrumentations cause a
+             denial of service in 1.13.0-1.13.18 (the BOM-managed 1.13.15 is inside that range), 1.14.0-1.14.15,
+             1.15.0-1.15.11, 1.16.0-1.16.5 and <=1.9.17. The only fixed versions are 1.15.12 and 1.16.6, so no
+             1.13.x or 1.14.x remediates anything and staying on the BOM line is not an option; 1.15.12 is the
+             lowest fixed version. The advisory's other remedy - disabling HTTP server instrumentation - is
+             deliberately NOT taken: the Operational Runbook's Step 3 cutover rollback criterion is a 5xx ratio
+             over http_server_requests_seconds_count scraped from this service (AAP 0.3.3), so disabling the
+             instrumentation would delete the metric that decides a rollback. This property drives the parent's
+             micrometer-bom import, so micrometer-core, -observation, -commons and -registry-prometheus move
+             together. -->
+        <micrometer.version>1.15.12</micrometer.version>
+        <!-- CVE-2026-22732 is the one CRITICAL advisory against anything this module ships: spring-security-web
+             up to 6.5.8 (the BOM's 6.3.10 among them), fixed in 6.5.9 and 7.0.4. 6.5.11 is the lowest version
+             that also closes CVE-2026-22746 (spring-security-core) and CVE-2026-22748 (-oauth2-jose), both
+             fixed 6.5.10, and CVE-2026-41706 and CVE-2026-47838 (spring-security-web), both fixed 6.5.11; no
+             6.3.x or 6.4.x release remediates any of them. This is the parent's own property, so it drives the
+             spring-security-bom import and the whole org.springframework.security:* set moves as one release -
+             the only safe way to move Spring Security, whose modules are built and tested together, and the
+             reason -test moves with it. SecurityConfig's eager header-writing workaround for CVE-2026-22732
+             stays in place beside this bump rather than being retired by it: the bump removes the vulnerable
+             code, the workaround keeps the header contract true on every rejection path, and the two are
+             independent. 6.5.x requires Spring Framework 6.2.x, which is the bump below. -->
+        <spring-security.version>6.5.11</spring-security.version>
+        <!-- CVE-2025-41249 (spring-core, fixed 6.2.11), CVE-2026-41842 and CVE-2026-41845 (spring-webmvc) and
+             CVE-2026-41850 (spring-expression), plus thirteen further MEDIUM/LOW advisories across those
+             three artifacts whose highest fixed version is also 6.2.19. Every fix lies on 6.2.x, so no 6.1.x release
+             remediates anything and 6.2.19 is the lowest version that closes all of them. The parent's own
+             property drives the spring-framework-bom import, so the entire org.springframework:* set moves
+             together; lifting one artifact out of its release is not an option for a framework whose modules
+             share internal APIs. 6.2.19 is not an independent guess either: it is the exact spring-core version
+             spring-security-web 6.5.11 declares, so the two overrides are one consistent pairing rather than
+             two versions chosen separately and hoped to agree. -->
+        <spring-framework.version>6.2.19</spring-framework.version>
+        <!-- CVE-2026-41716 (HIGH) with CVE-2026-41711 and CVE-2026-41721 against spring-data-commons, all
+             fixed in 3.5.12, which the 2025.0.x release train carries and the BOM's 2024.0.13 train (commons
+             3.3.13) cannot. 2025.0.13 is the current 2025.0.x, so it carries every later fix of that train.
+             Spring Data JPA moves with it to 3.5.13 while Hibernate stays at the BOM's 6.5.3.Final: no
+             Hibernate advisory is outstanding, so nothing justifies moving the ORM as well, and the pairing is
+             proven on exactly the repository surfaces this module's integration tests exercise. -->
+        <spring-data-bom.version>2025.0.13</spring-data-bom.version>
+        <!-- GHSA-r7wm-3cxj-wff9 (jackson-core) and CVE-2026-54512, CVE-2026-54513, CVE-2026-54514 and
+             CVE-2026-59888 (jackson-databind) are fixed in 2.18.8; CVE-2026-54515 in 2.18.9 and
+             CVE-2026-18401 (jackson-core) in 2.18.6. Nothing on 2.17.x remediates any of them. 2.18.11 is the
+             current 2.18.x and the lowest line that closes the whole set; the 2.21.x/2.22.x lines also carry
+             the fixes and are deliberately not taken, because 2.18.x is the line Spring Boot's own next minor
+             (3.4.x) is built against and is therefore the smallest step away from the mandated matrix. The
+             property drives the jackson-bom import, so databind, core and the annotations move together -
+             which matters here because the money wire contract depends on them: JacksonConfig's
+             USE_BIG_DECIMAL_FOR_FLOATS and WRITE_BIGDECIMAL_AS_PLAIN must keep rendering balance as a plain
+             decimal, which RetailContractIT asserts on the raw response text. -->
+        <jackson-bom.version>2.18.11</jackson-bom.version>
+        <!-- CVE-2025-11226 (arbitrary code execution, fixed 1.5.19) with CVE-2026-1225 (1.5.25),
+             CVE-2026-9828 (1.5.33), CVE-2026-10532 (1.5.34) and CVE-2026-13006 (1.5.37) against logback-core;
+             1.5.38 is the current 1.5.x and the lowest version that closes all five. The 1.6.x line is not
+             taken: it is a new minor whose configuration surface this module has no reason to adopt. The
+             CVE-2025-11226 exploitation precondition - Janino on the classpath, reached through a conditional
+             logback configuration - is absent here and must stay absent: no janino or commons-compiler
+             artifact is on any classpath of this module, so the bump removes the vulnerable code and that
+             absence keeps the precondition unmet. slf4j stays at the BOM's 2.0.17, which 1.5.38 requires. -->
+        <logback.version>1.5.38</logback.version>
+        <!-- CVE-2025-53864: nimbus-jose-jwt up to 9.37.3 parses a JWT claim set with no nesting bound, so a
+             deeply nested claim set can exhaust the stack; 9.37.4 is the drop-in patch. The BOM manages no
+             version for this coordinate - it arrives transitively through spring-security-oauth2-jose - which
+             is why it is pinned in <dependencyManagement> rather than here alone, and why 9.37.3 shipped
+             unnoticed in the first place. 9.37.4 is also what spring-security 6.5.11 resolves, so the pin
+             changes nothing today and exists to make the floor explicit: any future change to the security
+             line can no longer take the recursion fix away silently. The 10.x line is not taken - a major
+             version whose API the security line does not ask for. Tomcat's 8KB request-header ceiling, which
+             bounds a bearer token's reachable nesting depth, stays in place as defence in depth beside the
+             bump, not instead of it. -->
+        <nimbus-jose-jwt.version>9.37.4</nimbus-jose-jwt.version>
+
+        <!-- Everything below is a coordinate the BOM does not manage, with one stated exception: jakarta.ws.rs
+             below restates the BOM's own 3.1.0 (spring-boot-dependencies-3.3.13 jakarta-ws-rs.version) rather
+             than overriding it, so the API level the copied broker client compiles against is auditable beside
+             the rest of that stack. Declared once each so an audit reads one value per coordinate; apart from
+             the parent coordinate itself and the spring-boot-maven-plugin pin that repeats it, every version in
+             this file that appears nowhere in this block comes from the BOM deliberately. -->
+        <microprofile.rest.client.version>4.0</microprofile.rest.client.version>
+        <jakarta.ws.rs.version>3.1.0</jakarta.ws.rs.version>
+        <jakarta.cdi.version>4.1.0</jakarta.cdi.version>
+        <otel.instrumentation.annotations.version>2.4.0</otel.instrumentation.annotations.version>
+        <resteasy.microprofile.version>3.0.1.Final</resteasy.microprofile.version>
+        <!-- Deliberately 6.2.11.Final rather than trade-history's 6.2.5.Final
+             (backend/trade-history/pom.xml:L63): this is the RESTEasy version that
+             resteasy-microprofile-parent 3.0.1.Final itself declares, so the client stack is internally
+             consistent instead of mixing a newer MP layer onto an older core. -->
+        <resteasy.version>6.2.11.Final</resteasy.version>
+        <johnzon.version>2.0.2</johnzon.version>
+        <!-- RESTEasy's MP REST Client declares an MP Config implementation as optional; Liberty supplies
+             one, a Spring classpath does not, and without it RestClientBuilder.build() fails with
+             "RESTEASY003325 ... No ConfigProviderResolver implementation found!". These two versions are
+             the ones resteasy-microprofile-parent 3.0.1.Final manages. -->
+        <microprofile.config.version>3.1</microprofile.config.version>
+        <smallrye.config.version>3.9.1</smallrye.config.version>
+    </properties>
+
+    <!-- The one advisory-driven version this module cannot state as a property override, because the Spring
+         Boot BOM manages no version for the coordinate at all: nimbus-jose-jwt is a transitive dependency of
+         spring-security-oauth2-jose, so a managed entry is the only way to fix its floor. Scope and exclusions
+         are deliberately absent - this pins the version of a dependency the security starter already brings,
+         and does not introduce it as a direct one. -->
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>com.nimbusds</groupId>
+                <artifactId>nimbus-jose-jwt</artifactId>
+                <version>${nimbus-jose-jwt.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <!-- No Flyway and no Liquibase: the estate ships no migration framework (backend/portfolio
+         hand-applies createTables.ddl), so the schema is applied by Spring Boot SQL initialization over
+         src/main/resources/schema/cash-account-schema.sql with ddl-auto=validate guarding drift.
+         No Redis, Kafka or CQRS client either: the chart injects REDIS_URL, KAFKA_* and CQRS_ENABLED for
+         a Java version that was never built, and this service consumes none of them. -->
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-jpa</artifactId>
+        </dependency>
+        <!-- Needed so monetary request fields bind and validate as BigDecimal; no money path may touch
+             float or double. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+        <!-- The chart probes /actuator/health/readiness, /actuator/health/liveness and /actuator/startup
+             at the root of port 8080, so the actuator health groups and the startup endpoint are
+             deployment requirements, not optional instrumentation. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+        <!-- The broker propagates the caller's existing RS256 token as the Authorization header; this
+             service validates that same token as a resource server instead of introducing a new
+             identity mechanism. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
+        </dependency>
+        <!-- The chart's scrape annotation carries a port but no path, so a GET /metrics shim has to call
+             PrometheusMeterRegistry.scrape() directly; this registry backs both it and
+             /actuator/prometheus. -->
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
+        <!-- The pin deliberately OVERRIDES the BOM-managed 42.7.7, and therefore no longer matches
+             backend/portfolio/pom.xml:L113-L118: 42.7.7 is affected by CVE-2026-42198, fixed in 42.7.11 (see
+             postgresql.version above). The scope deliberately differs from portfolio's "provided" as well:
+             Liberty supplies the driver from /config/prereqs, whereas a Spring Boot executable jar must
+             carry it. -->
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <version>${postgresql.version}</version>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!-- Tests use real collaborators only - a Testcontainers PostgreSQL and Spring's
+             MockRestServiceServer - because no Java module in this estate uses a mocking framework.
+             The org.mockito artifacts the starter would contribute are excluded so none can be reached
+             by accident. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.mockito</groupId>
+                    <artifactId>mockito-core</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>org.mockito</groupId>
+                    <artifactId>mockito-junit-jupiter</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.security</groupId>
+            <artifactId>spring-security-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- Testcontainers is taken at the BOM-managed 1.19.8 rather than the siblings' 1.20.4
+             (backend/account) or 1.21.3 (backend/trade-history/pom.xml:L200-L217) so that a single BOM
+             is the sole version authority for the test stack - which it is in full, no test-scoped
+             coordinate being among the three security overrides declared in the properties block. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-testcontainers</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- MicroProfile REST Client stack, present only so the two verbatim test-tree copies of
+             backend/broker's CashAccountClient.java and CashAccount.java compile unmodified and can be
+             driven by RestClientBuilder. The copies exist precisely to avoid a Maven dependency on
+             broker's Liberty WAR module, which is a git submodule and must never be built from here. -->
+        <dependency>
+            <groupId>org.eclipse.microprofile.rest.client</groupId>
+            <artifactId>microprofile-rest-client-api</artifactId>
+            <version>${microprofile.rest.client.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>jakarta.ws.rs</groupId>
+            <artifactId>jakarta.ws.rs-api</artifactId>
+            <version>${jakarta.ws.rs.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>jakarta.enterprise</groupId>
+            <artifactId>jakarta.enterprise.cdi-api</artifactId>
+            <version>${jakarta.cdi.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-api</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- 2.4.0 declares opentelemetry-api 1.38.0, the BOM-managed version above, so the two stay
+             aligned. -->
+        <dependency>
+            <groupId>io.opentelemetry.instrumentation</groupId>
+            <artifactId>opentelemetry-instrumentation-annotations</artifactId>
+            <version>${otel.instrumentation.annotations.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.jboss.resteasy.microprofile</groupId>
+            <artifactId>microprofile-rest-client</artifactId>
+            <version>${resteasy.microprofile.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.jboss.resteasy</groupId>
+            <artifactId>resteasy-client</artifactId>
+            <version>${resteasy.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.jboss.resteasy</groupId>
+            <artifactId>resteasy-json-binding-provider</artifactId>
+            <version>${resteasy.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.johnzon</groupId>
+            <artifactId>johnzon-jsonb</artifactId>
+            <version>${johnzon.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.eclipse.microprofile.config</groupId>
+            <artifactId>microprofile-config-api</artifactId>
+            <version>${microprofile.config.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.smallrye.config</groupId>
+            <artifactId>smallrye-config</artifactId>
+            <version>${smallrye.config.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <!-- Verified build inputs. Two inputs of this module's build are fetched rather than declared, and both
+         are pinned by digest so a re-point after the build that validated them cannot go unnoticed.
+         1. The Maven distribution. .mvn/wrapper/maven-wrapper.properties carries
+            distributionSha256Sum=0d7125e8c91097b36edb990ea5934e6c68b4440eef4ea96510a0f6815e7eeadb, which
+            mvnw:222-247 and mvnw.cmd:123-131 verify on download and abort the build on mismatch. Maven
+            Central publishes no .sha256 for apache-maven-3.9.11-bin.zip, so that value was computed from the
+            9,278,421 bytes served by distributionUrl after their SHA-512 was matched against BOTH Central's
+            published .sha512 and archive.apache.org's independent copy
+            (03e2d65d4483a3396980629f260e25cac0d8b6f7f2791e4dc20bc83f9514db8d0f05b0479e699a5f34679250c49c8e52e961262ded468a20de0be254d8207076)
+            and their SHA-1 against Central's .sha1 (2b7fdf8f6983c7b295eab505b46825ee2d11959b). The value is
+            lowercase hex because mvnw.cmd compares (Get-FileHash ...).Hash.ToLower() against the literal.
+            The checksum line and the provenance comment above it are the ONLY departure from the verbatim
+            portfolio-assistant wrapper copy that AAP 0.2.3 and 0.8.1 call for: lines 1-19 of that file remain
+            byte-identical to the reference, the wrapper version, distribution type and distribution URL are
+            unchanged, and the build resolves the same Maven 3.9.11. Removing it would leave the distribution
+            unverified, which is the defect CWE-494 names, so the divergence is deliberate and is carried as a
+            row of README.md's "Deviations from the frozen AAP inventory" register, whose authorization record
+            carries this departure as decision row D3 - so the outstanding decision has one place to be signed
+            rather than being reported once and then invisible.
+         2. The container base image. Dockerfile pins ubi9/openjdk-21-runtime:1.21 to its multi-arch
+            manifest-list digest; that file states its own provenance and re-derivation commands.
+         Update policy for both: a new distribution URL or base release is a reviewed change in which the
+         digest is re-derived from the vendor's published checksums and moves in the same edit as the
+         reference it verifies. Neither may be bumped without the other. -->
+    <build>
+        <plugins>
+            <!-- Version stated explicitly so it can never drift from the parent above. The repackage
+                 goal produces the single executable jar the Dockerfile copies to /deployments/app.jar
+                 and that the migration tooling runs with "java -jar" under the "tool" profile. -->
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <version>3.3.13</version>
+                <!-- The entry point is named explicitly rather than discovered: the AAP fixes it as
+                     CashAccountApplication at the package root, and an explicit Start-Class keeps the
+                     repackaged jar's manifest stable regardless of what else on the classpath carries a
+                     main method (the "tool" profile reuses this same entry point as the migration CLI). -->
+                <configuration>
+                    <mainClass>com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.CashAccountApplication</mainClass>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>repackage</id>
+                        <goals>
+                            <goal>repackage</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+            <!-- Packages docs/legacy-characterization.md into the artifact, as the one resource that comes
+                 from outside src/main/resources. MigrationToolRunner copies the document's "Status:" line into
+                 migration_run.characterization_status, and runbook Step 1's sign-off and Step 3's gates read
+                 that column; resolved only from the working directory, it silently degraded to DRAFT for every
+                 invocation started anywhere but the module root - the container included, since the image
+                 carries the jar alone. Carried inside the jar it answers wherever the artifact runs, and the
+                 document the value then describes is unambiguous: the revision this artifact was built from.
+                 A copy-resources execution rather than a <resources> block, because overriding <resources>
+                 would also drop the Spring Boot parent's application*.yml filtering configuration. Precedence
+                 in the runner keeps -Dcashaccount.characterization-doc and the working-directory copies ahead
+                 of this one, so a document signed ACCEPTED after the build still wins. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-resources-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>copy-characterization-document</id>
+                        <phase>process-resources</phase>
+                        <goals>
+                            <goal>copy-resources</goal>
+                        </goals>
+                        <configuration>
+                            <outputDirectory>${project.build.outputDirectory}/docs</outputDirectory>
+                            <resources>
+                                <resource>
+                                    <directory>${project.basedir}/docs</directory>
+                                    <includes>
+                                        <include>legacy-characterization.md</include>
+                                    </includes>
+                                    <!-- Never filtered: the document quotes COBOL and SQL verbatim, and
+                                         Maven's @...@ and ${...} delimiters would rewrite a citation into
+                                         whatever a property of that name happens to hold. -->
+                                    <filtering>false</filtering>
+                                </resource>
+                            </resources>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <!-- Parent-managed version accepted on purpose: backend/portfolio/pom.xml:L150-L153 pins
+                 3.14.0, but overriding a BOM-managed plugin here would give this module a second version
+                 authority for no benefit. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <release>${maven.compiler.release}</release>
+                </configuration>
+            </plugin>
+            <!-- Unit tests are *Test and integration tests are *IT; the split is stated explicitly on
+                 both plugins so an *IT can never be executed by Surefire before its PostgreSQL container
+                 exists. cashaccount.module.basedir is required because CashAccountClientDriftTest
+                 resolves broker's sources relative to the module directory and
+                 CharacterizationDocPresentTest reads docs/legacy-characterization.md from it; the
+                 working directory of a forked test JVM is not a reliable substitute. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <includes>
+                        <include>**/*Test.java</include>
+                        <include>**/*Tests.java</include>
+                    </includes>
+                    <systemPropertyVariables>
+                        <cashaccount.module.basedir>${project.basedir}</cashaccount.module.basedir>
+                    </systemPropertyVariables>
+                </configuration>
+            </plugin>
+            <!-- Failsafe's goals are stated explicitly because it contributes nothing to "package": the
+                 module's gate is "./mvnw -B clean verify", the only phase that runs the integration
+                 tests and then asserts their results. The execution id is the inherited "default" on
+                 purpose - a new id would ADD a second execution alongside the one the Spring Boot
+                 parent already binds, and the integration suite would be scheduled twice. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-failsafe-plugin</artifactId>
+                <configuration>
+                    <includes>
+                        <include>**/*IT.java</include>
+                    </includes>
+                    <systemPropertyVariables>
+                        <cashaccount.module.basedir>${project.basedir}</cashaccount.module.basedir>
+                    </systemPropertyVariables>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>default</id>
+                        <goals>
+                            <goal>integration-test</goal>
+                            <goal>verify</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>
