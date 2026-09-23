@@ -123,6 +123,29 @@ spring:
       # spring.sql.init and ddl-auto=validate below both have to run against a real one before this service is
       # allowed to answer.
       initialization-fail-timeout: 30000
+      # THE BOUND ON WAITING FOR A LOCK ANOTHER TRANSACTION HOLDS, which is the one wait none of the three values
+      # above reaches. connection-timeout bounds OBTAINING a connection and cashaccount.jdbc.socket-timeout bounds
+      # a read once it has begun; neither bounds a statement the server is deliberately holding back, and
+      # PostgreSQL's row locks express only NOWAIT and SKIP LOCKED while its own lock_timeout defaults to 0 - wait
+      # for ever. Measured against PostgreSQL 12.22 with one stuck transaction on a cash_account row: a retail
+      # credit occupied a Tomcat worker for 30.07 s, the socket-timeout expiry then killed the connection so even
+      # the ROLLBACK failed, and the caller received 500 INTERNAL with no Retry-After - precisely the generic 500
+      # AAP 0.6.3 forbids for a lock conflict.
+      #
+      # A POOL setting rather than pgJDBC's `options` parameter on the assembled URL, which reaches the same GUC:
+      # this way the bound holds however the URL arrives - from the chart's JDBC_* variables in a deployment, and
+      # from Testcontainers' @ServiceConnection under @SpringBootTest, where config/DataSourceGuardConfig stands
+      # its own JdbcConnectionDetails down and a URL-borne bound would be silently absent from every *IT. A JPA
+      # jakarta.persistence.lock.timeout hint on the locking query would not work at all: Hibernate's
+      # PostgreSQLDialect reports supportsWait() = false and drops a positive timeout.
+      #
+      # What a caller receives once it expires was already correct and merely unreachable: SQLSTATE 55P03 becomes
+      # org.hibernate.PessimisticLockException, Spring translates that to PessimisticLockingFailureException, and
+      # error/ApiExceptionHandler renders it as 409 CONCURRENT_MODIFICATION with Retry-After: 1 - the modern
+      # reading of the -911/-913 CICS backed out at once rather than queued (AAP 0.12.3). Because the statement is
+      # a session setting it costs one round trip per PHYSICAL connection rather than per borrow, and it survives
+      # the ROLLBACK Hikari issues when a connection returns to the pool.
+      connection-init-sql: SET lock_timeout = ${cashaccount.jdbc.lock-wait-timeout-ms}
       # Deliberately no spring.datasource.hikari.schema: the Operational Runbook's Step 1 rehearsal supplies
       # spring.datasource.hikari.schema=cash_account_rehearsal at run time so production tables stay untouched, which
       # a value pinned here would defeat.
@@ -305,6 +328,27 @@ cashaccount:
     # DataSourceGuardConfig refuses it instead.
     connect-timeout: PT2S
     socket-timeout: PT30S
+    # The third driver-level bound, applied to every pooled connection as PostgreSQL's lock_timeout by
+    # spring.datasource.hikari.connection-init-sql above, and validated by config/DataSourceGuardConfig rather
+    # than left for the pool to fail on. Milliseconds rather than an ISO-8601 duration like its two neighbours
+    # because this value is substituted verbatim into SQL: PT2S binds as a Duration but is not a lock_timeout
+    # PostgreSQL accepts, and Spring reads 5m as minutes where the server requires 5min - a unit mismatch that
+    # would fail every connection at creation rather than at configuration.
+    #
+    # 2 s is the same ceiling cashaccount.fx.timeout gives the other outbound hop, for the same reason: every
+    # statement here locks ONE account row inside a single-row transaction, so ordinary contention clears in
+    # milliseconds and two seconds of unbroken waiting is a stuck transaction rather than load - a retryable 409
+    # is the honest answer to that, and a bounded wait is what stops one parked transaction from occupying a
+    # request thread. It must stay well below socket-timeout or the read bound fires first and the conflict
+    # degrades to 500 again, which is the ordering DataSourceGuardConfig refuses.
+    #
+    # THE ONE OTHER WAIT IT BOUNDS, stated so it is not discovered later: lock_timeout also governs
+    # schema/cash-account-schema.sql's pg_advisory_lock, so a pod whose start-up waits longer than this for
+    # another pod's copy of the script fails and is restarted, applying it cleanly on the next attempt. That
+    # script measures 50 ms cold against PostgreSQL 12.22, so the margin is roughly forty-fold, and a release
+    # that applies the schema by hand under a DDL-owning role (spring.sql.init.mode=never above) removes the
+    # interaction entirely.
+    lock-wait-timeout-ms: 2000
     # PEM text of the database server's CA, injected as cert_defaultTrustStore from configMap key ssl.certs and only
     # when global.specifyCerts is on (.../templates/cash-account.yaml:L179-L186), which defaults to false
     # (.../values.yaml:L72) — hence the empty default. When present, DataSourceGuardConfig writes it to a private
@@ -324,12 +368,20 @@ cashaccount:
     # Broker's default account currency, so a same-currency account short-circuits to a rate of exactly 1 with no
     # network call (backend/broker/src/main/java/com/ibm/hybrid/cloud/sample/stocktrader/broker/BrokerService.java:L357-L365).
     base-currency: USD
-    # Budget for the whole exchange per attempt in FrankfurterExchangeRateClient - connect, response headers AND
-    # body reception together, the last of which no timeout on the JDK HTTP client can bound (its response timer is
-    # disarmed once the headers arrive), so config/FxClientConfig enforces the three as one deadline. A slow rate
-    # provider must surface as 503 EXCHANGE_RATE_UNAVAILABLE with the balance untouched, never as a request that
-    # outlives its caller; at most two attempts are made, so this value is half the worst case a degraded or
-    # hostile provider can impose on a caller.
+    # Budget for the whole exchange per attempt in FrankfurterExchangeRateClient - DNS resolution, TCP connect, TLS
+    # handshake, request write, response headers AND body reception together, the last of which no timeout on the
+    # JDK HTTP client can bound (its response timer is disarmed once the headers arrive), so config/FxClientConfig
+    # enforces them as one deadline. A slow rate provider must surface as 503 EXCHANGE_RATE_UNAVAILABLE with the
+    # balance untouched, never as a request that outlives its caller; at most two attempts are made, so this value
+    # is half the worst case a degraded or hostile provider can impose on a caller.
+    #
+    # Connection set-up is inside the budget and is the part that does not fit: measured from a pod, a COLD TLS
+    # handshake to the endpoint the chart ships took 3.6 s, more than this whole value, which refused the first
+    # cross-currency credit or debit after every pod start. config/FxClientConfig therefore opens that connection
+    # once at start-up, outside every caller's budget and outside readiness, so the cost is paid before the first
+    # caller rather than by it. Where a provider is slow for the whole exchange and not only its set-up, this value
+    # is retuned as plain container environment - CASHACCOUNT_FX_TIMEOUT, no chart change - and README.md's
+    # "The FX budget covers connection set-up" section gives the measurement and the floor to set it from.
     timeout: PT2S
     # THE single authority for the accepted-currency policy: retail/RetailCashAccountService,
     # migration/reconcile/ReconciliationService and fx/FrankfurterExchangeRateClient all bind this key, so
@@ -380,3 +432,34 @@ cashaccount:
 logging:
   level:
     com.ibm.hybrid.cloud.sample.stocktrader.cashaccount: INFO
+    # THE TWO FRAMEWORK LOGGERS A DATASTORE OUTAGE WOULD OTHERWISE AMPLIFY. The module's own posture is one bounded
+    # record per failure - error/ApiExceptionHandler names the condition and the root cause's type and leaves the
+    # frames at DEBUG - but a level set for the application package alone leaves every framework logger at the root
+    # INFO, so the same outage was recorded a second and a third time, at greater volume, by code this module does
+    # not own. Measured over a ~12 s outage with five readiness probes and two requests: 1,137 log lines carrying
+    # 1,054 stack frames, against the two bounded WARN records the module itself wrote.
+    #
+    # Spring Boot's auto-configured DataSourceHealthIndicator was 945 of those frames, 189 per probe, because
+    # AbstractHealthIndicator logs whatever reaches Health.Builder#down(Throwable) as warn(message, throwable) on
+    # nothing but isWarnEnabled(). config/DatastoreHealthIndicator replaces it as the readiness group's `db`
+    # contributor and records one bounded line instead, so nothing in this package logs at all while that bean is
+    # registered. The level is the guard for when it is not: ERROR is the least-suppressive value that closes
+    # isWarnEnabled(), so a reinstated framework indicator cannot bring the per-probe stack back, and a genuine
+    # ERROR from the package is still published.
+    org.springframework.boot.actuate.jdbc: ERROR
+    # Hibernate's SqlExceptionHelper adds, per failed statement, one WARN naming the SQLState and one ERROR
+    # carrying the driver's message (verified in hibernate-core 6.5.3: the stack goes only to its own DEBUG). Both
+    # describe the exception error/ApiExceptionHandler is about to record once, with its root cause and its HTTP
+    # answer - and both are driven by conditions this service handles correctly: an unreachable datastore on every
+    # request of an outage, and the unique-violation race that institutional/ReservationService resolves into an
+    # idempotent replay, which made a working service log ERROR per concurrent hold. OFF rather than a lower
+    # threshold because a logger level cannot drop an ERROR line while keeping the logger: the frames and the
+    # message remain available through ApiExceptionHandler's DEBUG record, and through its ERROR-with-throwable for
+    # an INTERNAL failure. A debugging session restores them with
+    # logging.level.org.hibernate.engine.jdbc.spi.SqlExceptionHelper=DEBUG passed as a system property or a
+    # command-line argument, which carry the class logger's name verbatim - not as an environment variable, whose
+    # relaxed form cannot reproduce its camel case and would configure a different logger.
+    #
+    # Quoted deliberately: YAML 1.1, which SnakeYAML and therefore Spring Boot's loader implement, resolves a bare
+    # OFF to the boolean false, and the level would reach LogLevel as "false".
+    org.hibernate.engine.jdbc.spi.SqlExceptionHelper: 'OFF'

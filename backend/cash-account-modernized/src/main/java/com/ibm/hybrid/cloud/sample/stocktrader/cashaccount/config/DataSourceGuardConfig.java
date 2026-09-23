@@ -28,7 +28,8 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.core.env.ConfigurableEnvironment;
 import org.springframework.core.env.Environment;
 
-/** Fail-closed datasource configuration: PostgreSQL or no start-up, plus the JDBC URL the chart's variables imply. */
+/** Fail-closed datasource configuration: PostgreSQL or no start-up, the JDBC URL the chart's variables imply, and
+ * the three bounds on waiting for it. */
 @Configuration
 public class DataSourceGuardConfig {
 
@@ -60,6 +61,16 @@ public class DataSourceGuardConfig {
     private static final Duration DEFAULT_CONNECT_TIMEOUT = Duration.ofSeconds(2);
     private static final Duration DEFAULT_SOCKET_TIMEOUT = Duration.ofSeconds(30);
 
+    // The third bound, and the only one that is a server setting rather than a driver parameter: PostgreSQL's
+    // lock_timeout, applied to every pooled connection by spring.datasource.hikari.connection-init-sql. It is
+    // validated here, beside the two it has to stay consistent with, because nothing downstream would: the pool
+    // discovers a malformed value as a failed connection at the first borrow, and a value ABOVE the read bound is
+    // not malformed at all - it simply lets socketTimeout fire first, which is the 500 INTERNAL of AAP 0.6.3's
+    // forbidden case rather than the 409 the bound exists to produce. Default matches application.yml, which
+    // stays the declared source of truth.
+    private static final String LOCK_WAIT_TIMEOUT_PROPERTY = "cashaccount.jdbc.lock-wait-timeout-ms";
+    private static final long DEFAULT_LOCK_WAIT_TIMEOUT_MILLIS = 2000L;
+
     // pgJDBC's own spellings, matched case-insensitively and listed in the rejection message; see keepableParameters
     // for why this is an allowlist rather than a list of parameters to strip.
     private static final Set<String> KEEPABLE_URL_PARAMETERS = caseInsensitiveSet("ApplicationName",
@@ -80,9 +91,76 @@ public class DataSourceGuardConfig {
 
     // Thrown from initialization rather than logged, because a warning that scrolled past would leave the pod
     // passing its probes while every ledger write went to a store whose schema was never applied.
+    //
+    // The lock-wait bound is checked here rather than in resolveJdbcUrl below because it has to be checked even
+    // when that method never runs: under @SpringBootTest a Testcontainers @ServiceConnection supplies the
+    // JdbcConnectionDetails and this class's own bean stands down, while connection-init-sql still applies the
+    // bound to every connection in the pool.
     @PostConstruct
-    void guardDatastoreKind() {
+    void guardDatastoreConfiguration() {
         requirePostgres(properties.getJdbc().getKind());
+        long lockWaitBound = requireLockWaitBound(environment.getProperty(LOCK_WAIT_TIMEOUT_PROPERTY),
+                configuredDuration(SOCKET_TIMEOUT_PROPERTY, DEFAULT_SOCKET_TIMEOUT));
+        // Logged unconditionally, and here rather than with the URL bounds, because this is the difference between
+        // a lock conflict answered as a retryable 409 in two seconds and one that parks a request thread until the
+        // read bound kills the connection. The pool applies it per connection, so nothing else names it at run
+        // time and an effective value that came from a deployment override would otherwise be invisible.
+        LOGGER.info("Cash ledger row-lock wait bounded at {} ms (PostgreSQL lock_timeout, applied to every pooled"
+                + " connection); a longer wait is answered 409 CONCURRENT_MODIFICATION with Retry-After: 1",
+                lockWaitBound);
+    }
+
+    // Refused rather than clamped, and refused for being too LARGE as well as too small: the bound's whole
+    // purpose is to expire before cashaccount.jdbc.socket-timeout does, so an equal or larger value leaves the
+    // read bound to fire first, kill the connection mid-statement and surface the conflict as 500 INTERNAL - the
+    // behaviour this setting exists to remove, and indistinguishable from it by inspection of the value alone.
+    /**
+     * Validates the row-lock wait bound that {@code spring.datasource.hikari.connection-init-sql} applies as
+     * PostgreSQL's {@code lock_timeout}.
+     *
+     * <p>Pure: the inputs are the whole input, so every rejection is reachable without an {@code Environment}, a
+     * container or a Spring context.</p>
+     *
+     * @param rawMilliseconds the configured {@code cashaccount.jdbc.lock-wait-timeout-ms}, or {@code null}/blank
+     *                        to take the documented default of {@value #DEFAULT_LOCK_WAIT_TIMEOUT_MILLIS} ms
+     * @param readBound       the effective {@code cashaccount.jdbc.socket-timeout}, which the bound must expire
+     *                        before
+     * @return the bound in milliseconds
+     * @throws IllegalStateException when the value is not a positive whole number of milliseconds, or is not
+     *         strictly below {@code readBound}
+     */
+    public static long requireLockWaitBound(String rawMilliseconds, Duration readBound) {
+        long milliseconds = DEFAULT_LOCK_WAIT_TIMEOUT_MILLIS;
+        if (hasText(rawMilliseconds)) {
+            String candidate = rawMilliseconds.trim();
+            try {
+                milliseconds = Long.parseLong(candidate);
+            } catch (NumberFormatException ex) {
+                throw rejectLockWaitBound("'" + candidate + "', which is not a whole number of milliseconds", ex);
+            }
+            // Zero is called out by name because it is PostgreSQL's own spelling of "no timeout at all", so it
+            // would read as a configured bound while restoring exactly the unbounded wait being removed - the
+            // same silent downgrade a truncated fraction of a second would be for the two driver bounds.
+            if (milliseconds <= 0) {
+                throw rejectLockWaitBound(candidate + " ms, and it must be positive; PostgreSQL reads 0 as no"
+                        + " lock timeout at all, which is the unbounded wait this bound exists to remove", null);
+            }
+        }
+        if (readBound == null || milliseconds >= readBound.toMillis()) {
+            throw rejectLockWaitBound(milliseconds + " ms, which is not below " + SOCKET_TIMEOUT_PROPERTY + " ("
+                    + (readBound == null ? "not set" : readBound.toMillis() + " ms") + "). The read bound would"
+                    + " then expire first and kill the connection mid-statement, so a lock conflict would surface"
+                    + " as 500 INTERNAL instead of the 409 CONCURRENT_MODIFICATION with Retry-After: 1 that this"
+                    + " bound exists to produce", null);
+        }
+        return milliseconds;
+    }
+
+    private static IllegalStateException rejectLockWaitBound(String detail, Throwable cause) {
+        return new IllegalStateException("Cannot bound the cash ledger's row-lock wait: "
+                + LOCK_WAIT_TIMEOUT_PROPERTY + " is " + detail + ". Set it to a positive whole number of"
+                + " milliseconds below " + SOCKET_TIMEOUT_PROPERTY + " - 2000 is the documented default - through"
+                + " CASHACCOUNT_JDBC_LOCK_WAIT_TIMEOUT_MS, which needs no chart change.", cause);
     }
 
     /**

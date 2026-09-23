@@ -1,5 +1,9 @@
 package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.support;
 
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.SQLException;
+
 import org.springframework.boot.test.autoconfigure.actuate.observability.AutoConfigureObservability;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.test.context.ActiveProfiles;
@@ -41,5 +45,25 @@ public abstract class PostgresTestSupport {
 
     protected static String jdbcUrl() {
         return POSTGRES.getJdbcUrl();
+    }
+
+    /**
+     * Opens a connection to the same database <em>outside</em> the service's connection pool, with autocommit
+     * off so the caller can hold a transaction open.
+     *
+     * <p>Outside the pool deliberately. A test that needs one transaction to be waiting on another cannot take
+     * the blocking end from Hikari: the two would compete for the same bounded pool, and the wait under test
+     * would be a borrow timeout rather than a lock wait. It also carries no {@code lock_timeout}, because
+     * {@code spring.datasource.hikari.connection-init-sql} is a pool setting, so the holding side waits as long
+     * as the test tells it to while the service's side is bounded.</p>
+     *
+     * @return a new autocommit-off connection the caller must close
+     * @throws SQLException if the container refuses the connection
+     */
+    protected static Connection connectionOutsideThePool() throws SQLException {
+        Connection connection = DriverManager.getConnection(POSTGRES.getJdbcUrl(), POSTGRES.getUsername(),
+                POSTGRES.getPassword());
+        connection.setAutoCommit(false);
+        return connection;
     }
 }

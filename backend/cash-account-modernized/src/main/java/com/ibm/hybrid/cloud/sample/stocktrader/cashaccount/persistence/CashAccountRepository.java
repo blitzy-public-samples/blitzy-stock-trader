@@ -28,10 +28,22 @@ public interface CashAccountRepository extends JpaRepository<CashAccount, String
     // cache.shared.default=false is why no second-level or query cache is introduced alongside it.
     //
     // The JPQL is declared because "ForUpdate" is not a property of CashAccount: derivation would read the
-    // method name as the property path ownerForUpdate and fail the repository factory at start-up. No
-    // lock-timeout hint accompanies the lock, because PostgreSQL's row locks express only NOWAIT and SKIP
-    // LOCKED; blocking is the server's to arbitrate, and its deadlock detection reaches the error package as
-    // CannotAcquireLockException, already rendered there as 409 CONCURRENT_MODIFICATION.
+    // method name as the property path ownerForUpdate and fail the repository factory at start-up.
+    //
+    // No jakarta.persistence.lock.timeout hint accompanies the lock, and one would be inert if it did:
+    // PostgreSQL's row locks express only NOWAIT and SKIP LOCKED, so Hibernate's PostgreSQLDialect reports
+    // supportsWait() = false and renders a positive timeout as a plain FOR UPDATE. How long this statement may
+    // wait is therefore not decided here at all - it is PostgreSQL's own lock_timeout, which
+    // spring.datasource.hikari.connection-init-sql sets on every pooled connection from
+    // cashaccount.jdbc.lock-wait-timeout-ms (2000 ms). That is what makes the wait bounded rather than open-ended:
+    // beyond it the server cancels the statement with SQLSTATE 55P03, which reaches the error package as
+    // PessimisticLockingFailureException, while its deadlock detection (40P01) arrives as
+    // CannotAcquireLockException - both already rendered there as 409 CONCURRENT_MODIFICATION with Retry-After: 1
+    // (AAP 0.6.3). Ordinary contention is unaffected: competing single-row transactions queue on this lock and
+    // clear in milliseconds, so only a wait no request should ever incur reaches the bound.
+    //
+    // NOWAIT is deliberately not used in its place. It would bound the wait at zero and turn every overlapping
+    // write to one owner into a 409, where the design requires them to serialize and all succeed.
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("select a from CashAccount a where a.owner = :owner")
     Optional<CashAccount> findByOwnerForUpdate(@Param("owner") String owner);

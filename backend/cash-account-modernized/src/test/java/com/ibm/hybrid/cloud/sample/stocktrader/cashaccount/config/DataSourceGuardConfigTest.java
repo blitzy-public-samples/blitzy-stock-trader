@@ -9,6 +9,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFileAttributeView;
 import java.nio.file.attribute.PosixFilePermission;
+import java.time.Duration;
 
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
@@ -189,6 +190,68 @@ class DataSourceGuardConfigTest {
                 .withProperty("cashaccount.jdbc.connect-timeout", "PT0S")).resolveJdbcUrl())
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("cashaccount.jdbc.connect-timeout");
+    }
+
+    // The third bound, and the one a value alone cannot show to be wrong: a lock_timeout at or above
+    // socketTimeout is well-formed, and simply lets the read bound expire first - which kills the connection
+    // mid-statement and surfaces a lock conflict as 500 INTERNAL, the case AAP 0.6.3 forbids ("never a generic
+    // 500"). Measured before the bound existed: an external transaction holding one cash_account row parked a
+    // retail credit for 30.07 s and then answered 500 with no Retry-After.
+    @Test
+    void boundsARowLockWaitBelowTheReadBoundAndRefusesEveryValueThatWouldNotExpireFirst() {
+        Duration readBound = Duration.ofSeconds(30);
+
+        // Unset takes application.yml's documented default rather than leaving the wait open-ended.
+        assertThat(DataSourceGuardConfig.requireLockWaitBound(null, readBound)).isEqualTo(2000L);
+        assertThat(DataSourceGuardConfig.requireLockWaitBound("   ", readBound)).isEqualTo(2000L);
+
+        // Retuned with no chart change through relaxed binding of the same key, and whitespace tolerated because
+        // a configMap block scalar is what delivers it.
+        assertThat(DataSourceGuardConfig.requireLockWaitBound("500", readBound)).isEqualTo(500L);
+        assertThat(DataSourceGuardConfig.requireLockWaitBound(" 250 ", readBound)).isEqualTo(250L);
+
+        // 0 is PostgreSQL's own spelling of "no lock timeout at all", so it reads as a configured bound while
+        // restoring the unbounded wait - refused by name rather than accepted as a number.
+        assertThatThrownBy(() -> DataSourceGuardConfig.requireLockWaitBound("0", readBound))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("cashaccount.jdbc.lock-wait-timeout-ms")
+                .hasMessageContaining("no lock timeout at all");
+        assertThatThrownBy(() -> DataSourceGuardConfig.requireLockWaitBound("-1", readBound))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("positive");
+
+        // An ISO-8601 duration is the shape of both neighbouring keys, so it is the wrong value an operator is
+        // most likely to write here - and one that would otherwise reach the pool as SET lock_timeout = PT2S and
+        // fail every connection at creation instead of at configuration.
+        assertThatThrownBy(() -> DataSourceGuardConfig.requireLockWaitBound("PT2S", readBound))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("PT2S")
+                .hasMessageContaining("whole number of milliseconds");
+
+        // Equal is refused as well as greater: the bound has to expire strictly before the read bound, or the
+        // conflict it exists to convert into a 409 still arrives as a 500.
+        assertThatThrownBy(() -> DataSourceGuardConfig.requireLockWaitBound("30000", readBound))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("cashaccount.jdbc.socket-timeout")
+                .hasMessageContaining("500 INTERNAL");
+        assertThatThrownBy(() -> DataSourceGuardConfig.requireLockWaitBound("45000", readBound))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("409 CONCURRENT_MODIFICATION");
+
+        // The guard runs on every context, including one where a Testcontainers @ServiceConnection supplies the
+        // JdbcConnectionDetails and no URL is assembled here at all - so a misordered pair cannot start a pod
+        // just because this class's own bean stood down.
+        new ApplicationContextRunner()
+                .withUserConfiguration(CashAccountPropertiesBinding.class, DataSourceGuardConfig.class)
+                .withPropertyValues("JDBC_HOST=" + HOST, "JDBC_PORT=" + PORT, "JDBC_DB=" + DATABASE,
+                        "cashaccount.jdbc.socket-timeout=PT1S", "cashaccount.jdbc.lock-wait-timeout-ms=2000")
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    assertThat(context.getStartupFailure())
+                            .rootCause()
+                            .isInstanceOf(IllegalStateException.class)
+                            .hasMessageContaining("cashaccount.jdbc.lock-wait-timeout-ms");
+                });
     }
 
     // A supplied spring.datasource.url is the one input able to carry a whole connection - dialect, host,

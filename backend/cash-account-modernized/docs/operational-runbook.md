@@ -1097,6 +1097,68 @@ traffic on the line.
    asserts the same six refusals against a container, so a divergence here is the deployment's, not
    the module's.
 
+6. **Measure what the rate endpoint costs to reach from the cluster, and set the FX budget from that
+   measurement.** This action changes no state anywhere: it reads a public endpoint from a pod and
+   writes a file. It is here rather than at cutover because the value it decides is container
+   environment on the Deployment gate 3(e) creates, so it has to be known before that gate applies.
+
+   `cashaccount.fx.timeout` (`PT2S` as shipped) budgets the **whole exchange per attempt** — DNS, TCP
+   connect, the TLS handshake, the request write, the response headers and the body — and
+   `fx/FrankfurterExchangeRateClient` makes at most two attempts, so a caller can wait twice it.
+   Connection set-up is the part that does not reliably fit: measured from a pod against the endpoint
+   the chart ships, a cold TLS handshake alone took **3.6 s**, more than the whole budget, while a warm
+   connection answered the same lookup in 0.05 s. The service already removes the commonest exposure by
+   opening that connection once at start-up, outside every caller's budget and outside readiness
+   ([`../README.md#the-fx-budget-covers-connection-set-up-and-a-cold-tls-handshake-can-exceed-it`](../README.md#the-fx-budget-covers-connection-set-up-and-a-cold-tls-handshake-can-exceed-it)),
+   but a pooled connection the provider later closes is re-established inside a caller's budget, so the
+   budget still has to cover this network's cost. Measure it where the service will run — a
+   workstation's path to the provider is not the cluster's:
+
+   ```bash
+   # In a throwaway pod on the cluster, in the namespace the release runs in, against the value the
+   # chart injects. time_appconnect is DNS + TCP + TLS; total is the whole exchange. Three runs, so
+   # the cold cost and the warm cost are both on the record; the first is the one that decides.
+   kubectl run cash-account-fx-probe -n <namespace> --rm -i --restart=Never \
+     --image=<curl-image> --command -- sh -c '
+       for i in 1 2 3; do
+         curl -s -o /dev/null \
+           -w "attempt=$i appconnect=%{time_appconnect}s total=%{time_total}s http=%{http_code}\n" \
+           "<cashAccount.exchangeRateUrl>?from=USD&to=EUR"
+       done' | tee step0-fx-budget.txt
+   ```
+
+   Then decide, and record the decision in the same file:
+
+   ```bash
+   cat >> step0-fx-budget.txt <<'TXT'
+   endpoint: <cashAccount.exchangeRateUrl, as the live values/CR snapshot carries it>
+   cold total: <seconds, from attempt=1 above>
+   shipped budget: PT2S (cashaccount.fx.timeout)
+   decision: <"unchanged — the cold total plus margin fits PT2S">
+         or  <"CASHACCOUNT_FX_TIMEOUT=<ISO-8601 duration> applied to the cash-account Deployment">
+   decided by: <name, role>
+   date: <YYYY-MM-DD>
+   TXT
+   ```
+
+   The rule the decision follows: the budget must exceed the **cold** total with margin — a value below
+   it refuses the first conversion over every connection the pool has to re-establish — and for a public
+   provider reached over the internet that is typically `PT5S`. It is bounded from above too: broker's
+   REST client configures no timeout at all, so a caller's thread and a broker thread behind it are held
+   for up to twice this value, which is why the margin is a margin and not a multiple. Applying it is a
+   **container-environment** edit on the cash-account Deployment — `CASHACCOUNT_FX_TIMEOUT=PT5S`,
+   Spring's relaxed binding for the same property — and touches **no chart template and no chart
+   value**, so it is outside the value set gate 3(e) applies and outside the Step 0 snapshot; it is
+   recorded here because nothing else in the release records it.
+
+   *Gate:* `step0-fx-budget.txt` exists, carries three measurements and a decision with an authority and
+   a date, and the effective `CASHACCOUNT_FX_TIMEOUT` on the Deployment matches what it records — read
+   back from the running pod, not from the manifest that was applied. After gate 3(e) the pod's own log
+   line is the confirmation that the warm-up ran on this network: `Exchange-rate connection opened in
+   <n> ms`. A `WARN` naming the start-up warm-up budget in its place means the endpoint was unreachable
+   from the pod at start-up — the service still runs and readiness is unaffected, but the reachability
+   is what this action exists to establish, so treat it as a failed gate and resolve it before 3(g).
+
 ### Evidence to capture
 
 | Item | Class | What it is |
@@ -1111,6 +1173,7 @@ traffic on the line.
 | `step0-dependency-scan.txt` | change record | The NVD dependency-scan report — or, where no feed was provisioned, the recorded failure verbatim together with the build-input scan that stood in for it, which is what the sign-off then refers to |
 | `step0-catalog-baseline.txt` | change record | Both catalog queries' output, schema-qualified: `cash_account` absent from every schema, `cashaccount` as the estate created it, and which schema reports `on_search_path = t`. Catalog metadata only — relation, column and type names, no row of either table |
 | `step0-memory-fit.txt` | change record | The readiness status code and the heap line under `--memory=2g --cpus=1`, **naming the throwaway instance it ran against** and recording that it was destroyed. A memory-fit record that names the release's store is a Step 0 failure, not evidence |
+| `step0-fx-budget.txt` | change record | The three measurements of the rate endpoint's cost from a pod on the cluster — `time_appconnect` and `total` per attempt — together with the budget decision they produced, its authority and its date. This is the only record of the FX budget a release runs with, because the value is container environment rather than a chart value, and it is what a later "the first conversion after a restart was refused" question is answered from |
 | `step0-store.txt` | change record | The effective `database.kind` and the server version reported by `SELECT version();` |
 | `step0-framework-support.txt` | change record | The written framework-support determination — which of **stay / buy support / move line** was chosen, by whom, dated — together with the artifact inventory and image-scan output it was decided against (`./mvnw -B dependency:tree` and the Trivy image scan of the digest recorded above), so the decision and the evidence under it are one record. If the choice is *move line*, this file also carries the re-gate and re-scan of the rebuilt artifact |
 | `step0-authorization-record.txt` | change record | The status of rows D1–D6 of the README's authorization record at the moment Step 0 is signed, each with its authorizer, date and reference — a `PENDING` row here is an open deviation entering the cutover, which is the fact this evidence item exists to make visible |
@@ -1140,6 +1203,11 @@ traffic on the line.
 - **Platform owner** — the actuator reachability decision in `step0-actuator-reachability.txt`, since
   the NetworkPolicy and the monitoring topology are theirs; a recorded acceptance of the LOW residual
   is a valid outcome, an unrecorded one is not.
+- **Platform owner** — the FX budget decision in `step0-fx-budget.txt`, since the path between the
+  cluster and the rate provider is theirs to measure and the value is container environment on the
+  Deployment they own. Signing "unchanged" is a valid outcome and says the cold measurement fits the
+  shipped `PT2S`; leaving the file absent is not, because the release then runs a budget nobody checked
+  against this network.
 - **Platform owner and cash-account data owner** — the evidence-handling determination, the restricted
   store and the secret-manager location, and that the snapshot reached the store rather than the change
   record: the platform owner for the release-configuration class they are custodian of, the data owner
@@ -2164,6 +2232,11 @@ by whether gate (e) has been applied.
            # in its constructor, so a plaintext endpoint fails start-up and this pod never reaches
            # Ready, exactly as with a blank OIDC_JWKS_URL above. The refusal reads
            # `cashaccount.fx.url (CURRENCY_API_URL) must use the https scheme, not http`.
+           #
+           # The FX budget is NOT carried here and does not need to be: this pod only reads account
+           # views, which convert nothing and reach no rate provider. Where Step 0 action 6 decided a
+           # CASHACCOUNT_FX_TIMEOUT for this network, it belongs on the Deployment gate (e) creates,
+           # not on this pod.
            - name: CURRENCY_API_URL
              valueFrom:
                configMapKeyRef: { name: <release>-config, key: cashAccount.exchangeRateUrl }
@@ -2412,7 +2485,7 @@ by whether gate (e) has been applied.
    | `cashAccount.image.repository` | `<registry>/cash-account@sha256` — the first of the two values recorded in `step0-image-digest.txt`, verbatim | The digest is the only reference that cannot be re-pointed after validation, and the chart joins these two fields with a colon (`…/templates/cash-account.yaml:L65`), so the reference is carried as `repository` = the `@sha256` prefix and `tag` = the hex. The whole `sha256:<hex>` in `tag` renders an invalid reference and the pod never starts — see [`../README.md#carrying-the-digest-through-the-charts-fixed-repositorytag-rendering`](../README.md#carrying-the-digest-through-the-charts-fixed-repositorytag-rendering) |
    | `cashAccount.image.tag` | The 64-character hex digest, with **no** `sha256:` prefix — the second recorded value, verbatim | As above; the pair renders `<registry>/cash-account@sha256:<hex>` |
    | `cashAccount.url` | `http://{{ .Release.Name }}-cash-account-service:8080/cash-account` — the chart default — **if the snapshot differs** | This is the path the controllers are mapped at; broker reads it as `CASH_ACCOUNT_URL` (`…/templates/broker.yaml:L97-L102`) |
-   | `cashAccount.exchangeRateUrl` | Unchanged — and **an `https` URL** if this cutover changes it at all | Reaches the service as `CURRENCY_API_URL` (`…/templates/cash-account.yaml:L156-L160`), which `fx/FrankfurterExchangeRateClient` validates in its constructor: the value must use the `https` scheme, name a host, and carry no user-info credentials and no fragment. The refusal is a **start-up** failure — `cashaccount.fx.url (CURRENCY_API_URL) must use the https scheme, not http`, before the port is bound — so a plaintext rate mirror yields pods that never become Ready rather than a degraded rate lookup, and no property relaxes it (the rate multiplies into every cross-currency credit and debit and is written to the immutable ledger). See [`../README.md#currency_api_url-is-https-only-and-refused-at-start-up`](../README.md#currency_api_url-is-https-only-and-refused-at-start-up) |
+   | `cashAccount.exchangeRateUrl` | Unchanged — and **an `https` URL** if this cutover changes it at all | Reaches the service as `CURRENCY_API_URL` (`…/templates/cash-account.yaml:L156-L160`), which `fx/FrankfurterExchangeRateClient` validates in its constructor: the value must use the `https` scheme, name a host, and carry no user-info credentials and no fragment. The refusal is a **start-up** failure — `cashaccount.fx.url (CURRENCY_API_URL) must use the https scheme, not http`, before the port is bound — so a plaintext rate mirror yields pods that never become Ready rather than a degraded rate lookup, and no property relaxes it (the rate multiplies into every cross-currency credit and debit and is written to the immutable ledger). See [`../README.md#currency_api_url-is-https-only-and-refused-at-start-up`](../README.md#currency_api_url-is-https-only-and-refused-at-start-up). If this value is changed here, Step 0 action 6's measurement was taken against the **old** endpoint: re-measure the new one and re-decide `CASHACCOUNT_FX_TIMEOUT` before (g), because the budget covers connection set-up and a different host is a different cost — see [`../README.md#the-fx-budget-covers-connection-set-up-and-a-cold-tls-handshake-can-exceed-it`](../README.md#the-fx-budget-covers-connection-set-up-and-a-cold-tls-handshake-can-exceed-it) |
    | `database.*` | **Not changed by this cutover** | The release is already on PostgreSQL as a Step 0 prerequisite, signed off separately, because these values are shared with portfolio |
    | `vault.enabled` | Remains `false` | The enabled branch injects Liberty container arguments a Spring Boot image cannot execute |
 
@@ -3387,6 +3460,7 @@ pending, each against the step that closes it.
 | A supported framework line, or written acceptance of the residual advisories that ship on the mandated one | [Step 0](#step-0--prerequisites), on the requesting organization's written determination — stay on 3.3.13 with the stated controls, buy commercial support, or authorize a later minor line — recorded with the authorization of the nine dependency overrides (row D1) | **Pending** |
 | The database-identity posture — split DDL-owning and DML-only roles with `SPRING_SQL_INIT_MODE=never` (which needs the chart's second secret key), or the single identity with its residual accepted | Step 0, on the cash-account data owner's recorded decision in `step0-db-identity.txt` | **Pending** |
 | Network-layer constraint on who may reach `/actuator` and `/metrics`, or a recorded acceptance of the LOW residual disclosure | Step 0, on the platform owner's record in `step0-actuator-reachability.txt` | **Pending** |
+| The FX budget checked against the path between the cluster and the rate provider — the cold connection cost measured from a pod, and `CASHACCOUNT_FX_TIMEOUT` either set from it or recorded as unnecessary | Step 0 action 6, on the platform owner's record in `step0-fx-budget.txt` | **Pending** |
 | Legacy balances migrated with zero variance against real DB2 for z/OS and VSAM data | Step 1, on the cash-account data owner's acceptance of every variance row | **Pending** |
 | Dual-run clean for the agreed number of consecutive windows | Step 2, on the product owner's and risk's joint sign-off | **Pending** |
 | Cutover completed and routing through broker confirmed | Step 3, on the platform operator's and data owner's gate sign-offs and the product owner's post-(g) sign-off | **Pending** |
@@ -3410,6 +3484,7 @@ it is not evidence about any real data set.
 | [`../README.md`](../README.md) | The build → scan → push → digest path, the environment↔property map, the tooling command reference, the chart values consumed, and the open items |
 | [`../README.md#image-build-scan-and-push`](../README.md#image-build-scan-and-push) | The exact image path Step 0 requires, including the `docker inspect` digest capture |
 | [`../README.md#the-nine-dependency-overrides-and-why-no-bom-version-remediates-them`](../README.md#the-nine-dependency-overrides-and-why-no-bom-version-remediates-them) | The nine advisory-driven version overrides this service ships, the three advisories on the `spring-boot` artifacts that no override can reach with the controls that stand in their place, and the authorization record Step 0 collects — the evidence the framework-support determination is made against |
+| [`../README.md#the-fx-budget-covers-connection-set-up-and-a-cold-tls-handshake-can-exceed-it`](../README.md#the-fx-budget-covers-connection-set-up-and-a-cold-tls-handshake-can-exceed-it) | What `cashaccount.fx.timeout` budgets, the cold-handshake measurement Step 0 action 6 repeats on the release's own network, and how `CASHACCOUNT_FX_TIMEOUT` is applied without a chart change |
 | [`legacy-characterization.md`](legacy-characterization.md) | The legacy behaviour, cited to `file:line`. §10 **Acceptance** carries the `Status` field that Step 1's `characterization_status` gate reads; §9.5 is the record-length open item; §9.6 the code page and time zone; §9.7 the `cyrrnbase` / `CURRNBASE` spelling |
 | [`../src/test/resources/fixtures/legacy-export/`](../src/test/resources/fixtures/legacy-export/) | The export shapes Steps 1 and 3 must produce — `cashaccounty.csv`, `frankfurt1.csv`, `history.csv`, `history.cp037.bin` — in matched and seeded-mismatch variants, each with a `MANIFEST.md` |
 | [`../src/test/resources/fixtures/shadow/`](../src/test/resources/fixtures/shadow/) | The Step 2 stream shapes (`transactions.csv`, `legacy-responses.csv`) and `rollback-replay.csv`, the worked example of the Step 3 replay-file contract |

@@ -6,6 +6,9 @@ import static org.assertj.core.api.Assertions.within;
 
 import java.math.BigDecimal;
 import java.net.URI;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.util.List;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutorService;
@@ -83,6 +86,9 @@ class RetailContractIT extends PostgresTestSupport {
     private static final String HELD_PUT_OWNER = "CTHELDPUT";
     private static final String HELD_DELETE_OWNER = "CTHELDDELETE";
 
+    /** The owner whose row is held by a transaction outside the service while a retail write is issued for it. */
+    private static final String LOCK_OWNER = "CTLOCKED";
+
     /** Never created by any scenario, which is what makes the 404 assertion mean something. */
     private static final String MISSING_OWNER = "CTMISSING";
 
@@ -114,6 +120,14 @@ class RetailContractIT extends PostgresTestSupport {
     private static final int INVALID_AMOUNT_STATUS = 400;
     private static final int AMOUNT_OUT_OF_RANGE_STATUS = 422;
     private static final int RESERVATIONS_OUTSTANDING_STATUS = 409;
+    private static final int CONCURRENT_MODIFICATION_STATUS = 409;
+
+    private static final double LOCK_OWNER_BALANCE = 100.00;
+
+    // Halfway between the 2000 ms lock bound and the 30 s read bound, so the assertion separates the two without
+    // becoming a timing test: a slow container may take well over two seconds to answer and still be correct,
+    // while anything at the read bound is the unbounded wait returning.
+    private static final long LOCK_WAIT_CEILING_MILLIS = 15_000L;
 
     /** The retail seam's published prefix, which the chart hands broker as {@code cashAccount.url}. */
     private static final String RETAIL_BASE = BrokerClientFactory.RETAIL_BASE_PATH;
@@ -644,6 +658,76 @@ class RetailContractIT extends PostgresTestSupport {
         assertThat(ledgerRows(HELD_DELETE_OWNER, LedgerEventType.ACCOUNT_DELETED))
                 .as("a refused DELETE must write no ACCOUNT_DELETED ledger row")
                 .isEmpty();
+    }
+
+    // The conflict shape the other concurrency scenario cannot produce. Two requests racing each other overlap
+    // for microseconds and both succeed, which is the design; this one is a transaction that will not let go -
+    // another client, a DBA session, a pod hung mid-transaction - and it is what AAP 0.6.3's clause is about:
+    // "never a generic 500: an ObjectOptimisticLockingFailureException or a lock timeout/deadlock maps to 409
+    // CONCURRENT_MODIFICATION with Retry-After: 1".
+    //
+    // Measured with no bound in place: the request blocked 30.07 s on the cashaccount.jdbc.socket-timeout
+    // ceiling, whose expiry then killed the connection so the ROLLBACK failed too, and the caller received
+    // 500 INTERNAL with no Retry-After after a Tomcat worker had been parked for the whole conflict.
+    @Test
+    void aRetailWriteAgainstARowAnotherTransactionHoldsIsRefusedAsARetryableConflict() throws Exception {
+        seedAccount(LOCK_OWNER, LOCK_OWNER_BALANCE);
+
+        AtomicReference<String> responseBody = new AtomicReference<>();
+        CashAccountClient capturingClient = capturingClient(responseBody::set);
+
+        try (Connection holder = connectionOutsideThePool()) {
+            try (PreparedStatement lock = holder.prepareStatement(
+                    "select owner from cash_account where owner = ? for update")) {
+                lock.setString(1, LOCK_OWNER);
+                try (ResultSet locked = lock.executeQuery()) {
+                    assertThat(locked.next())
+                            .as("the scenario's precondition is a held row lock, so the row must exist")
+                            .isTrue();
+                }
+            }
+
+            // The elapsed time is asserted as well as the status, because the status alone cannot distinguish a
+            // bounded wait from the unbounded one: without the bound this same call answered after 30 s.
+            long startedAt = System.nanoTime();
+            assertThatExceptionOfType(WebApplicationException.class)
+                    .isThrownBy(() -> capturingClient.credit(LOCK_OWNER, 1.00))
+                    .satisfies(rejection -> {
+                        assertThat(rejection.getResponse().getStatus())
+                                .as("PUT /cash-account/{owner}/credit?amount= against a row another transaction"
+                                        + " holds must answer 409 CONCURRENT_MODIFICATION")
+                                .isEqualTo(CONCURRENT_MODIFICATION_STATUS);
+                        assertThat(rejection.getResponse().getHeaderString(HttpHeaders.RETRY_AFTER))
+                                .as("a lock conflict is retryable, so AAP 0.6.2 binds Retry-After: 1 to the code")
+                                .isEqualTo("1");
+                    });
+            long elapsedMillis = (System.nanoTime() - startedAt) / 1_000_000L;
+
+            assertThat(responseBody.get())
+                    .as("the rejection must carry the ApiError code, not the generic INTERNAL one")
+                    .isNotNull()
+                    .contains("\"code\":\"CONCURRENT_MODIFICATION\"");
+
+            // Generous, because it bounds rather than times: the assertion is that the wait ended at the
+            // lock bound and not at the 30 s read bound, and any value between the two would prove that.
+            assertThat(elapsedMillis)
+                    .as("the wait must end at cashaccount.jdbc.lock-wait-timeout-ms, not at"
+                            + " cashaccount.jdbc.socket-timeout")
+                    .isLessThan(LOCK_WAIT_CEILING_MILLIS);
+
+            holder.rollback();
+        }
+
+        // A refused write must have written nothing, and the retry its own Retry-After invites must then work -
+        // which is the difference between a retryable conflict and a failure.
+        assertAccount(client.getCashAccount(LOCK_OWNER), LOCK_OWNER, LOCK_OWNER_BALANCE,
+                "GET /cash-account/{owner} after a conflict-refused credit");
+        assertThat(ledger(LOCK_OWNER).stream().filter(row -> row.eventType() == LedgerEventType.CREDIT).toList())
+                .as("a credit refused on a lock conflict must write no CREDIT ledger row")
+                .isEmpty();
+
+        assertAccount(client.credit(LOCK_OWNER, 1.00), LOCK_OWNER, LOCK_OWNER_BALANCE + 1.00,
+                "PUT /cash-account/{owner}/credit?amount= retried once the conflict cleared");
     }
 
     // Seeding goes through the contract's own create endpoint rather than a repository or a JdbcTemplate: a

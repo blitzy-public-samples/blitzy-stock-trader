@@ -263,6 +263,86 @@ same hole from the other side — a redirect may not walk the endpoint back down
 therefore reachable only over TLS; for a developer's stub see
 [A local or CI FX stub must be served over TLS](#a-local-or-ci-fx-stub-must-be-served-over-tls).
 
+### The FX budget covers connection set-up, and a cold TLS handshake can exceed it
+
+`cashaccount.fx.timeout` (`PT2S`) is a budget for the **whole exchange, per attempt**: DNS resolution, TCP connect,
+the TLS handshake, the request write, the response headers and the body. `config/FxClientConfig` spends it as one
+deadline because from a caller's seat a connect that never completes, an answer that never starts and an answer
+that starts and then stops are one outage; `fx/FrankfurterExchangeRateClient` makes at most two attempts, so the
+worst case a degraded provider can impose on a caller is twice the value.
+
+Connection set-up is the part of that list which does not reliably fit. Measured from a pod against the endpoint the
+chart ships, a **cold TLS handshake took 3.6 s** — more than the whole budget — while a warm connection answered the
+same lookup in 0.05 s. Unaddressed, the consequence is narrow but real and reproducible: the first cross-currency
+`credit` or `debit` after a pod starts is refused `503 EXCHANGE_RATE_UNAVAILABLE` after ~4 s (two attempts), with
+the balance untouched and no ledger row — correct behaviour for an undeterminable rate, but caused by this service's
+own cold start rather than by the provider being down. Broker swallows the `503`, so the trade completes with no
+cash movement and no caller-visible signal.
+
+So the connection is opened **before** the first caller rather than by it. At `ApplicationReadyEvent` —
+after the port is bound, so nothing start-up needed waits on it — `FxClientConfig.FxConnectionPrewarm` hands one
+GET of the configured endpoint to a short-lived daemon thread on the **same** `HttpClient` the request path uses,
+which is what puts the handshaken connection in the pool a conversion draws from. Four properties of it are
+deliberate:
+
+- **It has its own budget, and callers do not.** The warm-up spends a compiled-in floor of `PT10S` (or the
+  caller-facing budget, if a deployment has already widened it past that), because it is off the request path. The
+  caller-facing `PT2S` is unchanged and still enforced per attempt — the value is fixed by the plan and is not what
+  this addresses.
+- **Any answer counts, and none is kept.** A provider that answers `404` for the pair the warm-up asked for has
+  still completed DNS, TCP and TLS, which is the entire product. No rate is bound, cached or handed to anything;
+  the answer is read under the same size and deadline bounds as every other exchange and discarded. The pair is the
+  base currency against the lowest code in `cashaccount.fx.accepted-currencies` that is not the base, so a narrowed
+  deployment is never sent a pair it does not use, and a deployment whose accepted set is the base alone — where
+  every conversion short-circuits to a rate of exactly `1` — warms nothing.
+- **It is not a health check.** Nothing about it reaches a health group, so an unreachable provider at start-up
+  still cannot flap pods: it logs one line — `INFO` with the elapsed milliseconds on success, one `WARN` naming the
+  budget and the cause's class (never the endpoint, never a stack) on failure — and the service then runs exactly as
+  it would have, with the first conversion paying set-up inside its own budget. The `*IT` suite is where that
+  failure path is exercised: `application-test.yml` points `cashaccount.fx.url` at `https://127.0.0.1:1/latest`, so
+  every web context logs that one `WARN`, starts, and answers `/actuator/health/readiness` `200 UP` regardless.
+- **It is a start-up measure, not a keep-alive.** A pooled connection left idle long enough for the provider to
+  close it is gone, and the next conversion pays set-up again. Nothing polls a third party on a timer to prevent
+  that; the budget is what has to cover it, which is what the tuning below is for. That matters more than it
+  sounds: a caller's attempt is abandoned at its deadline, and an abandoned attempt leaves **no** connection
+  behind, so on a path whose cold set-up genuinely exceeds the budget every attempt fails identically — measured
+  against a 3 s handshake with a `PT2S` budget, the first, second and third conversions each failed after 4 s
+  rather than the third finding a connection the first two had opened. A budget under the cold cost does not
+  degrade the first conversion, it refuses all of them until a warm-up or a restart supplies the connection.
+
+**Retuning it, with no chart change.** The endpoint is a deployment value and its cost is a property of the network
+between the cluster and that host, so the budget is set from a measurement rather than from this default. Measure it
+where the service runs, not from a workstation:
+
+```bash
+# Inside a pod on the cluster, against the value the chart injects. time_appconnect is DNS + TCP + TLS;
+# total is the whole exchange. Run it more than once: the first is cold and the rest are warm.
+for i in 1 2 3; do
+  curl -s -o /dev/null -w 'appconnect=%{time_appconnect}s total=%{time_total}s\n' \
+    "$CURRENCY_API_URL?from=USD&to=EUR"
+done
+```
+
+Set the budget above the **cold** `total`, with headroom: for a public provider reached over the internet that is
+typically `PT5S`, and the floor is whatever the measurement shows plus a margin — never below it, because a value
+under the cold cost refuses the first conversion on every connection the pool has to re-establish. Two ceilings
+bound the other direction: broker's REST client configures no timeout at all, so a caller's thread — and a broker
+thread behind it — is held for up to twice this value, and the retail `credit`/`debit` path resolves the rate
+before it takes the account row, so a long budget delays a caller without holding a database lock. `PT5S` against
+`PT2S` therefore costs a degraded provider's callers 10 s in the worst case instead of 4 s.
+
+It is applied as plain container environment on the cash-account Deployment, which needs no chart template and no
+chart value:
+
+```bash
+# Verify, from inside the pod, that the service bound what was set.
+CASHACCOUNT_FX_TIMEOUT=PT5S
+```
+
+Runbook Step 0 carries this as a prerequisite measurement with its own evidence file, so the value a release runs
+with is recorded rather than assumed — see
+[`docs/operational-runbook.md`](docs/operational-runbook.md) Step 0, action 6.
+
 ### `JDBC_KIND` is guarded, not defaulted
 
 `config/DataSourceGuardConfig` accepts only `postgres` (trimmed, case-insensitively) and fails start-up with an
@@ -322,7 +402,7 @@ and their precedence.
 
 ### How long anything waits for the database
 
-Four values, and together they are the whole answer. None of them is a framework default left in place.
+Five values, and together they are the whole answer. None of them is a framework default left in place.
 
 | Property | Default | What it bounds |
 | --- | --- | --- |
@@ -330,6 +410,7 @@ Four values, and together they are the whole answer. None of them is a framework
 | `spring.datasource.hikari.validation-timeout` | `1000` ms | Testing a pooled connection, which happens **inside** the borrow above |
 | `spring.datasource.hikari.initialization-fail-timeout` | `30000` ms | Start-up only: how long the pool retries, once a second, before the context fails |
 | `cashaccount.jdbc.connect-timeout` / `cashaccount.jdbc.socket-timeout` | `PT2S` / `PT30S` | One TCP-and-TLS handshake, and one read on an established connection |
+| `cashaccount.jdbc.lock-wait-timeout-ms` | `2000` ms | Waiting for a row lock another transaction holds — applied as PostgreSQL's `lock_timeout` by `spring.datasource.hikari.connection-init-sql` |
 
 Left at their own defaults, Hikari waits 30 s for a connection and pgJDBC waits for ever on a read. With the
 database unreachable that produced a measured **30.0 s** for every database-dependent request and for
@@ -357,6 +438,41 @@ Why each value is what it is:
   exactly the unbounded wait the setting exists to remove, and `DataSourceGuardConfig` refuses it instead.
 - **A saturated pool answers the same way.** Every operation here is a single-row read or write, so 2 s of
   unbroken contention is real overload, and a retryable `503` is the honest answer to it rather than a queue.
+- **`lock-wait-timeout-ms` because none of the other four reaches a lock wait.** `connection-timeout` bounds
+  *obtaining* a connection and `socket-timeout` bounds a *read* once it has begun; neither bounds a statement the
+  server is deliberately holding back, and PostgreSQL's row locks express only `NOWAIT` and `SKIP LOCKED` while its
+  own `lock_timeout` defaults to `0` — wait for ever. Measured against PostgreSQL 12.22 with one stuck transaction
+  on a `cash_account` row: a retail credit to that owner occupied a Tomcat worker for **30.07 s**, the
+  `socket-timeout` expiry then killed the connection so even the `ROLLBACK` failed, and the caller received
+  `500 INTERNAL` with no `Retry-After` — the generic 500 AAP 0.6.3 forbids for a lock conflict. With the bound in
+  place the server cancels the statement at 2 s with `SQLSTATE 55P03`, which reaches `ApiExceptionHandler` as
+  `PessimisticLockingFailureException` and answers **`409 CONCURRENT_MODIFICATION` with `Retry-After: 1`**, the
+  balance untouched and no ledger row written. Deadlock detection (`40P01`) already arrived there as
+  `CannotAcquireLockException` and is unchanged.
+
+  Three things about it are deliberate. It is a **pool** setting rather than pgJDBC's `options` parameter on the
+  assembled URL, which reaches the same GUC, so that the bound holds however the URL arrives — from the chart's
+  `JDBC_*` variables in a deployment and from Testcontainers' `@ServiceConnection` under `@SpringBootTest`, where
+  `DataSourceGuardConfig` stands its own `JdbcConnectionDetails` down and a URL-borne bound would be silently
+  absent from the whole suite. It is **milliseconds rather than an ISO-8601 duration** like its two neighbours
+  because the value is substituted verbatim into SQL: `PT2S` binds as a `Duration` but is not a `lock_timeout`
+  PostgreSQL accepts, and Spring reads `5m` as minutes where the server requires `5min`. And a JPA
+  `jakarta.persistence.lock.timeout` hint on the locking query is **not** an alternative — Hibernate's
+  `PostgreSQLDialect` reports `supportsWait() = false` and renders a positive timeout as a plain `FOR UPDATE`.
+  `NOWAIT` is not one either: it would bound the wait at zero and turn every overlapping write to one owner into a
+  409, where the design requires them to serialize and all succeed.
+
+  `DataSourceGuardConfig` refuses the value unless it is a positive whole number of milliseconds **strictly below**
+  `socket-timeout`, because an equal or larger value is not malformed — it simply lets the read bound expire first
+  and reinstates the `500` exactly as if no bound existed.
+
+  **The one other wait it bounds**, stated so it is not discovered later: `lock_timeout` also governs
+  `schema/cash-account-schema.sql`'s `pg_advisory_lock`, so a pod whose start-up waits longer than 2 s for another
+  pod's copy of the script fails and is restarted, applying it cleanly on the next attempt — the script itself is
+  idempotent and the advisory lock is session-scoped, so nothing is left behind. That script measures **50 ms**
+  cold against PostgreSQL 12.22, a roughly forty-fold margin, and a release that applies the schema by hand under
+  a DDL-owning role (`SPRING_SQL_INIT_MODE=never`, see [Schema application](#schema-application)) removes the
+  interaction entirely.
 
 One thing this does **not** reach, stated so it is not mistaken for covered: the chart's `readinessProbe` declares
 `periodSeconds: 15` and `failureThreshold: 3` but no `timeoutSeconds`, so the kubelet applies its 1 s default, and a
@@ -369,8 +485,9 @@ is that the server no longer holds a worker per probe for 30 s. Making the kubel
 taken: opening a TLS connection to a managed PostgreSQL instance can legitimately take several hundred
 milliseconds, and spurious `503`s on a healthy database would be a worse defect than a late probe body.
 
-All four are retunable as plain container environment with no chart change:
-`SPRING_DATASOURCE_HIKARI_CONNECTION_TIMEOUT`, `CASHACCOUNT_JDBC_SOCKET_TIMEOUT`, and so on.
+All five are retunable as plain container environment with no chart change:
+`SPRING_DATASOURCE_HIKARI_CONNECTION_TIMEOUT`, `CASHACCOUNT_JDBC_SOCKET_TIMEOUT`,
+`CASHACCOUNT_JDBC_LOCK_WAIT_TIMEOUT_MS`, and so on.
 
 ### Properties with no environment binding
 
@@ -381,9 +498,10 @@ These have internal defaults; nothing in the chart supplies them, and nothing ne
 | `cashaccount.security.jwt.public-key-location` | `classpath:security/jwtsigner.pem` | Tests repoint it at an ephemeral per-JVM key instead of shipping key material |
 | `cashaccount.security.all-authenticated-hold-stocktrader` | `true` | Parity with the siblings' `ALL_AUTHENTICATED_USERS → StockTrader` binding; `false` is the strict mode (see [Security](#security)) |
 | `cashaccount.fx.base-currency` | `USD` | Broker's default account currency, so a same-currency account short-circuits to a rate of exactly `1` with no network call |
-| `cashaccount.fx.timeout` | `PT2S` | Connect and read budget; a slow rate provider must surface as `503`, not as a request that outlives its caller |
+| `cashaccount.fx.timeout` | `PT2S` | Budget for the **whole exchange, per attempt** — DNS, TCP connect, TLS handshake, request write, response headers and body reception together — so a slow rate provider surfaces as `503`, not as a request that outlives its caller. Two attempts are made, so the worst case a provider can impose is twice this. Connection set-up is the part that does not always fit: a cold TLS handshake to the endpoint the chart ships was measured at **3.6 s** from a pod, more than the whole budget, which is why the connection is opened once at start-up instead of by the first caller, and why `CASHACCOUNT_FX_TIMEOUT` is the knob for a provider that is slow for the rest of the exchange too. Both are in [The FX budget covers connection set-up, and a cold TLS handshake can exceed it](#the-fx-budget-covers-connection-set-up-and-a-cold-tls-handshake-can-exceed-it) |
 | `cashaccount.jdbc.connect-timeout` | `PT2S` | Bounds one TCP-and-TLS handshake to the database, appended to the assembled URL as pgJDBC's `connectTimeout`. A host that drops packets rather than refusing them otherwise sits in the kernel's connect retry, leaving the socket behind after the pool has already given up on it. See [How long anything waits for the database](#how-long-anything-waits-for-the-database) |
 | `cashaccount.jdbc.socket-timeout` | `PT30S` | Bounds a **read** on an established connection, appended as pgJDBC's `socketTimeout`. Nothing else here bounds it at all: the driver's default is `0`, so a statement in flight when the peer disappears waits for ever, and the pool's `connection-timeout` governs obtaining a connection rather than using one |
+| `cashaccount.jdbc.lock-wait-timeout-ms` | `2000` | Bounds waiting for a **row lock another transaction holds**, applied to every pooled connection as PostgreSQL's `lock_timeout` by `spring.datasource.hikari.connection-init-sql`. None of the bounds above reaches that wait, and the server's own default is `0` — wait for ever — so one stuck transaction on a `cash_account` row otherwise parked a retail write for the whole `socket-timeout` and then answered `500 INTERNAL`. Beyond the bound the statement is cancelled and the caller gets `409 CONCURRENT_MODIFICATION` with `Retry-After: 1`. Milliseconds rather than a duration because the value is substituted verbatim into SQL; refused unless positive and strictly below `socket-timeout`. See [How long anything waits for the database](#how-long-anything-waits-for-the-database) |
 | `cashaccount.fx.accepted-currencies` | The 31 ISO codes `AUD BGN BRL CAD CHF CNY CZK DKK EUR GBP HKD HUF IDR ILS INR ISK JPY KRW MXN MYR NOK NZD PHP PLN RON SEK SGD THB TRY USD ZAR` | The **estate allowlist**, adopted verbatim from the `allowed_currencies` CHECK the estate's PostgreSQL init template already enforces — **not** the set the exchange-rate API serves, which is a 30-code subset of it: as of 2026-09-22 the configured provider's `/v1/currencies` omits `BGN` and `GET /latest?from=USD&to=BGN` answers `404`. Acceptance is therefore not a promise of convertibility — a `BGN` account is created and read normally, and only a cross-currency `credit`/`debit` for it fails, with `503 EXCHANGE_RATE_UNAVAILABLE`, the balance unchanged and no ledger row. `BGN` is kept rather than dropped because this list also decides what a legacy export may be **loaded** with (an out-of-set currency is recorded as `CURRENCY` / `INVALID_IN_LEGACY` and the account is not migrated), so dropping it would silently strand a `BGN`-denominated legacy account. A deployment whose accounts must all be convertible narrows the list — `CASHACCOUNT_FX_ACCEPTED_CURRENCIES=USD,EUR,…`, no chart change — and `application.yml` is the single authority every consumer binds |
 | `cashaccount.reservation.default-ttl` | `PT24H` | A hold nobody settles or releases must not strand funds indefinitely |
 | `cashaccount.reservation.expiry-sweep-interval` | `PT60S` | Bounds how long an overdue hold keeps money out of the available balance |
@@ -392,6 +510,11 @@ These have internal defaults; nothing in the chart supplies them, and nothing ne
 All of them are overridable through Spring's relaxed binding — `CASHACCOUNT_FX_TIMEOUT`,
 `CASHACCOUNT_SECURITY_ALL_AUTHENTICATED_HOLD_STOCKTRADER`, and so on — as plain container environment, **without any
 chart change**. That is the point of leaving them unbound rather than inventing chart keys for them.
+`CASHACCOUNT_FX_TIMEOUT` is the one of them a deployment is most likely to need: it is what retunes the rate-lookup
+budget for a slow or distant provider, and
+[The FX budget covers connection set-up](#the-fx-budget-covers-connection-set-up-and-a-cold-tls-handshake-can-exceed-it)
+gives the measurement to set it from. Adding it to a Deployment is a container-environment edit the operator makes
+against the chart's own rendering — `CASHACCOUNT_FX_TIMEOUT=PT5S` — and no chart template or value is touched.
 
 ### Request intake bounds
 
@@ -642,7 +765,7 @@ return channel, which dropped the sign in a `X(10)` field and reported only the 
 | `NOT_ACCEPTABLE` | 406 | An `Accept` header this service cannot satisfy (`application/xml`, `text/html`). The body is still the `ApiError` shape in `application/json` — a rejection that could not be rendered would be no rejection at all. Recorded in the same place |
 | `REQUEST_TOO_LARGE` | 413 | A request body above `server.max-request-body-size` (8KB), refused on its declared `Content-Length` or counted mid-read — see [Request intake bounds](#request-intake-bounds). One of the three codes here with **no** legacy counterpart and no entry in the AAP's own error table: a COMMAREA is a fixed-length structure, so an oversized request was unrepresentable rather than rejected, and a 413 cannot be reported without a code of its own. Recorded under [Deviations from the frozen AAP inventory](#deviations-from-the-frozen-aap-inventory) |
 | `INVALID_QUERY` | 400 | `limit` below 1 or above 1000, or an unparsable `since` |
-| `CONCURRENT_MODIFICATION` | 409 + `Retry-After: 1` | A lock conflict. One second, not five: the conflict clears as soon as the competing transaction commits |
+| `CONCURRENT_MODIFICATION` | 409 + `Retry-After: 1` | A lock conflict — three shapes reach it: a row-lock wait that exceeds `cashaccount.jdbc.lock-wait-timeout-ms` (`SQLSTATE 55P03` → `PessimisticLockingFailureException`), a deadlock the server broke (`40P01` → `CannotAcquireLockException`), and an optimistic `@Version` conflict (`ObjectOptimisticLockingFailureException`). Also a concurrent `PUT` that changed the account currency after a credit or debit had already priced its rate. One second, not five: the conflict clears as soon as the competing transaction commits. The balance is unchanged and no ledger row is written, so the retry the header invites is safe |
 | `UNAUTHORIZED` | 401 | Missing or invalid token, rendered by the filter chain's entry point |
 | `FORBIDDEN` | 403 | Authenticated but lacking the required role, rendered by the access-denied handler |
 | `INTERNAL` | 500 | Any unexpected exception |
@@ -1463,11 +1586,11 @@ beyond the plan's frozen **file** inventory (AAP 0.2.1) that this repository's o
 
 | Open item | What settles it |
 | --- | --- |
-| **Nine dependency versions override AAP 0.9.1's frozen inventory** — `org.postgresql:postgresql` `42.7.13` (the AAP pins `42.7.7`, matching `backend/portfolio`), and eight coordinate sets the Spring Boot 3.3.13 BOM would otherwise decide: `tomcat.version` `10.1.60` (BOM `10.1.42`), `micrometer.version` `1.15.12` (`1.13.15`), `spring-security.version` `6.5.11` (`6.3.10`), `spring-framework.version` `6.2.19` (`6.1.21`), `spring-data-bom.version` `2025.0.13` (`2024.0.13`), `jackson-bom.version` `2.18.11` (`2.17.3`), `logback.version` `1.5.38` (`1.5.18`) and `nimbus-jose-jwt.version` `9.37.4` (transitive `9.37.3`, a coordinate the BOM manages no version for at all, so it is pinned in `pom.xml`'s `<dependencyManagement>`). Each closes a named advisory the mandated 3.3 line ships no newer parent to inherit, declared per coordinate in `pom.xml` and detailed [below](#the-nine-dependency-overrides-and-why-no-bom-version-remediates-them). Measured on the packaged jar with the same instrument that found them — a Trivy image scan of the built image — the set takes the Java layer from **40 advisory rows (1 CRITICAL, 9 HIGH, 22 MEDIUM, 8 LOW) to 3**, and the 3 that remain are named [below](#what-the-nine-cannot-reach-and-the-controls-that-stand-in-their-place) | The requesting organization authorizes the nine coordinates, recording what the set costs as well as what it fixes: it lifts the Spring, Spring Data, Jackson, Logback and Micrometer lines above Boot 3.3.13's tested dependency matrix, a combination **no Spring compatibility statement covers**. The evidence offered in its place is this module's own gate — `./mvnw -B clean verify`, 141 tests, green on exactly this set — plus the runtime checks and the narrow, named surfaces in the [operational consequence](#the-nine-dependency-overrides-and-why-no-bom-version-remediates-them) below. **Reverting to the AAP-pinned versions is not an option on the table** — those versions are the vulnerable ones; the alternative that is on the table is the framework-line decision in the [open items](#open-items) above, which removes the need for the overrides rather than the need for the fix. Decision row **D1** of the [authorization record](#authorization-record) |
+| **Nine dependency versions override AAP 0.9.1's frozen inventory** — `org.postgresql:postgresql` `42.7.13` (the AAP pins `42.7.7`, matching `backend/portfolio`), and eight coordinate sets the Spring Boot 3.3.13 BOM would otherwise decide: `tomcat.version` `10.1.60` (BOM `10.1.42`), `micrometer.version` `1.15.12` (`1.13.15`), `spring-security.version` `6.5.11` (`6.3.10`), `spring-framework.version` `6.2.19` (`6.1.21`), `spring-data-bom.version` `2025.0.13` (`2024.0.13`), `jackson-bom.version` `2.18.11` (`2.17.3`), `logback.version` `1.5.38` (`1.5.18`) and `nimbus-jose-jwt.version` `9.37.4` (transitive `9.37.3`, a coordinate the BOM manages no version for at all, so it is pinned in `pom.xml`'s `<dependencyManagement>`). Each closes a named advisory the mandated 3.3 line ships no newer parent to inherit, declared per coordinate in `pom.xml` and detailed [below](#the-nine-dependency-overrides-and-why-no-bom-version-remediates-them). Measured on the packaged jar with the same instrument that found them — a Trivy image scan of the built image — the set takes the Java layer from **40 advisory rows (1 CRITICAL, 9 HIGH, 22 MEDIUM, 8 LOW) to 3**, and the 3 that remain are named [below](#what-the-nine-cannot-reach-and-the-controls-that-stand-in-their-place) | The requesting organization authorizes the nine coordinates, recording what the set costs as well as what it fixes: it lifts the Spring, Spring Data, Jackson, Logback and Micrometer lines above Boot 3.3.13's tested dependency matrix, a combination **no Spring compatibility statement covers**. The evidence offered in its place is this module's own gate — `./mvnw -B clean verify`, 152 tests, green on exactly this set — plus the runtime checks and the narrow, named surfaces in the [operational consequence](#the-nine-dependency-overrides-and-why-no-bom-version-remediates-them) below. **Reverting to the AAP-pinned versions is not an option on the table** — those versions are the vulnerable ones; the alternative that is on the table is the framework-line decision in the [open items](#open-items) above, which removes the need for the overrides rather than the need for the fix. Decision row **D1** of the [authorization record](#authorization-record) |
 | **The container base image is pinned ahead of AAP 0.9.1's frozen tag** — `Dockerfile` names `registry.access.redhat.com/ubi9/openjdk-21-runtime:1.24@sha256:908540a9…` (the head of the `1.24` stream, by tag and multi-arch manifest-list digest) where the AAP and `backend/account/src/main/docker/Dockerfile.jvm:L94` name `1.21`. Measured on the assembled image with the promotion gate's own scanner, the move takes the OS and JDK layer from 75 HIGH findings (64 with a fix available, ten of them against `java-21-openjdk-headless` itself) to 11 with **no** fix available; the image contract — Java 21 runtime, non-root `185`, `run-java.sh`, ports 8080/8443 — is inherited unchanged. Detailed [above](#the-base-image-is-pinned-ahead-of-the-siblings-tag-deliberately) | The requesting organization authorizes the tag and digest as a deviation from the frozen dependency inventory, on the same terms as the library overrides in row D1. **Reverting to `1.21` reinstates the 64 fixable findings** and fails the blocking promotion gate in [Image build, scan and push](#image-build-scan-and-push); the pin is re-derived and dated at each promotion under runbook Step 0. Decision row **D6** of the [authorization record](#authorization-record) |
 | **Four error codes beyond AAP 0.6.2's closed 22-code vocabulary, and one code changed within it** — `REQUEST_TOO_LARGE` → `413`, raised by `config/RequestBodySizeLimitFilter` and carried out of a mid-read stream by `error/RequestBodyTooLargeException`; the media-type pair `UNSUPPORTED_MEDIA_TYPE` → `415` and `NOT_ACCEPTABLE` → `406`, rendered by `error/ApiExceptionHandler` for Spring's `HttpMediaTypeNotSupportedException` and `HttpMediaTypeNotAcceptableException`; and `INVALID_REQUEST_FIELD` → `400` for a request member the AAP names no code for. Purely additive: every AAP-declared code is present with the status the AAP declares. Each exists because the condition cannot be reported without a code of its own, and the alternatives break the invariant the enum is for — a `413`, `415` or `406` carrying a `400`'s code makes the code-to-status binding untrue on the wire, and `400 INVALID_AMOUNT` tells a caller its amount was wrong when its body was never parsed at all. The media-type pair closes a runtime defect rather than a hypothetical: unhandled, a wrong `Content-Type` or an unsatisfiable `Accept` was answered `500 INTERNAL` with an `ERROR` record, reporting a caller's mistake as a server fault and contradicting the fail-closed model of AAP 0.4.3. `INVALID_REQUEST_FIELD` closes the same class of untruth on the institutional surface, where a blank, absent or over-length `orderReference` and an unparsable `expiresAt` were all answered `INVALID_AMOUNT` about an amount the caller had sent correctly. The changed code is the **hold** above the `NUMERIC(9,2)` ceiling, now `422 AMOUNT_OUT_OF_RANGE` rather than `422 INSUFFICIENT_FUNDS`: the AAP's per-endpoint column for `…/holds` lists only `INSUFFICIENT_FUNDS` at `422`, but `AMOUNT_OUT_OF_RANGE` is the AAP's own code for that input class at that same status, and the retail credit and debit answer the identical input with it, so the two surfaces no longer report one condition two ways | The requesting organization authorizes the four codes and the one changed code. For `REQUEST_TOO_LARGE` the only alternative is a decision to accept an unbounded request body, because removing the code removes the `413` path, which **is** the remediation ([Request intake bounds](#request-intake-bounds)). For the media-type pair the alternative is a `400` carrying one of the existing codes — available, and rejected here only because the status would then be untrue; `error/FailClosedIT` would need its two media-type assertions changed with it. For `INVALID_REQUEST_FIELD` and the hold's `AMOUNT_OUT_OF_RANGE` the alternative is the literal per-endpoint list of AAP 0.6.2, which means reinstating a code that names the wrong field and a second code for one condition; no status class changes either way, so the decision is about the vocabulary rather than the contract's shape. Decision row **D2** of the [authorization record](#authorization-record) |
 | **The Maven wrapper properties are not the verbatim copy AAP 0.2.3 and 0.8.1 call for** — `.mvn/wrapper/maven-wrapper.properties` adds exactly two lines to `backend/portfolio-assistant`'s file (lines 20–21: a provenance comment and `distributionSha256Sum=0d7125e8…eeadb`). Lines 1–19 are byte-identical, `mvnw` and `mvnw.cmd` are byte-identical, `wrapperVersion`, `distributionType` and `distributionUrl` are unchanged, and the build resolves the same Apache Maven 3.9.11; `pom.xml`'s verified-build-inputs comment records how the value was derived | The requesting organization authorizes the two lines. **The checksum stays**: without it the wrapper downloads and executes an unverified distribution, which is the defect CWE-494 names. If verbatim copying must hold to the byte, the owners supply an equivalent control outside the file — a repository- or runner-level integrity policy that pins the same distribution. Decision row **D3** of the [authorization record](#authorization-record) |
-| **The suite executes 148 tests against AAP 0.7.6's "approximately 72"** — Surefire 56 plus Failsafe 92, 0 skipped. Every addition traces to a named regression a prior checkpoint's fix left behind, and the ceiling's qualitative prohibitions are honoured: zero `@ParameterizedTest`, `@RepeatedTest` and `@TestFactory`, no exploratory or redundant variants, Mockito excluded from the build. Per-family accounting, and the command that re-derives the number from the build's own XML rather than from this table, are [below](#test-volume-148-executed-against-a-ceiling-of-72) | The requesting organization authorizes the overshoot as regression coverage. **No test is to be deleted to reach the number**: each one guards a defect a prior checkpoint fixed, so deleting it restores the defect's cover, not the plan. The executed count is folded into the declared scenarios below — 72 declared plus 72 named regressions — and the decision is row **D4** of the [authorization record](#authorization-record) |
+| **The suite executes 152 tests against AAP 0.7.6's "approximately 72"** — Surefire 57 plus Failsafe 95, 0 skipped. Every addition traces to a named regression a prior checkpoint's fix left behind, and the ceiling's qualitative prohibitions are honoured: zero `@ParameterizedTest`, `@RepeatedTest` and `@TestFactory`, no exploratory or redundant variants, Mockito excluded from the build. Per-family accounting, and the command that re-derives the number from the build's own XML rather than from this table, are [below](#test-volume-152-executed-against-a-ceiling-of-72) | The requesting organization authorizes the overshoot as regression coverage. **No test is to be deleted to reach the number**: each one guards a defect a prior checkpoint fixed, so deleting it restores the defect's cover, not the plan. The executed count is folded into the declared scenarios below — 72 declared plus 80 fix-mandated regressions — and the decision is row **D4** of the [authorization record](#authorization-record) |
 | **A request-body cap at the edge is outstanding, and only the platform owner can set it** — the in-process controls bound what this pod reads (8KB parsed, 64KB drained), never what the network delivers to the connector. Setting it in the ingress, service mesh or API gateway is a deployment change this module may not make: AAP 0.3.4 makes a chart template change a [stop-and-flag](#stop-and-flag) condition and AAP 0.2.4 puts values, CRDs and GitOps resources out of scope | The platform owner sets a request-body limit at or below this module's 8KB for the `/cash-account` path space — for example nginx-ingress `client_max_body_size`, or an Envoy buffer limit — and captures as evidence an over-limit `POST` refused at the edge before it reaches a pod |
 | **The module ships a one-line `.gitignore` (`target/`), a file AAP 0.2.1's inventory does not carry** — without it every build leaves `?? backend/cash-account-modernized/target/` in the parent tree, so the boundary gate this repository is checked with cannot tell the deliverable's files from some 60 MB of build output, and a blanket `git add -A` commits the artifacts; described under [Module placement](#target-is-ignored-so-the-parents-boundary-gate-stays-clean) | The requesting organization authorizes the file, on the same terms as the rows above because it is a file beyond the frozen inventory. Rejecting it means accepting that untracked line permanently or suppressing it per checkout (`echo 'backend/cash-account-modernized/target/' >> .git/info/exclude`), which no clone inherits from the repository and which therefore has to be repeated by every reviewer. Decision row **D5** of the [authorization record](#authorization-record) |
 
@@ -1488,7 +1611,7 @@ beyond the plan's frozen **file** inventory (AAP 0.2.1) that this repository's o
 Operational consequence, and the thing to re-check on any future version move: this set lifts Spring Framework,
 Spring Security, Spring Data, Jackson, Logback and Micrometer above Spring Boot 3.3.13's tested dependency matrix.
 No Spring compatibility statement covers the combination, so the evidence is this module's own and it is narrow by
-nature — `./mvnw -B clean verify` green on exactly these versions (148 tests, 0 failures), `ActuatorProbesIT`
+nature — `./mvnw -B clean verify` green on exactly these versions (152 tests, 0 failures), `ActuatorProbesIT`
 asserting 200 on `/metrics` and `/actuator/prometheus` with the `http_server_requests_seconds_count` series that
 runbook Step 3's rollback criterion reads, `RetailContractIT` asserting the plain-decimal `balance` on the raw
 wire, `RoleEnforcementIT` asserting both role modes and the security headers on success and on both filter-chain
@@ -1530,14 +1653,14 @@ because nothing in the service can exercise the affected path: the artifact is p
 `MapMessage` anywhere. Whether to take the tenth override is a one-property decision for the module's owners,
 stated here so it is a decision rather than an omission.
 
-#### Test volume: 148 executed against a ceiling of 72
+#### Test volume: 152 executed against a ceiling of 72
 
 Counts are from `./mvnw -B clean verify` (Surefire `*Test`, Failsafe `*IT`), 0 skipped. They are re-derivable from
 the build's own reports rather than from this table, which is what makes the number reviewable instead of asserted:
 
 ```bash
 cd backend/cash-account-modernized && ./mvnw -B clean verify
-# Prints 148 and the per-class tally the table below is built from (56 Surefire + 92 Failsafe).
+# Prints 152 and the per-class tally the table below is built from (57 Surefire + 95 Failsafe).
 python3 - <<'PY'
 import collections, glob, xml.etree.ElementTree as ET
 per = collections.Counter()
@@ -1553,7 +1676,7 @@ PY
 ```
 
 The executed number is the AAP's own scenario count plus the regressions the fixes left behind, and the third column
-is that difference: **72 declared + 76 fix-mandated regressions = 148**. Every family's addition is named in the
+is that difference: **72 declared + 80 fix-mandated regressions = 152**. Every family's addition is named in the
 paragraph below, so the overshoot is accounted for scenario by scenario rather than asserted as a total.
 
 | Family | AAP 0.7.6 declared | Added by fixes | Executed | Classes |
@@ -1561,18 +1684,18 @@ paragraph below, so the overshoot is accounted for scenario by scenario rather t
 | State-transition unit | 8 | 1 | 9 | `ReservationStateMachineTest` |
 | Money / arithmetic unit | 11 | 3 | 14 | `MoneyTest` 7, `LegacyBalanceCalculatorTest` 3, `CharacterizationDocPresentTest` 4 |
 | Currency conversion | 6 | 10 | 16 | `CurrencyConversionTest` 10, `ExchangeRateSourceWiringTest` 6 |
-| Owner normalization and datasource | 5 | 7 | 12 | `OwnerNormalizerTest` 7, `DataSourceGuardConfigTest` 5 |
+| Owner normalization and datasource | 5 | 8 | 13 | `OwnerNormalizerTest` 7, `DataSourceGuardConfigTest` 6 |
 | Export decoding | 3 | 0 | 3 | `VsamHistoryRecordDecoderTest` |
-| Contract through the caller's client | 10 | 8 | 18 | `RetailContractIT` 17, `CashAccountClientDriftTest` 1 |
+| Contract through the caller's client | 10 | 9 | 19 | `RetailContractIT` 18, `CashAccountClientDriftTest` 1 |
 | Institutional and audit immediacy | 13 | 11 | 24 | `ReservationLifecycleIT` 22, `AuditImmediacyIT` 2 |
 | Audit immutability | 2 | 1 | 3 | `LedgerImmutabilityIT` |
 | Security | 5 | 10 | 15 | `RoleEnforcementIT` |
 | Fail-closed | 2 | 10 | 12 | `FailClosedIT` |
-| Deployment shape | 1 | 1 | 2 | `ActuatorProbesIT` |
+| Deployment shape | 1 | 3 | 4 | `ActuatorProbesIT` |
 | Reconciliation and dual-run | 6 | 14 | 20 | `LoaderIT` 10, `ReconciliationIT` 6, `ShadowComparatorIT` 3, `RollbackReplayFileTest` 1 |
-| **Total** | **72** | **76** | **148** | 21 classes |
+| **Total** | **72** | **80** | **152** | 21 classes |
 
-Where the extra 76 came from: the families that grew most are the ones a security or correctness fix reached.
+Where the extra 80 came from: the families that grew most are the ones a security or correctness fix reached.
 Currency conversion gained the outbound-request assertions — no `Authorization` header forwarded, an https-only
 endpoint with no credentials, a bounded response, and a real stalling socket proving the `cashaccount.fx.timeout`
 budget bounds body reception — and the wiring proofs that the staged legacy rate source can never reach the request
@@ -1598,7 +1721,13 @@ any servlet context exists rendered as `ApiError` JSON with the security headers
 that family from 15 to 17 closes a condition AAP 0.6.2 declares and AAP 0.7.6's scenario list does not enumerate: retail `PUT`
 and retail `DELETE` answering `409 RESERVATIONS_OUTSTANDING` while a reservation is `HELD`. Until they existed the
 whole suite stayed green with that guard removed, which would have made an account with funds on hold overwritable
-and deletable — the invariant the reserved balance exists to protect (AAP 0.6.3). None of them is a parameterized
+and deletable — the invariant the reserved balance exists to protect (AAP 0.6.3). The final checkpoint's fixes added
+the last four: the datasource guard's lock-wait bound (its default, a retune and every refusal, including a bound
+not below `socket-timeout`), the contract scenario that holds a `cash_account` row lock outside the pool and
+asserts the credit through broker's client answers `409 CONCURRENT_MODIFICATION` with `Retry-After: 1` inside the
+bound, and the two deployment-shape scenarios proving the readiness group's `db` contributor is the bounded
+`DatastoreHealthIndicator` and that the scheduler's error handler records an outage as one throwable-free line.
+None of them is a parameterized
 matrix or an exploratory test, and each is the regression a specific fix left behind.
 
 #### Authorization record
@@ -1624,7 +1753,7 @@ the two deprecated-for-removal call sites the move creates — all three in
 [the nine dependency overrides](#the-nine-dependency-overrides-and-why-no-bom-version-remediates-them), whose last
 table also carries the three advisories no override can reach, so an authorizer signing D1 can see both what the
 overrides fix and what they leave standing; D2 each code and its status, and the one code an over-ceiling hold now answers with; D3 the two wrapper lines; **D4 the executed count, which is
-re-derivable from the build in the two commands under [Test volume](#test-volume-148-executed-against-a-ceiling-of-72)
+re-derivable from the build in the two commands under [Test volume](#test-volume-152-executed-against-a-ceiling-of-72)
 so the number on this row can be checked rather than believed, together with the per-family attribution of every test
 above the 72 declared scenarios**; D5 the single ignored pattern and the gate it keeps clean; D6 the tag, the
 manifest-list digest and the measured before/after finding counts in
@@ -1637,7 +1766,7 @@ decision.
 | D1 | The nine dependency overrides (AAP 0.9.1) — pgJDBC `42.7.13`, Tomcat `10.1.60`, Micrometer `1.15.12`, Spring Security `6.5.11`, Spring Framework `6.2.19`, Spring Data `2025.0.13`, Jackson `2.18.11`, Logback `1.5.38`, nimbus-jose-jwt `9.37.4` — including that the set sits above Boot 3.3.13's tested matrix on this module's own gate alone, and the two deprecated-for-removal call sites it creates | PENDING | — | — | — |
 | D2 | `REQUEST_TOO_LARGE` → `413`, `UNSUPPORTED_MEDIA_TYPE` → `415`, `NOT_ACCEPTABLE` → `406` and `INVALID_REQUEST_FIELD` → `400` as four codes beyond the 22, plus an over-ceiling hold answering `422 AMOUNT_OUT_OF_RANGE` in place of `422 INSUFFICIENT_FUNDS` (AAP 0.6.2) | PENDING | — | — | — |
 | D3 | The two lines added to the wrapper properties: the provenance comment and `distributionSha256Sum` (AAP 0.2.3, 0.8.1) | PENDING | — | — | — |
-| D4 | 148 executed tests — 72 declared scenarios plus 76 fix-mandated regressions (AAP 0.7.6) | PENDING | — | — | — |
+| D4 | 152 executed tests — 72 declared scenarios plus 80 fix-mandated regressions (AAP 0.7.6) | PENDING | — | — | — |
 | D5 | A tracked one-line `.gitignore` (`target/`) beyond AAP 0.2.1's file inventory | PENDING | — | — | — |
 | D6 | Base image `ubi9/openjdk-21-runtime:1.24@sha256:908540a9…` in place of the frozen `1.21` tag (AAP 0.9.1, 0.6.1), including the manifest-list digest pin and its re-derivation at each promotion | PENDING | — | — | — |
 

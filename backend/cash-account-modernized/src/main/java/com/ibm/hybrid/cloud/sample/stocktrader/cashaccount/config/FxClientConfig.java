@@ -3,8 +3,10 @@ package com.ibm.hybrid.cloud.sample.stocktrader.cashaccount.config;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.URI;
 import java.net.http.HttpClient;
 import java.time.Duration;
+import java.util.Locale;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
@@ -13,14 +15,19 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.event.EventListener;
+import org.springframework.core.NestedExceptionUtils;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.http.client.ClientHttpResponse;
 import org.springframework.http.client.JdkClientHttpRequestFactory;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestClientException;
+import org.springframework.web.util.UriComponentsBuilder;
 
 /**
  * Publishes the single bounded HTTP client used for the outbound exchange-rate lookup, carrying one compiled-in
@@ -68,6 +75,25 @@ public class FxClientConfig {
      */
     public static final String USER_AGENT = "cash-account-service";
 
+    /**
+     * Floor for the budget of the ONE start-up exchange whose only product is a handshaken, pooled connection.
+     *
+     * <p>It exists because {@code cashaccount.fx.timeout} is a budget for the whole exchange <em>including</em>
+     * connection establishment, and a cold TLS handshake to a public provider does not reliably fit in it: measured
+     * from a pod against the endpoint the chart ships, the handshake alone took 3.6 s against a shipped budget of
+     * PT2S, so the first cross-currency credit or debit after a pod started was refused
+     * {@code 503 EXCHANGE_RATE_UNAVAILABLE} and only succeeded once a connection happened to be warm. The budget
+     * itself is fixed by AAP 0.6.1 and is not what changes here; what changes is who pays the handshake - this
+     * warm-up, before any caller arrives, instead of the first caller.
+     *
+     * <p>Deliberately a compiled-in floor and not a property, for the same reason as {@link #MAX_RESPONSE_BYTES}:
+     * it is spent off the request path, at most once per process, so there is nothing for an operator to tune, and
+     * a knob here would only be a second way to express {@code cashaccount.fx.timeout}. A floor rather than a fixed
+     * value so that a deployment which has already widened the caller-facing budget past it never ends up with a
+     * warm-up stingier than an ordinary request.
+     */
+    static final Duration PREWARM_FLOOR = Duration.ofSeconds(10);
+
     // Not a @Bean, and that is a wiring constraint rather than a style choice: this application runs
     // @EnableScheduling for the reservation expiry sweep, and Spring's ScheduledAnnotationBeanPostProcessor adopts
     // a context ScheduledExecutorService when no TaskScheduler is defined, which would move that sweep onto this
@@ -77,6 +103,44 @@ public class FxClientConfig {
     // and cancelled the moment that read returns, with setRemoveOnCancelPolicy so cancelled tasks do not
     // accumulate in the queue between arrivals.
     private static final ScheduledExecutorService DEADLINE_WATCHDOG = newDeadlineWatchdog();
+
+    /**
+     * The one HTTP transport - and therefore the one connection pool - every client below is built on.
+     *
+     * <p>A bean rather than a local, because the JDK's connection pool belongs to an {@code HttpClient} instance:
+     * a second instance would have a pool of its own, and the start-up warm-up of
+     * {@link FxConnectionPrewarm} would then leave its handshaken connection somewhere the request path can never
+     * reach. Wrapped in a record instead of published as a bare {@code java.net.http.HttpClient} so that no other
+     * bean in the context can acquire an HTTP transport by asking for one, and so that this module - not Spring's
+     * destroy-method inference - decides whether shutdown blocks on {@code HttpClient.close()}, which waits for
+     * every exchange in flight.
+     *
+     * @param properties source of {@code cashaccount.fx.timeout}, which is the floor for the connect bound below
+     * @return the shared transport and the warm-up budget derived from that property
+     */
+    @Bean
+    public FxTransport fxTransport(CashAccountProperties properties) {
+        Duration prewarmBudget = prewarmBudget(properties);
+
+        // The endpoint the chart ships answers a redirect - api.frankfurter.app/latest returns 301 to
+        // api.frankfurter.dev/v1 - and the JDK client declines redirects unless asked, which would turn every
+        // cross-currency conversion into a rate failure. NORMAL rather than ALWAYS is the security half of that
+        // choice and must stay: it refuses a redirect from HTTPS down to HTTP, so the HTTPS-only endpoint
+        // fx/FrankfurterExchangeRateClient enforces at start-up cannot be walked back to plaintext by a hop the
+        // operator never configured.
+        //
+        // connectTimeout is the WIDEST budget any client on this transport may spend rather than the caller's own,
+        // because it is a property of the shared instance and the warm-up needs room for a cold handshake the
+        // caller-facing budget deliberately refuses to wait for (see PREWARM_FLOOR). No caller-facing guarantee
+        // rides on it: every client below arms its own per-exchange bound - the request factory's timeout covers
+        // connect, request and response headers and the interceptor's deadline covers body reception - so a
+        // caller's exchange still fails inside cashaccount.fx.timeout whatever this value is. Bounded all the
+        // same, so a black-holed endpoint cannot leave connect attempts open indefinitely.
+        return new FxTransport(HttpClient.newBuilder()
+                .followRedirects(HttpClient.Redirect.NORMAL)
+                .connectTimeout(prewarmBudget)
+                .build(), prewarmBudget);
+    }
 
     /**
      * The one {@link RestClient} bean in the application context, named so that injection by type, by name and by
@@ -95,19 +159,75 @@ public class FxClientConfig {
         // failure surfaces as 503 EXCHANGE_RATE_UNAVAILABLE with the balance untouched, where the legacy program
         // ran its COMPUTE and UPDATE even after the rate SELECT found no row
         // [backend/cash-account-cobol/COBOL/CASH00.cbl:L214-L231].
-        Duration timeout = properties.getFx().getTimeout();
+        //
+        // The transport comes from the bean method, so under the container this is the shared pool the warm-up
+        // fills; called directly - as fx/CurrencyConversionTest builds the real bean without a container - it is a
+        // transport of this client's own, which is what an isolated drive wants.
+        return boundedClient(fxTransport(properties).httpClient(), properties.getFx().getTimeout());
+    }
 
-        // The endpoint the chart ships answers a redirect - api.frankfurter.app/latest returns 301 to
-        // api.frankfurter.dev/v1 - and the JDK client declines redirects unless asked, which would turn every
-        // cross-currency conversion into a rate failure. NORMAL rather than ALWAYS is the security half of that
-        // choice and must stay: it refuses a redirect from HTTPS down to HTTP, so the HTTPS-only endpoint
-        // fx/FrankfurterExchangeRateClient enforces at start-up cannot be walked back to plaintext by a hop the
-        // operator never configured.
-        HttpClient httpClient = HttpClient.newBuilder()
-                .followRedirects(HttpClient.Redirect.NORMAL)
-                .connectTimeout(timeout)
-                .build();
+    /**
+     * Opens the exchange-rate connection once, at start-up, so that no caller pays for establishing it.
+     *
+     * <p>Only in a web application: the migration tooling runs with no web server
+     * ({@code spring.main.web-application-type=none} in {@code application-tool.yml}) and prices a replay from the
+     * staged legacy rate table, so an outbound rate request while it loads an export would be a call nothing asked
+     * for.
+     *
+     * @param properties source of the endpoint, the base currency and the accepted-currency set
+     * @param transport  the shared transport whose pool this warm-up fills, and the budget it may spend
+     * @return the start-up listener; it contributes to no health group, so an unreachable provider still cannot
+     *         flap pods (AAP 0.9.1)
+     */
+    @Bean
+    @ConditionalOnWebApplication
+    public FxConnectionPrewarm fxConnectionPrewarm(CashAccountProperties properties, FxTransport transport) {
+        return new FxConnectionPrewarm(boundedClient(transport.httpClient(), transport.prewarmBudget()),
+                warmUpTarget(properties), transport.prewarmBudget());
+    }
 
+    // A floor and not a maximum: a deployment that has already widened cashaccount.fx.timeout past PREWARM_FLOOR
+    // has said that its provider needs longer than this, and a warm-up stingier than an ordinary request would
+    // then be the one thing that cannot connect.
+    private static Duration prewarmBudget(CashAccountProperties properties) {
+        Duration caller = properties.getFx().getTimeout();
+        return caller.compareTo(PREWARM_FLOOR) > 0 ? caller : PREWARM_FLOOR;
+    }
+
+    // The request the warm-up sends is the request shape a caller sends - the configured endpoint with from and to
+    // - so the connection it leaves behind is the one a conversion reuses, and a third party sees nothing it does
+    // not already serve. The quote is the lowest accepted code that is not the base rather than a currency named
+    // here: the accepted set is configuration (cashaccount.fx.accepted-currencies), and a hardcoded code would
+    // send a pair a narrowed deployment never asks for. Null when the set offers no other code, which leaves the
+    // warm-up out rather than inventing a currency.
+    private static URI warmUpTarget(CashAccountProperties properties) {
+        CashAccountProperties.Fx fx = properties.getFx();
+        String base = normalizedCode(fx.getBaseCurrency());
+        String quote = fx.getAcceptedCurrencies().stream()
+                .map(FxClientConfig::normalizedCode)
+                .filter(code -> !code.isEmpty() && !code.equals(base))
+                .sorted()
+                .findFirst()
+                .orElse(null);
+        if (quote == null) {
+            return null;
+        }
+        // Built onto the configured value rather than concatenated, exactly as fx/FrankfurterExchangeRateClient
+        // builds it, so a query string already in that value survives here too.
+        return UriComponentsBuilder.fromUriString(fx.getUrl())
+                .queryParam("from", base)
+                .queryParam("to", quote)
+                .build()
+                .toUri();
+    }
+
+    private static String normalizedCode(String code) {
+        return code == null ? "" : code.trim().toUpperCase(Locale.ROOT);
+    }
+
+    // Everything a client on the shared transport needs and nothing it may choose for itself: the two bounds no
+    // timeout on this transport can express, the one default header, and no base URL.
+    private static RestClient boundedClient(HttpClient httpClient, Duration timeout) {
         // Bounds the header phase only, and is kept for exactly that: Spring's JdkClientHttpRequestFactory reads
         // the answer with HttpResponse.BodyHandlers.ofInputStream and waits out this timeout on the resulting
         // future, which the JDK completes as soon as the response HEADERS arrive. Everything after that point is
@@ -312,6 +432,89 @@ public class FxClientConfig {
         @Override
         public void close() {
             delegate.close();
+        }
+    }
+
+    /** The one HTTP transport every exchange-rate client shares, and the budget a start-up warm-up on it may spend. */
+    public record FxTransport(HttpClient httpClient, Duration prewarmBudget) {
+    }
+
+    /**
+     * One exchange at start-up whose product is a handshaken, pooled connection rather than a rate.
+     *
+     * <p>It exists because {@code cashaccount.fx.timeout} budgets the whole exchange, connection establishment
+     * included, and a cold TLS handshake to a public provider can cost more than the whole of it (see
+     * {@link FxClientConfig#PREWARM_FLOOR}). Paying that cost here moves it off the first caller's request without
+     * widening any caller's budget, which AAP 0.6.1 fixes.
+     *
+     * <p>No rate is bound, cached or handed to anything: the answer is read under the same size and deadline bounds
+     * every other exchange gets and then discarded, and any status at all counts as success because the connection
+     * - not the body - is the point. Nothing here reaches a health group either, so an unreachable provider at
+     * start-up still cannot flap pods (AAP 0.9.1): the warm-up logs one line and the service runs exactly as it
+     * did before, with the first conversion paying connection set-up inside its own budget.
+     */
+    public static final class FxConnectionPrewarm {
+
+        private static final Logger PREWARM_LOGGER = LoggerFactory.getLogger(FxConnectionPrewarm.class);
+
+        private final RestClient client;
+        private final URI target;
+        private final Duration budget;
+
+        FxConnectionPrewarm(RestClient client, URI target, Duration budget) {
+            this.client = client;
+            this.target = target;
+            this.budget = budget;
+        }
+
+        // ApplicationReadyEvent and not a @PostConstruct or an ApplicationRunner: a bean initialised mid-refresh
+        // would add a third party to the critical path of start-up itself, and a runner would do the same before
+        // the port is bound. By the time this event fires the server is listening, so a warm-up that never
+        // completes costs nothing that start-up needed.
+        @EventListener(ApplicationReadyEvent.class)
+        void open() {
+            if (target == null) {
+                // cashaccount.fx.accepted-currencies offers no code other than the base, so every conversion this
+                // deployment can ask for short-circuits to a rate of exactly 1 with no call at all.
+                PREWARM_LOGGER.debug("No accepted currency other than the base, so no exchange-rate connection is "
+                        + "warmed: this deployment makes no cross-currency rate request.");
+                return;
+            }
+            // Handed to a thread rather than run here: Spring Boot publishes the readiness change to
+            // ACCEPTING_TRAFFIC immediately after this event's listeners return, so waiting out a handshake in
+            // this method would hold readiness back for exactly as long as the warm-up exists to save. Daemon, so
+            // it can never hold a JVM open, and one-shot, so nothing lingers between start-ups.
+            Thread warmUp = new Thread(this::exchange, "fx-connection-prewarm");
+            warmUp.setDaemon(true);
+            warmUp.start();
+        }
+
+        private void exchange() {
+            long startedAt = System.nanoTime();
+            try {
+                client.get()
+                        .uri(target)
+                        .retrieve()
+                        // Every status is accepted, including an error one: a provider that answers 404 for the
+                        // pair this warm-up happened to ask for has still completed DNS, TCP and TLS, which is the
+                        // whole product. Without this the default handler would raise on 4xx/5xx and report a
+                        // successful warm-up as a failure.
+                        .onStatus(status -> true, (request, response) -> { })
+                        .toBodilessEntity();
+                PREWARM_LOGGER.info("Exchange-rate connection opened in {} ms, so the first cross-currency credit "
+                        + "or debit does not pay connection set-up inside its cashaccount.fx.timeout budget.",
+                        Duration.ofNanos(System.nanoTime() - startedAt).toMillis());
+            } catch (RuntimeException unreachable) {
+                // One bounded line, and the cause's simple class name rather than its message: the message would
+                // echo the operator-supplied endpoint into a log, which this class does not do anywhere else. No
+                // stack either - nothing here is a fault to diagnose, and the next conversion reports its own
+                // failure through 503 EXCHANGE_RATE_UNAVAILABLE.
+                PREWARM_LOGGER.warn("Exchange-rate connection was not opened ({}) inside the {} start-up warm-up "
+                        + "budget. No request was affected and readiness is unchanged; the first cross-currency "
+                        + "credit or debit will pay connection set-up inside its cashaccount.fx.timeout budget.",
+                        NestedExceptionUtils.getMostSpecificCause(unreachable).getClass().getSimpleName(),
+                        budget);
+            }
         }
     }
 }
