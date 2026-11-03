@@ -1,0 +1,47 @@
+/*
+       Copyright 2019-2021 IBM Corp, All Rights Reserved
+       Copyright 2023-2024 Kyndryl, All Rights Reserved
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+ */
+
+package com.ibm.hybrid.cloud.sample.stocktrader.executioncontrol.json;
+
+/** One settlement-instruction field on which the firm and the counterparty disagree */
+public class MismatchField {
+    /* Holds the Java field name of the offending SettlementInstruction property rather than
+       a prose label, so an analyst reading the exception can locate the break on the
+       instruction itself. PostTradeService supplies that name from its own field-name
+       constants, which must be kept aligned by hand with the names the instruction publishes. */
+    private final String field;
+    private final String firmValue;
+    private final String counterpartyValue;
+
+    public MismatchField(String field, String firmValue, String counterpartyValue) {
+        this.field = field;
+        this.firmValue = firmValue;
+        this.counterpartyValue = counterpartyValue;
+    }
+
+    public String getField() {
+        return field;
+    }
+
+    public String getFirmValue() {
+        return firmValue;
+    }
+
+    public String getCounterpartyValue() {
+        return counterpartyValue;
+    }
+}

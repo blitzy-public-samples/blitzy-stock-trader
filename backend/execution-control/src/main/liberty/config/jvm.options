@@ -1,0 +1,39 @@
+# Heap bounds for the server JVM, in the server configuration directory so that the
+# container image, the Maven integration-test server and a local `server run` all get the
+# same ones.
+#
+# An absolute ceiling rather than -XX:MaxRAMPercentage: a percentage is only as good as the
+# memory figure the JVM reads, and a JVM inside a container that does not carry its own
+# memory limit reads the whole machine's. Measured on a build host that exposes 3.1 TB, the
+# unconfigured JVM chose a 30 GB maximum heap and a 2 GB initial heap, and resident memory
+# reached 1.9 GB for a live set of roughly 71 MB; a percentage of that same figure would
+# have bounded nothing. These two values bound it wherever the image runs.
+#
+# 384 MB is sized from what this service can actually hold: every structure has a ceiling
+# (10,000 orders, 10,000 exceptions, 5,000 positions, 150,000 audit events) and a full
+# estate retains roughly 130 MB, so the maximum leaves about three times the live set for
+# collection headroom and sits inside the 1Gi memory limit the README's manifest requests.
+# A deployment that raises those ceilings, or that wants a larger young generation for
+# throughput, should raise -Xmx here in step and grant the pod the memory to match.
+-Xms64m
+-Xmx384m
+
+# Load-bearing, not tuning: this switches off the web container's invocation cache, and with it a
+# 500 an anonymous caller can provoke at will.
+#
+# Liberty refuses a request URI that carries an encoded path separator (%2F, %5C) while dispatching
+# it - and caches a servlet wrapper for that same refused URI on the way out. The next identical
+# request takes the cached path, which derives the path info by cutting the context root off the
+# CANONICALIZED URI; /execution-control/orders/..%2f..%2fcontrols canonicalizes to /controls, nine
+# characters against an eighteen-character context root, so the cut throws
+# StringIndexOutOfBoundsException and the caller receives the container's own error page instead of
+# this service's 400. Alternate requests therefore answered 400 and 500. With the cache at zero
+# there is no second path: every such request takes the one that refuses it correctly and answers
+# the {status, error, message, path} envelope, which is what the README documents and what
+# SettlementExceptionIT asserts on repeated requests.
+#
+# The cache saves filter and URI matching per request. This WAR declares one servlet, one error
+# servlet and no filters, and 400 sequential requests measured the same either way, so nothing is
+# given up here. Raise it only together with a Liberty release that computes the cached path info
+# from the same URI it keyed the entry on.
+-DinvocationCacheSize=0
